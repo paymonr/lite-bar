@@ -44,7 +44,6 @@ fn main() {
 mod app {
     use std::any::Any;
     use std::cell::{Cell, RefCell};
-    use std::collections::HashSet;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
@@ -54,7 +53,7 @@ mod app {
     use lite_bar_core::game_name::display_name;
     use lite_bar_core::history::LocalTime;
     use lite_bar_core::layout::{fps_text, stats_text};
-    use lite_bar_core::sessions::{session_log_line, OpenSession, SessionBook};
+    use lite_bar_core::sessions::{session_log_line, OpenSession, QueryGate, SessionBook};
     use lite_bar_core::settings::{Settings, StatsLayout};
     use windows::core::{w, HSTRING};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -78,7 +77,7 @@ mod app {
     use crate::hotkeys::{self, HotkeyId, Registration};
     use crate::overlay::Overlay;
     use crate::paths::{app_dir, load_or_create_settings};
-    use crate::process_info::{is_running, process_info};
+    use crate::process_info::{process_info, process_state, ProcessState};
     use crate::single_instance::{acquire_single_instance, InstanceGuard};
     use crate::stats_files::{local_now, StatsWriter};
     use crate::tray::{MenuItem, Tray, TrayMenuState, WM_TRAY};
@@ -172,8 +171,10 @@ mod app {
         /// Open play sessions; they survive the overlay being hidden.
         sessions: SessionBook,
         writer: StatsWriter,
-        /// Pids whose process could not be queried, so the failure is logged once per pid.
-        untrackable: HashSet<u32>,
+        /// Keeps a refused process query from being retried during the same focus.
+        gate: QueryGate,
+        /// Set by `start_overlay`: the next tick runs the process-exit check.
+        just_shown: bool,
     }
 
     impl App {
@@ -208,6 +209,7 @@ mod app {
             unsafe {
                 SetTimer(Some(self.hwnd), TIMER_ID, TIMER_MS, None);
             }
+            self.just_shown = true;
             self.on_timer();
             match PresentCapture::start(self.tracker.clone(), self.clock) {
                 Ok(capture) => self.capture = Some(capture),
@@ -255,9 +257,15 @@ mod app {
             let now = self.clock.elapsed().as_secs_f64();
             let pid = foreground_pid();
             let want_stats = self.settings.overlay.stats != StatsLayout::Off;
+            let refused = self.gate.on_focus(pid);
             // One lock for focus, FPS and stats; the summary is Copy so it is released early.
             let (fps, summary, has_stats) = {
                 let mut tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(refused) = refused {
+                    // Focus left a process that refused the query: its frames can't be
+                    // recorded.
+                    tracker.take_stats(refused);
+                }
                 tracker.set_focus(pid);
                 match pid {
                     Some(pid) => {
@@ -273,12 +281,14 @@ mod app {
             };
             let stats = want_stats.then(|| stats_text(summary.as_ref()));
             self.overlay.update(&fps_text(fps), stats.as_ref());
-            if let Some(pid) = pid_to_track(pid, has_stats, &self.sessions) {
-                self.start_session(pid);
-            }
             self.ticks = self.ticks.wrapping_add(1);
-            if alive_check_due(self.ticks) {
+            // Before tracking: a pid reused while the overlay was hidden must not add frames
+            // to the earlier run's session.
+            if session_check_due(self.ticks, std::mem::take(&mut self.just_shown)) {
                 self.check_sessions();
+            }
+            if let Some(pid) = pid_to_track(pid, has_stats, &self.sessions, &self.gate) {
+                self.start_session(pid);
             }
             if self.ticks.is_multiple_of(PRUNE_EVERY_TICKS) {
                 self.tracker
@@ -293,7 +303,7 @@ mod app {
             match process_info(pid) {
                 Some(info) => {
                     let now = local_now();
-                    self.sessions.track(OpenSession {
+                    let displaced = self.sessions.track(OpenSession {
                         pid,
                         created: info.created,
                         exe_path: info.exe_path,
@@ -301,27 +311,28 @@ mod app {
                         start: now,
                         last_alive: now,
                     });
+                    if let Some(old) = displaced {
+                        log::warn(&format!(
+                            "stats: pid {} was reused; ending the earlier session",
+                            old.pid
+                        ));
+                        let end = old.last_alive;
+                        self.finish_session(old, end);
+                    }
                 }
                 None => {
-                    // Without its identity the frames can't be stored; drop them.
-                    self.tracker
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .take_stats(pid);
-                    if self.untrackable.insert(pid) {
-                        log::warn(&format!(
-                            "stats: cannot query process {pid}; its play time is not recorded"
-                        ));
-                    }
+                    // Live stats still show; the frames are discarded when focus moves away.
+                    self.gate.refused(pid);
+                    log::warn(&format!(
+                        "stats: cannot query process {pid}; its play time is not recorded"
+                    ));
                 }
             }
         }
 
         /// The 1 s check: sessions whose process exited end when it was last seen alive.
         fn check_sessions(&mut self) {
-            let finished = self
-                .sessions
-                .sweep(local_now(), |s| is_running(s.pid, s.created));
+            let finished = self.sessions.sweep(local_now(), still_running);
             for (session, end) in finished {
                 self.finish_session(session, end);
             }
@@ -330,9 +341,7 @@ mod app {
         /// Quit or sign-out: every session ends (now, if its process still runs) and queued
         /// stats writes are retried.
         fn finish_all_sessions(&mut self) {
-            let finished = self
-                .sessions
-                .drain(local_now(), |s| is_running(s.pid, s.created));
+            let finished = self.sessions.drain(local_now(), still_running);
             for (session, end) in finished {
                 self.finish_session(session, end);
             }
@@ -444,6 +453,24 @@ mod app {
         }
     }
 
+    /// Whether a session's process still runs; logs why when it doesn't.
+    fn still_running(s: &OpenSession) -> bool {
+        match process_state(s.pid, s.created) {
+            ProcessState::Running => true,
+            ProcessState::Exited => {
+                log::info(&format!("stats: {} (pid {}) exited", s.exe_path, s.pid));
+                false
+            }
+            ProcessState::Unqueryable => {
+                log::warn(&format!(
+                    "stats: {} (pid {}) can no longer be queried; ending its session",
+                    s.exe_path, s.pid
+                ));
+                false
+            }
+        }
+    }
+
     /// Opens `path` (a file or a folder) in its default program.
     fn shell_open(path: &Path, what: &str) {
         let path = HSTRING::from(path.as_os_str());
@@ -469,14 +496,21 @@ mod app {
         StopCapture,
     }
 
-    /// The foreground pid that needs a new session: it has counted frames and none is open.
-    fn pid_to_track(pid: Option<u32>, has_stats: bool, sessions: &SessionBook) -> Option<u32> {
-        pid.filter(|pid| has_stats && !sessions.contains(*pid))
+    /// The foreground pid that needs a new session: it has counted frames, none is open, and
+    /// its process hasn't already refused a query during this focus.
+    fn pid_to_track(
+        pid: Option<u32>,
+        has_stats: bool,
+        sessions: &SessionBook,
+        gate: &QueryGate,
+    ) -> Option<u32> {
+        pid.filter(|pid| has_stats && !sessions.contains(*pid) && gate.may_query(*pid))
     }
 
-    /// Whether this tick (counted after incrementing) runs the 1 s process-exit check.
-    fn alive_check_due(ticks: u32) -> bool {
-        ticks.is_multiple_of(ALIVE_CHECK_EVERY_TICKS)
+    /// Whether this tick (counted after incrementing) runs the process-exit check: every 1 s,
+    /// and on the first tick after the overlay is shown (before new sessions are tracked).
+    fn session_check_due(ticks: u32, first_tick_after_show: bool) -> bool {
+        first_tick_after_show || ticks.is_multiple_of(ALIVE_CHECK_EVERY_TICKS)
     }
 
     /// A reload regenerates `games.csv` only when the display-name overrides changed.
@@ -574,7 +608,9 @@ mod app {
             }
             Some(Command::PostQuit) => quit(),
             Some(Command::StopCapture) => {
-                with_app(App::end_session);
+                if with_app(App::end_session).is_none() {
+                    log::warn("session ending while the app is busy; open play sessions not saved");
+                }
                 return LRESULT(0);
             }
             None => {}
@@ -670,7 +706,8 @@ mod app {
             ticks: 0,
             sessions: SessionBook::new(),
             writer,
-            untrackable: HashSet::new(),
+            gate: QueryGate::default(),
+            just_shown: false,
         };
         app.register_hotkey();
         if start_visible {
@@ -761,28 +798,52 @@ mod app {
             book
         }
 
+        fn open_gate() -> QueryGate {
+            QueryGate::default()
+        }
+
         #[test]
         fn foreground_with_stats_and_no_session_is_tracked() {
-            assert_eq!(pid_to_track(Some(7), true, &SessionBook::new()), Some(7));
-            assert_eq!(pid_to_track(Some(8), true, &tracked(7)), Some(8));
+            let none = SessionBook::new();
+            assert_eq!(pid_to_track(Some(7), true, &none, &open_gate()), Some(7));
+            assert_eq!(
+                pid_to_track(Some(8), true, &tracked(7), &open_gate()),
+                Some(8)
+            );
         }
 
         #[test]
         fn tracked_pid_or_one_without_stats_is_not_tracked_again() {
-            assert_eq!(pid_to_track(Some(7), true, &tracked(7)), None);
-            assert_eq!(pid_to_track(Some(7), false, &SessionBook::new()), None);
-            assert_eq!(pid_to_track(None, true, &SessionBook::new()), None);
+            let none = SessionBook::new();
+            assert_eq!(pid_to_track(Some(7), true, &tracked(7), &open_gate()), None);
+            assert_eq!(pid_to_track(Some(7), false, &none, &open_gate()), None);
+            assert_eq!(pid_to_track(None, true, &none, &open_gate()), None);
+        }
+
+        #[test]
+        fn refused_pid_is_not_queried_again_while_focused() {
+            let mut gate = QueryGate::default();
+            gate.on_focus(Some(7));
+            gate.refused(7);
+            gate.on_focus(Some(7));
+            let none = SessionBook::new();
+            assert_eq!(pid_to_track(Some(7), true, &none, &gate), None);
         }
 
         #[test]
         fn exit_check_runs_every_fourth_tick() {
-            let due: Vec<u32> = (1..=12).filter(|t| alive_check_due(*t)).collect();
+            let due: Vec<u32> = (1..=12).filter(|t| session_check_due(*t, false)).collect();
             assert_eq!(due, vec![4, 8, 12]);
             assert_eq!(ALIVE_CHECK_EVERY_TICKS * TIMER_MS, 1000);
         }
 
         #[test]
-        fn only_changed_game_names_regenerate_games_csv() {
+        fn exit_check_runs_on_the_first_tick_after_show() {
+            assert!(session_check_due(5, true));
+        }
+
+        #[test]
+        fn game_names_changed_ignores_other_settings() {
             let old = Settings::default();
             let mut new = Settings::default();
             new.overlay.visible = !old.overlay.visible;

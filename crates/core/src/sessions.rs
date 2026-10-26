@@ -62,12 +62,15 @@ impl SessionBook {
     }
 
     /// Starts tracking `s`. No-op if its pid is tracked with the same creation time; a reused
-    /// pid (new creation time) replaces the old entry.
-    pub fn track(&mut self, s: OpenSession) {
+    /// pid (new creation time) replaces the old entry, which is returned.
+    pub fn track(&mut self, s: OpenSession) -> Option<OpenSession> {
         match self.sessions.iter_mut().find(|o| o.pid == s.pid) {
-            Some(existing) if existing.created == s.created => {}
-            Some(existing) => *existing = s,
-            None => self.sessions.push(s),
+            Some(existing) if existing.created == s.created => None,
+            Some(existing) => Some(std::mem::replace(existing, s)),
+            None => {
+                self.sessions.push(s);
+                None
+            }
         }
     }
 
@@ -129,6 +132,36 @@ impl SessionBook {
     }
 }
 
+/// Limits process queries for a foreground pid that refused one: it is not asked again until
+/// focus moves away and back. A pid is only remembered while it keeps the focus, so a reused
+/// pid can be tracked later.
+#[derive(Debug, Default)]
+pub struct QueryGate {
+    refused: Option<u32>,
+}
+
+impl QueryGate {
+    /// Call once per tick with the current focus. When focus has left the refused pid, returns
+    /// it: its frame stats can't be recorded and should be discarded.
+    pub fn on_focus(&mut self, focus: Option<u32>) -> Option<u32> {
+        if self.refused.is_some() && self.refused != focus {
+            self.refused.take()
+        } else {
+            None
+        }
+    }
+
+    /// Whether `pid` may be queried now.
+    pub fn may_query(&self, pid: u32) -> bool {
+        self.refused != Some(pid)
+    }
+
+    /// Records that the query for the focused `pid` failed.
+    pub fn refused(&mut self, pid: u32) {
+        self.refused = Some(pid);
+    }
+}
+
 /// When a session ends: `now` if its process still runs, else when it was last seen alive.
 pub fn end_time(s: &OpenSession, still_running: bool, now: LocalTime) -> LocalTime {
     if still_running {
@@ -185,9 +218,9 @@ mod tests {
     #[test]
     fn track_is_idempotent_for_same_process() {
         let mut book = SessionBook::new();
-        book.track(open(7, 100));
+        assert_eq!(book.track(open(7, 100)), None);
         book.mark_alive(7, t(10, 5));
-        book.track(open(7, 100));
+        assert_eq!(book.track(open(7, 100)), None);
         assert_eq!(book.pids(), vec![7]);
         let s = book.remove(7).unwrap();
         assert_eq!(s.last_alive, t(10, 5), "the existing session is kept");
@@ -198,7 +231,8 @@ mod tests {
     fn reused_pid_with_new_creation_time_replaces() {
         let mut book = SessionBook::new();
         book.track(open(7, 100));
-        book.track(open(7, 200));
+        let displaced = book.track(open(7, 200)).expect("the old run is returned");
+        assert_eq!(displaced.created, 100);
         assert_eq!(book.pids(), vec![7]);
         assert_eq!(book.remove(7).unwrap().created, 200);
     }
@@ -215,6 +249,44 @@ mod tests {
         let mut s = open(7, 100);
         s.last_alive = t(10, 30);
         assert_eq!(end_time(&s, true, t(12, 0)), t(12, 0));
+    }
+
+    #[test]
+    fn same_focus_already_failed_makes_no_attempt() {
+        let mut gate = QueryGate::default();
+        assert_eq!(gate.on_focus(Some(7)), None);
+        assert!(gate.may_query(7));
+        gate.refused(7);
+        for _ in 0..3 {
+            assert_eq!(gate.on_focus(Some(7)), None);
+            assert!(!gate.may_query(7));
+        }
+    }
+
+    #[test]
+    fn focus_change_allows_one_attempt() {
+        let mut gate = QueryGate::default();
+        gate.on_focus(Some(7));
+        gate.refused(7);
+        gate.on_focus(Some(8));
+        assert!(gate.may_query(8));
+        gate.on_focus(Some(7));
+        assert!(gate.may_query(7), "back on the pid: one new attempt");
+        gate.refused(7);
+        gate.on_focus(Some(7));
+        assert!(!gate.may_query(7));
+    }
+
+    #[test]
+    fn focus_leaves_failed_pid_its_stats_are_discarded() {
+        let mut gate = QueryGate::default();
+        gate.on_focus(Some(7));
+        gate.refused(7);
+        assert_eq!(gate.on_focus(None), Some(7));
+        assert_eq!(gate.on_focus(None), None, "discarded once");
+        gate.on_focus(Some(8));
+        gate.refused(8);
+        assert_eq!(gate.on_focus(Some(9)), Some(8));
     }
 
     #[test]

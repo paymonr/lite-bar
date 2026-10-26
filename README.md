@@ -116,7 +116,7 @@ Games are kept apart by the exe's full path. For Java games (`java.exe`, `javaw.
 
 To rename a game, add it to `[game_names]` in the settings file and choose **Reload settings**: `games.csv` is regenerated with the new name, and new `sessions.csv` rows use it (existing rows keep the old name).
 
-Anti-cheat: Lite Bar never injects into, hooks or reads the memory of a game. Its only contact with a game's process is `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` to read the exe path, the start time and whether the process has exited, and the handle is closed straight away. The window title comes from `GetWindowTextW`. Everything else reads files and the registry, with no network lookups. If a game's process refuses even that limited query, its play time is not recorded (a warning goes to the log).
+Anti-cheat: Lite Bar never injects into, hooks or reads the memory of a game. Its only contact with a game's process is `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` to read the exe path, the start time and whether the process has exited, and the handle is closed straight away. The window title comes from `GetWindowTextW`. Everything else reads files and the registry, with no network lookups. If a game's process refuses even that limited query, its live stats still show on the overlay, but it isn't recorded in the history (a warning goes to the log). Lite Bar asks such a process at most once each time it gets the focus.
 
 ### Known limitations
 
