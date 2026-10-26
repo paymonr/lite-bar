@@ -1,11 +1,14 @@
 //! Lite Bar: Windows tray app with an FPS overlay.
 
-fn main() {}
+// These helpers are wired into `main` by a later task.
+#[cfg(windows)]
+#[allow(dead_code)]
+mod elevation;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod paths;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod single_instance;
 
-#[cfg(all(test, windows))]
-mod tests {
-    #[test]
-    fn runs_on_windows() {
-        assert!(cfg!(windows));
-    }
-}
+fn main() {}
