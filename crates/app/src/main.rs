@@ -51,10 +51,11 @@ mod app {
     };
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
-        PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetTimer, TranslateMessage, MSG,
-        SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_CONTEXTMENU, WM_HOTKEY, WM_RBUTTONUP, WM_TIMER,
-        WNDCLASSEXW, WS_OVERLAPPED,
+        ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
+        DispatchMessageW, GetMessageW, KillTimer, PostQuitMessage, RegisterClassExW,
+        RegisterWindowMessageW, SetTimer, TranslateMessage, MSG, MSGFLT_ALLOW, SW_SHOWNORMAL,
+        WINDOW_EX_STYLE, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY,
+        WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
     };
 
     use crate::elevation::{is_elevated, relaunch_as_admin};
@@ -257,6 +258,7 @@ mod app {
         fn restart_as_admin(&mut self) -> bool {
             let was_on = self.overlay_on;
             self.guard = None;
+            hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
             self.stop_overlay();
             self.tray.remove();
             match relaunch_as_admin() {
@@ -268,6 +270,7 @@ mod app {
                         log::error(&format!("could not re-add tray icon: {e}"));
                     }
                     self.guard = acquire_guard();
+                    self.register_hotkey();
                     if was_on {
                         self.start_overlay();
                     }
@@ -292,10 +295,38 @@ mod app {
 
         /// Stops capture and removes the tray icon (the icon and window go with the drop).
         fn shutdown(&mut self) {
+            log::info("shutting down");
             hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
             self.stop_overlay();
             self.tray.remove();
         }
+    }
+
+    /// What the owner window does about a lifecycle message.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Command {
+        /// Same path as the tray's Quit item.
+        Quit,
+        /// The window is going away anyway: make sure the message loop ends.
+        PostQuit,
+        /// The session is ending: stop the ETW session so it does not outlive the logoff.
+        StopCapture,
+    }
+
+    fn window_command(msg: u32, wparam: usize) -> Option<Command> {
+        match msg {
+            WM_CLOSE => Some(Command::Quit),
+            WM_DESTROY => Some(Command::PostQuit),
+            WM_ENDSESSION if wparam != 0 => Some(Command::StopCapture),
+            _ => None,
+        }
+    }
+
+    /// Lets an elevated process receive `msg` from lower-integrity senders (Explorer's
+    /// `TaskbarCreated` broadcast is otherwise dropped by UIPI).
+    fn allow_through_uipi(hwnd: HWND, msg: u32) -> windows::core::Result<()> {
+        // SAFETY: plain FFI on a window we own.
+        unsafe { ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, None) }
     }
 
     fn quit() {
@@ -365,6 +396,18 @@ mod app {
             }
             _ => {}
         }
+        match window_command(msg, wparam.0) {
+            Some(Command::Quit) => {
+                quit();
+                return LRESULT(0);
+            }
+            Some(Command::PostQuit) => quit(),
+            Some(Command::StopCapture) => {
+                with_app(App::stop_overlay);
+                return LRESULT(0);
+            }
+            None => {}
+        }
         // SAFETY: forwards the arguments unchanged from the system.
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
@@ -404,8 +447,12 @@ mod app {
         guard: Option<InstanceGuard>,
     ) -> windows::core::Result<()> {
         // SAFETY: plain FFI with a static NUL-terminated name.
-        TASKBAR_CREATED.set(unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) });
+        let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+        TASKBAR_CREATED.set(taskbar_created);
         let owner = create_owner_window()?;
+        if let Err(e) = allow_through_uipi(owner.0, taskbar_created) {
+            log::warn(&format!("could not allow TaskbarCreated through UIPI: {e}"));
+        }
         let tray = Rc::new(tray::Tray::new(owner.0)?);
         let overlay = Overlay::new(&settings.overlay)?;
 
@@ -450,5 +497,53 @@ mod app {
         }
         drop(owner);
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            HWND_MESSAGE, WM_CLOSE, WM_DESTROY, WM_ENDSESSION,
+        };
+
+        #[test]
+        fn close_destroy_and_endsession_map_to_commands() {
+            assert_eq!(window_command(WM_CLOSE, 0), Some(Command::Quit));
+            assert_eq!(window_command(WM_DESTROY, 0), Some(Command::PostQuit));
+            assert_eq!(window_command(WM_ENDSESSION, 1), Some(Command::StopCapture));
+        }
+
+        #[test]
+        fn cancelled_endsession_and_other_messages_have_no_command() {
+            assert_eq!(window_command(WM_ENDSESSION, 0), None);
+            assert_eq!(window_command(WM_TIMER, 1), None);
+        }
+
+        #[test]
+        fn taskbar_created_can_be_allowed_through_uipi() {
+            // SAFETY: plain FFI; the predefined STATIC class needs no registration.
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    w!(""),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .unwrap();
+            let id = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
+            assert!(allow_through_uipi(hwnd, id).is_ok());
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+        }
     }
 }

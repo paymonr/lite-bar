@@ -35,8 +35,8 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SetWindowPos, ShowWindow,
     UpdateLayeredWindow, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE,
-    SW_SHOWNOACTIVATE, ULW_ALPHA, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    SW_SHOWNOACTIVATE, ULW_ALPHA, WM_CLOSE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows_numerics::Vector2;
 
@@ -66,6 +66,10 @@ unsafe extern "system" fn window_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    // `Overlay` owns the window; a stray WM_CLOSE must not destroy it (DefWindowProc would).
+    if msg == WM_CLOSE {
+        return LRESULT(0);
+    }
     // SAFETY: forwards the arguments unchanged from the system.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
@@ -614,9 +618,17 @@ mod tests {
     use lite_bar_core::settings::{Corner, Settings};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetWindowLongPtrW, GetWindowRect, IsWindow, IsWindowVisible, GWL_EXSTYLE, WS_EX_LAYERED,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+        GetWindowLongPtrW, GetWindowRect, IsWindow, IsWindowVisible, SendMessageW, GWL_EXSTYLE,
+        WM_CLOSE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+        WS_EX_TRANSPARENT,
     };
+
+    #[test]
+    fn wm_close_does_not_destroy_the_overlay_window() {
+        let o = Overlay::new(&Settings::default().overlay).unwrap();
+        unsafe { SendMessageW(o.hwnd(), WM_CLOSE, None, None) };
+        assert!(unsafe { IsWindow(Some(o.hwnd())) }.as_bool());
+    }
 
     fn window_size(o: &Overlay) -> (i32, i32) {
         let mut r = RECT::default();
