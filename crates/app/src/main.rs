@@ -339,13 +339,13 @@ mod app {
         }
 
         /// Quit or sign-out: every session ends (now, if its process still runs) and queued
-        /// stats writes are retried.
+        /// stats writes are retried; what still fails is saved for the next start.
         fn finish_all_sessions(&mut self) {
             let finished = self.sessions.drain(local_now(), still_running);
             for (session, end) in finished {
                 self.finish_session(session, end);
             }
-            self.writer.flush(&self.settings.game_names);
+            self.writer.shutdown_flush(&self.settings.game_names);
         }
 
         /// Takes the session's frame stats and stores it if it is long enough.
@@ -689,7 +689,9 @@ mod app {
         let overlay = Overlay::new(&settings.overlay)?;
 
         let start_visible = settings.overlay.visible;
-        let writer = StatsWriter::new(dir.join(STATS_DIR));
+        let mut writer = StatsWriter::new(dir.join(STATS_DIR));
+        // Writes what an earlier run saved in pending.toml.
+        writer.flush(&settings.game_names);
         let mut app = App {
             hwnd: owner.0,
             dir,

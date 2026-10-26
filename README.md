@@ -104,8 +104,9 @@ A play session runs from a game's first counted frame until its process exits, o
 | `games.csv` | One row per game: name, sessions, play time, first and last played, lifetime avg / 1% low / 1% high, exe path. Newest first. Regenerated after every session. |
 | `sessions.csv` | One row per session: start, end, game, play time, frames, avg / 1% low / 1% high, exe path. New rows are appended. |
 | `games.toml` | Lite Bar's own store, with each game's frame-time histogram so lifetime percentiles come from every frame. Don't edit it. |
+| `pending.toml` | Only while needed: sessions and rows that couldn't be written at quit. Written at the next start, then deleted. |
 
-**Open game stats** in the tray menu opens `games.csv` in its default program (the stats folder, while there is no CSV yet). If a CSV is open in Excel and can't be written, the write is retried after the next session and at quit; `games.toml` stays the source of truth.
+**Open game stats** in the tray menu opens `games.csv` in its default program (the stats folder, while there is no CSV yet). If a CSV is open in Excel and can't be written, the write is retried after the next session and at quit, and what still can't be written at quit or sign-out is saved to `stats\pending.toml` and retried later, even after a restart; `games.toml` stays the source of truth.
 
 Games are kept apart by the exe's full path. For Java games (`java.exe`, `javaw.exe`) the name from the window title is part of the key too, so Minecraft and another Java game stay separate. The name is the first of these that works:
 

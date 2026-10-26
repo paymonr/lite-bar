@@ -211,12 +211,7 @@ impl GameStore {
                 first_played: g.first_played,
                 last_played: g.last_played,
                 total_secs: g.hist.total_secs(),
-                buckets: g
-                    .hist
-                    .to_sparse()
-                    .into_iter()
-                    .map(|(i, n)| (i, i64::try_from(n).unwrap_or(i64::MAX)))
-                    .collect(),
+                buckets: toml_buckets(&g.hist),
             };
             let value = toml::Value::try_from(out).expect("game entry converts to a TOML value");
             games.insert(key.clone(), value);
@@ -265,6 +260,101 @@ impl GameStore {
             }
         }
     }
+}
+
+// ---- pending.toml ----
+
+/// Sparse buckets for TOML, whose integers are i64 (counts clamp, as in `games.toml`).
+fn toml_buckets(hist: &FrameHistogram) -> Vec<(u32, i64)> {
+    hist.to_sparse()
+        .into_iter()
+        .map(|(i, n)| (i, i64::try_from(n).unwrap_or(i64::MAX)))
+        .collect()
+}
+
+#[derive(Serialize)]
+struct PendingOut<'a> {
+    /// Before `sessions`: TOML needs plain values ahead of the `[[sessions]]` tables.
+    rows: &'a [String],
+    sessions: Vec<PendingSessionOut<'a>>,
+}
+
+#[derive(Serialize)]
+struct PendingSessionOut<'a> {
+    start: LocalTime,
+    end: LocalTime,
+    key: &'a str,
+    name: &'a str,
+    exe_path: &'a str,
+    total_secs: f64,
+    buckets: Vec<(u32, i64)>,
+}
+
+#[derive(Deserialize)]
+struct PendingIn {
+    #[serde(default)]
+    rows: Vec<String>,
+    #[serde(default)]
+    sessions: Vec<PendingSessionIn>,
+}
+
+#[derive(Deserialize)]
+struct PendingSessionIn {
+    start: LocalTime,
+    end: LocalTime,
+    key: String,
+    name: String,
+    exe_path: String,
+    total_secs: f64,
+    #[serde(default)]
+    buckets: Vec<(u32, u64)>,
+}
+
+/// `pending.toml`: finished sessions not yet merged into `games.toml` and `sessions.csv` rows
+/// not yet appended, saved at quit so they are retried after a restart.
+pub fn pending_toml(sessions: &[SessionRecord], rows: &[String]) -> String {
+    let out = PendingOut {
+        rows,
+        sessions: sessions
+            .iter()
+            .map(|s| PendingSessionOut {
+                start: s.start,
+                end: s.end,
+                key: &s.key,
+                name: &s.name,
+                exe_path: &s.exe_path,
+                total_secs: s.hist.total_secs(),
+                buckets: toml_buckets(&s.hist),
+            })
+            .collect(),
+    };
+    toml::to_string(&out).expect("pending.toml serialization cannot fail")
+}
+
+/// Reads `pending.toml` back as `(sessions, rows)`. Any unreadable part fails the whole file.
+pub fn parse_pending(text: &str) -> Result<(Vec<SessionRecord>, Vec<String>), String> {
+    let pending: PendingIn = toml::from_str(text).map_err(|e| e.message().replace('\n', " "))?;
+    let sessions = pending
+        .sessions
+        .into_iter()
+        .map(|s| {
+            if !s.total_secs.is_finite() || s.total_secs < 0.0 {
+                return Err(format!(
+                    "total_secs {} is not a valid duration",
+                    s.total_secs
+                ));
+            }
+            Ok(SessionRecord {
+                start: s.start,
+                end: s.end,
+                key: s.key,
+                name: s.name,
+                exe_path: s.exe_path,
+                hist: FrameHistogram::from_sparse(&s.buckets, s.total_secs),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((sessions, pending.rows))
 }
 
 // ---- CSV ----
@@ -865,5 +955,55 @@ mod tests {
         let csv = games_csv(&store, &overrides);
         assert!(csv.contains("\r\nPretty Name,1,"), "{csv}");
         assert!(!csv.contains("Raw Name,"), "{csv}");
+    }
+
+    // ---- pending.toml ----
+
+    #[test]
+    fn pending_roundtrips_sessions_and_rows() {
+        let mut h = hist(500, 1.0 / 60.0);
+        for _ in 0..7 {
+            h.add(1.0 / 23.0);
+        }
+        let mut odd = session(
+            "c:\\games\\a.exe",
+            "A, \"the\" game",
+            t(1, 0, 0),
+            t(1, 1, 0),
+            h,
+        );
+        odd.exe_path = r"C:\Games\A\a.exe".into();
+        let sessions = vec![
+            odd,
+            session("b", "B", t(2, 0, 0), t(2, 3, 0), hist(480, 0.125)),
+        ];
+        let rows = vec![
+            session_csv_row(&sessions[0], "A Shown"),
+            session_csv_row(&sessions[1], "B"),
+        ];
+        let text = pending_toml(&sessions, &rows);
+        assert_eq!(parse_pending(&text), Ok((sessions, rows)));
+    }
+
+    #[test]
+    fn pending_with_only_rows_or_nothing_parses() {
+        let rows = vec!["2026-10-01 00:00:07,x\r\n".to_string()];
+        assert_eq!(
+            parse_pending(&pending_toml(&[], &rows)),
+            Ok((Vec::new(), rows))
+        );
+        assert_eq!(parse_pending(""), Ok((Vec::new(), Vec::new())));
+    }
+
+    #[test]
+    fn unreadable_pending_is_an_error() {
+        for bad in [
+            "rows = [ not toml",
+            "rows = 5",
+            "[[sessions]]\nstart = \"yesterday\"\nend = \"2026-10-01 00:00:07\"\nkey = \"k\"\nname = \"n\"\nexe_path = \"e\"\ntotal_secs = 1.0\n",
+            "[[sessions]]\nstart = \"2026-10-01 00:00:07\"\nend = \"2026-10-01 00:00:07\"\nkey = \"k\"\nname = \"n\"\nexe_path = \"e\"\ntotal_secs = nan\n",
+        ] {
+            assert!(parse_pending(bad).is_err(), "{bad}");
+        }
     }
 }

@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 
 use lite_bar_core::game_name::display_name;
 use lite_bar_core::history::{
-    games_csv, session_csv_row, GameStore, LocalTime, SessionRecord, CSV_BOM, SESSIONS_CSV_HEADER,
+    games_csv, parse_pending, pending_toml, session_csv_row, GameStore, LocalTime, SessionRecord,
+    CSV_BOM, SESSIONS_CSV_HEADER,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
@@ -17,6 +18,7 @@ use crate::log;
 const GAMES_TOML: &str = "games.toml";
 const GAMES_CSV: &str = "games.csv";
 const SESSIONS_CSV: &str = "sessions.csv";
+const PENDING_TOML: &str = "pending.toml";
 
 /// Current local date and time.
 pub fn local_now() -> LocalTime {
@@ -32,8 +34,20 @@ pub fn local_now() -> LocalTime {
     }
 }
 
+/// What `pending.toml` holds, as far as this writer knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingFile {
+    /// Nothing of ours: no file, or it was deleted once its work was written.
+    None,
+    /// Our queue, as of the last flush; rewritten or deleted after each flush.
+    Ours,
+    /// A file that could be neither read nor moved aside: never overwritten or deleted.
+    Blocked,
+}
+
 /// Writes the three stats files. Work that fails (locked file, full disk) stays queued in
-/// memory and is retried by the next `record` or `flush`.
+/// memory and is retried by the next `record` or `flush`. Work still queued at quit is saved
+/// to `pending.toml` and queued again by the next `new`.
 pub struct StatsWriter {
     dir: PathBuf,
     /// Sessions not yet merged into `games.toml`.
@@ -42,15 +56,54 @@ pub struct StatsWriter {
     rows: Vec<String>,
     /// `games.csv` needs regenerating from `games.toml`.
     games_csv_dirty: bool,
+    pending: PendingFile,
 }
 
 impl StatsWriter {
+    /// Queues the work saved in `pending.toml` by an earlier run, if any; the next `flush`
+    /// writes it.
     pub fn new(stats_dir: PathBuf) -> StatsWriter {
-        StatsWriter {
+        let mut writer = StatsWriter {
             dir: stats_dir,
             sessions: Vec::new(),
             rows: Vec::new(),
             games_csv_dirty: false,
+            pending: PendingFile::None,
+        };
+        writer.load_pending();
+        writer
+    }
+
+    fn load_pending(&mut self) {
+        let path = self.dir.join(PENDING_TOML);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) => {
+                log::error(&format!("stats: cannot read {PENDING_TOML}: {e}"));
+                self.pending = PendingFile::Blocked;
+                return;
+            }
+        };
+        let parsed = String::from_utf8(bytes)
+            .map_err(|e| e.to_string())
+            .and_then(|text| parse_pending(&text));
+        match parsed {
+            Ok((sessions, rows)) => {
+                log::info(&format!(
+                    "stats: {PENDING_TOML}: retrying {} sessions and {} rows from an earlier run",
+                    sessions.len(),
+                    rows.len()
+                ));
+                self.sessions.extend(sessions);
+                self.rows.extend(rows);
+                self.pending = PendingFile::Ours;
+            }
+            Err(reason) => {
+                if !move_aside(&path, PENDING_TOML, &reason) {
+                    self.pending = PendingFile::Blocked;
+                }
+            }
         }
     }
 
@@ -82,8 +135,37 @@ impl StatsWriter {
         self.flush(overrides);
     }
 
+    /// The last flush before quit or sign-out: whatever is still queued is saved to
+    /// `pending.toml` so it is retried after a restart.
+    pub fn shutdown_flush(&mut self, overrides: &BTreeMap<String, String>) {
+        self.flush(overrides);
+        if self.sessions.is_empty() && self.rows.is_empty() {
+            return;
+        }
+        if self.pending == PendingFile::Blocked {
+            log::error(&format!(
+                "stats: {} sessions and {} rows are lost: {PENDING_TOML} can't be replaced",
+                self.sessions.len(),
+                self.rows.len()
+            ));
+            return;
+        }
+        if self.write_pending() {
+            log::warn(&format!(
+                "stats: {} sessions and {} rows saved to {PENDING_TOML} for the next start",
+                self.sessions.len(),
+                self.rows.len()
+            ));
+        }
+    }
+
     /// Retries queued work.
     pub fn flush(&mut self, overrides: &BTreeMap<String, String>) {
+        self.write_queued(overrides);
+        self.sync_pending();
+    }
+
+    fn write_queued(&mut self, overrides: &BTreeMap<String, String>) {
         if self.sessions.is_empty() && self.rows.is_empty() && !self.games_csv_dirty {
             return;
         }
@@ -99,6 +181,38 @@ impl StatsWriter {
         }
         if !self.rows.is_empty() {
             self.append_rows();
+        }
+    }
+
+    /// Keeps our `pending.toml` equal to the queue, so work written since it was loaded is
+    /// never queued again by a later start; deletes it once the queue is empty.
+    fn sync_pending(&mut self) {
+        if self.pending != PendingFile::Ours {
+            return;
+        }
+        if !self.sessions.is_empty() || !self.rows.is_empty() {
+            self.write_pending();
+            return;
+        }
+        match std::fs::remove_file(self.dir.join(PENDING_TOML)) {
+            Ok(()) => self.pending = PendingFile::None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.pending = PendingFile::None,
+            Err(e) => log::error(&format!("stats: cannot delete {PENDING_TOML}: {e}")),
+        }
+    }
+
+    /// Saves the queue to `pending.toml`. Returns whether it worked.
+    fn write_pending(&mut self) -> bool {
+        let text = pending_toml(&self.sessions, &self.rows);
+        match write_atomic(&self.dir.join(PENDING_TOML), text.as_bytes()) {
+            Ok(()) => {
+                self.pending = PendingFile::Ours;
+                true
+            }
+            Err(e) => {
+                log::error(&format!("stats: cannot write {PENDING_TOML}: {e}"));
+                false
+            }
         }
     }
 
@@ -180,24 +294,28 @@ impl StatsWriter {
                 }
                 Some(store)
             }
-            Err(reason) => {
-                let bad = free_backup_path(&path);
-                match std::fs::rename(&path, &bad) {
-                    Ok(()) => {
-                        log::warn(&format!(
-                            "stats: {GAMES_TOML} is unreadable ({reason}); moved to {}",
-                            bad.display()
-                        ));
-                        Some(GameStore::default())
-                    }
-                    Err(e) => {
-                        log::error(&format!(
-                            "stats: {GAMES_TOML} is unreadable ({reason}) and cannot be moved aside: {e}"
-                        ));
-                        None
-                    }
-                }
-            }
+            Err(reason) => move_aside(&path, GAMES_TOML, &reason).then(GameStore::default),
+        }
+    }
+}
+
+/// Moves an unreadable file to the first free `.bad`, `.bad2`, ... name. Returns whether it
+/// worked; the file must not be overwritten otherwise.
+fn move_aside(path: &Path, name: &str, reason: &str) -> bool {
+    let bad = free_backup_path(path);
+    match std::fs::rename(path, &bad) {
+        Ok(()) => {
+            log::warn(&format!(
+                "stats: {name} is unreadable ({reason}); moved to {}",
+                bad.display()
+            ));
+            true
+        }
+        Err(e) => {
+            log::error(&format!(
+                "stats: {name} is unreadable ({reason}) and cannot be moved aside: {e}"
+            ));
+            false
         }
     }
 }
@@ -551,5 +669,135 @@ mod tests {
         assert!(!dir.join("games.toml.bad").exists());
         let toml = read(&dir, "games.toml");
         assert!(toml.contains("odd") && toml.contains("alpha"), "{toml}");
+    }
+
+    fn lock_exclusive(path: &Path) -> File {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .share_mode(0)
+            .open(path)
+            .unwrap()
+    }
+
+    fn stored(dir: &Path) -> lite_bar_core::history::GameStore {
+        lite_bar_core::history::GameStore::parse(&read(dir, "games.toml"))
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn queued_work_survives_restart() {
+        let tmp = TempDir::new("stats-pending-rows");
+        let dir = tmp.path().to_path_buf();
+        let lock = lock_exclusive(&dir.join("sessions.csv"));
+        let mut writer = StatsWriter::new(dir.clone());
+        writer.record(
+            &session("alpha", "Alpha", time(10, 0), time(10, 10)),
+            &no_overrides(),
+        );
+        writer.shutdown_flush(&no_overrides());
+        assert!(dir.join("pending.toml").is_file(), "queued row is saved");
+        drop(writer);
+        drop(lock);
+
+        let mut writer = StatsWriter::new(dir.clone());
+        writer.flush(&no_overrides());
+        assert_eq!(read(&dir, "sessions.csv").matches(",Alpha,").count(), 1);
+        assert_eq!(stored(&dir).games["alpha"].sessions, 1);
+        assert!(!dir.join("pending.toml").exists(), "deleted once written");
+    }
+
+    #[test]
+    fn queued_session_survives_restart() {
+        let tmp = TempDir::new("stats-pending-session");
+        let dir = tmp.path().to_path_buf();
+        std::fs::write(dir.join("games.toml"), "").unwrap();
+        let toml_lock = lock_exclusive(&dir.join("games.toml"));
+        let csv_lock = lock_exclusive(&dir.join("sessions.csv"));
+        let mut writer = StatsWriter::new(dir.clone());
+        writer.record(
+            &session("beta", "Beta", time(11, 0), time(11, 10)),
+            &no_overrides(),
+        );
+        writer.shutdown_flush(&no_overrides());
+        drop(writer);
+        drop(toml_lock);
+        drop(csv_lock);
+        assert_eq!(read(&dir, "games.toml"), "", "nothing was written yet");
+
+        let mut writer = StatsWriter::new(dir.clone());
+        writer.flush(&no_overrides());
+        let store = stored(&dir);
+        assert_eq!(store.games.len(), 1);
+        assert_eq!(store.games["beta"].sessions, 1);
+        assert_eq!(store.games["beta"].hist.frames(), 600);
+        assert!(read(&dir, "games.csv").contains("Beta"));
+        assert_eq!(read(&dir, "sessions.csv").matches(",Beta,").count(), 1);
+        assert!(!dir.join("pending.toml").exists());
+    }
+
+    #[test]
+    fn partly_written_pending_keeps_only_the_rest() {
+        let tmp = TempDir::new("stats-pending-partial");
+        let dir = tmp.path().to_path_buf();
+        std::fs::write(dir.join("games.toml"), "").unwrap();
+        let toml_lock = lock_exclusive(&dir.join("games.toml"));
+        let csv_lock = lock_exclusive(&dir.join("sessions.csv"));
+        let mut writer = StatsWriter::new(dir.clone());
+        writer.record(
+            &session("beta", "Beta", time(11, 0), time(11, 10)),
+            &no_overrides(),
+        );
+        writer.shutdown_flush(&no_overrides());
+        drop(writer);
+        drop(toml_lock);
+
+        // The store can be written now but sessions.csv is still locked.
+        let mut writer = StatsWriter::new(dir.clone());
+        writer.flush(&no_overrides());
+        assert_eq!(stored(&dir).games["beta"].sessions, 1);
+        drop(writer);
+        drop(csv_lock);
+
+        // The merged session must not be merged a second time.
+        let mut writer = StatsWriter::new(dir.clone());
+        writer.flush(&no_overrides());
+        assert_eq!(stored(&dir).games["beta"].sessions, 1);
+        assert_eq!(read(&dir, "sessions.csv").matches(",Beta,").count(), 1);
+        assert!(!dir.join("pending.toml").exists());
+    }
+
+    #[test]
+    fn clean_shutdown_writes_no_pending_file() {
+        let tmp = TempDir::new("stats-pending-none");
+        let dir = tmp.path().to_path_buf();
+        let mut writer = StatsWriter::new(dir.clone());
+        writer.record(
+            &session("alpha", "Alpha", time(10, 0), time(10, 10)),
+            &no_overrides(),
+        );
+        writer.shutdown_flush(&no_overrides());
+        assert!(!dir.join("pending.toml").exists());
+    }
+
+    #[test]
+    fn unparsable_pending_is_moved_aside() {
+        let tmp = TempDir::new("stats-pending-bad");
+        let dir = tmp.path().to_path_buf();
+        std::fs::write(dir.join("pending.toml"), "rows = [ broken").unwrap();
+        std::fs::write(dir.join("pending.toml.bad"), "older backup").unwrap();
+        let mut writer = StatsWriter::new(dir.clone());
+        assert!(!dir.join("pending.toml").exists());
+        assert_eq!(read(&dir, "pending.toml.bad"), "older backup");
+        assert_eq!(read(&dir, "pending.toml.bad2"), "rows = [ broken");
+
+        writer.record(
+            &session("alpha", "Alpha", time(10, 0), time(10, 10)),
+            &no_overrides(),
+        );
+        assert_eq!(stored(&dir).games["alpha"].sessions, 1);
+        assert_eq!(read(&dir, "pending.toml.bad2"), "rows = [ broken");
     }
 }
