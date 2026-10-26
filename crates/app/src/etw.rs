@@ -19,6 +19,7 @@ use ferrisetw::provider::{EventFilter, Provider};
 use ferrisetw::trace::{stop_trace_by_name, TraceError, TraceProperties, UserTrace};
 use ferrisetw::{EventRecord, SchemaLocator};
 use lite_bar_core::fps::{FpsTracker, PresentOrigin};
+use windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
 
 /// Name of our real-time ETW session.
 pub const SESSION_NAME: &str = "LiteBar-FPS";
@@ -181,6 +182,15 @@ fn note_flags_result(flags: Option<u32>) {
         Some(FlagsLog::Readable) => crate::log::info("DXGI present flags readable"),
         None => {}
     }
+}
+
+/// Current system time in the event time base: FILETIME seconds, as ETW header timestamps
+/// (see `record_present`). Focus changes are stamped with it.
+pub fn etw_now_secs() -> f64 {
+    // SAFETY: no arguments; returns a plain struct.
+    let t = unsafe { GetSystemTimePreciseAsFileTime() };
+    let ticks = u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime);
+    ticks as f64 / TICKS_PER_SEC
 }
 
 /// Hot path: runs once per present event, at the game's frame rate. Allocation-free, never
@@ -378,6 +388,21 @@ mod tests {
             )),
             CaptureError::Other(_)
         ));
+    }
+
+    #[test]
+    fn etw_now_is_system_time_in_the_event_base() {
+        // FILETIME counts from 1601-01-01; the Unix epoch is 11_644_473_600 s later.
+        const UNIX_EPOCH_AS_FILETIME_SECS: f64 = 11_644_473_600.0;
+        let unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        let now = etw_now_secs();
+        assert!(
+            (now - (unix + UNIX_EPOCH_AS_FILETIME_SECS)).abs() < 5.0,
+            "etw_now_secs {now}, SystemTime {unix}"
+        );
     }
 
     #[test]

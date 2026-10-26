@@ -1,8 +1,9 @@
 //! Per-process FPS from present timestamps. Pure logic, no Windows types.
 //!
 //! Two time bases are involved. `event_time` is the ETW event timestamp in seconds: accurate,
-//! but events arrive in bursts because of ETW's buffer flushing. `received_at` / `now` is the
-//! app's monotonic clock in seconds and is only used to detect processes that stopped presenting.
+//! but events arrive in bursts because of ETW's buffer flushing. Focus changes (`set_focus`)
+//! are stamped in the same base, so a late event is judged by the focus when it was presented.
+//! `received_at` / `now` is the app's monotonic clock in seconds and is only used to detect processes that stopped presenting.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -88,6 +89,8 @@ struct StatsState {
     origin: PresentOrigin,
     /// Time of the previous counted present of `origin`.
     prev: Option<f64>,
+    /// Focus span `prev` was counted in. A chain never links two spans.
+    span: u64,
     hist: Option<FrameHistogram>,
 }
 
@@ -96,20 +99,32 @@ impl Default for StatsState {
         Self {
             origin: PresentOrigin::Kernel,
             prev: None,
+            span: 0,
             hist: None,
         }
     }
 }
 
 impl StatsState {
-    fn observe(&mut self, origin: PresentOrigin, event_time: f64, focused: bool) {
+    /// `span` is the id of the focus span the present falls in, or `None` when the pid was
+    /// not focused at `event_time`.
+    fn observe(&mut self, origin: PresentOrigin, event_time: f64, span: Option<u64>) {
         if origin == PresentOrigin::Api && self.origin == PresentOrigin::Kernel {
             self.origin = PresentOrigin::Api;
             self.prev = None;
             self.hist = None;
         }
-        if origin != self.origin || !focused {
+        let Some(span) = span else {
+            // Not focused then: a background run never bridges two focused intervals.
+            self.prev = None;
             return;
+        };
+        if origin != self.origin {
+            return;
+        }
+        if span != self.span {
+            self.span = span;
+            self.prev = None;
         }
         match self.prev {
             // A long pause, or the clock stepped backwards: a break, so the chain restarts.
@@ -132,6 +147,34 @@ impl StatsState {
     }
 }
 
+/// A stretch of event time during which one pid (or none) had the focus.
+#[derive(Clone, Copy)]
+struct FocusSpan {
+    /// Grows with every focus change.
+    id: u64,
+    pid: Option<u32>,
+    /// Start (inclusive) and end (exclusive), in the ETW event time base.
+    since: f64,
+    until: f64,
+}
+
+impl FocusSpan {
+    fn covers(&self, pid: u32, event_time: f64) -> bool {
+        self.pid == Some(pid) && self.since <= event_time && event_time < self.until
+    }
+}
+
+impl Default for FocusSpan {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            pid: None,
+            since: f64::NEG_INFINITY,
+            until: f64::INFINITY,
+        }
+    }
+}
+
 #[derive(Default)]
 struct PidState {
     api: Series,
@@ -143,7 +186,10 @@ struct PidState {
 #[derive(Default)]
 pub struct FpsTracker {
     pids: HashMap<u32, PidState>,
-    focus: Option<u32>,
+    /// The current focus (open-ended) and the one before it. ETW delivers presents up to about
+    /// 1 s late, so a present is judged by the focus at its own event time, not at delivery.
+    focus: FocusSpan,
+    prev_focus: FocusSpan,
 }
 
 impl FpsTracker {
@@ -159,13 +205,19 @@ impl FpsTracker {
         event_time: f64,
         received_at: f64,
     ) {
-        let focused = self.focus == Some(pid);
+        let span = if self.focus.covers(pid, event_time) {
+            Some(self.focus.id)
+        } else if self.prev_focus.covers(pid, event_time) {
+            Some(self.prev_focus.id)
+        } else {
+            None
+        };
         let state = self.pids.entry(pid).or_default();
         match origin {
             PresentOrigin::Api => state.api.push(event_time, received_at),
             PresentOrigin::Kernel => state.kernel.push(event_time, received_at),
         }
-        state.stats.observe(origin, event_time, focused);
+        state.stats.observe(origin, event_time, span);
     }
 
     /// FPS for `pid` at app-clock time `now`. Prefers a fresh `Api` series with at least two
@@ -177,17 +229,25 @@ impl FpsTracker {
         state.api.rate(now).or_else(|| state.kernel.rate(now))
     }
 
-    /// Sets the pid whose presents feed frame stats. A different value forgets every pid's
-    /// previous-present timestamp so a focus gap or capture restart is never a frame time;
-    /// histograms are kept. The same value changes nothing.
-    pub fn set_focus(&mut self, pid: Option<u32>) {
-        if self.focus == pid {
+    /// Sets the pid whose presents feed frame stats from event time `at` (the ETW time base;
+    /// see the module docs). A present counts for its pid only if that pid had the focus at
+    /// the present's own event time: in the current span, or in the previous one for presents
+    /// delivered late. Each span starts a new interval chain, so a focus gap or capture
+    /// restart is never a frame time; histograms are kept. The same pid changes nothing.
+    pub fn set_focus(&mut self, pid: Option<u32>, at: f64) {
+        if self.focus.pid == pid {
             return;
         }
-        self.focus = pid;
-        for state in self.pids.values_mut() {
-            state.stats.prev = None;
-        }
+        self.prev_focus = FocusSpan {
+            until: at,
+            ..self.focus
+        };
+        self.focus = FocusSpan {
+            id: self.focus.id + 1,
+            pid,
+            since: at,
+            until: f64::INFINITY,
+        };
     }
 
     /// Frame-time histogram accumulated for `pid` while it was focused.
@@ -402,7 +462,7 @@ mod tests {
     #[test]
     fn focused_pid_accumulates_stats() {
         let mut t = FpsTracker::new();
-        t.set_focus(Some(42));
+        t.set_focus(Some(42), 0.0);
         present_run(&mut t, 42, PresentOrigin::Kernel, 100.0, 1.0 / 60.0, 600);
         assert_eq!(t.stats(42).unwrap().frames(), 599);
     }
@@ -410,7 +470,7 @@ mod tests {
     #[test]
     fn unfocused_pid_has_no_stats() {
         let mut t = FpsTracker::new();
-        t.set_focus(Some(1));
+        t.set_focus(Some(1), 0.0);
         present_run(&mut t, 42, PresentOrigin::Kernel, 100.0, 1.0 / 60.0, 600);
         assert!(t.stats(42).is_none());
         assert!(t.stats(1).is_none());
@@ -419,20 +479,64 @@ mod tests {
     #[test]
     fn refocus_does_not_count_the_gap() {
         let mut t = FpsTracker::new();
-        t.set_focus(Some(1));
-        present_run(&mut t, 1, PresentOrigin::Kernel, 100.0, 0.01, 200);
-        t.set_focus(Some(2));
-        t.set_focus(Some(1));
-        present_run(&mut t, 1, PresentOrigin::Kernel, 400.0, 0.01, 200);
+        t.set_focus(Some(1), 0.0);
+        present_run(&mut t, 1, PresentOrigin::Kernel, 100.0, 0.01, 200); // to 101.99
+        t.set_focus(Some(2), 102.0);
+        t.set_focus(Some(1), 103.0);
+        // Pid 1 drew nothing in the background, and the 1.5 s gap is under the pause limit:
+        // only the focus change keeps it out.
+        present_run(&mut t, 1, PresentOrigin::Kernel, 103.5, 0.01, 200);
         let h = t.stats(1).unwrap();
         assert_eq!(h.frames(), 398);
         assert!((h.total_secs() - 3.98).abs() < 0.01, "{}", h.total_secs());
     }
 
     #[test]
+    fn late_present_from_before_focus_is_not_counted() {
+        let mut t = FpsTracker::new();
+        t.set_focus(Some(2), 0.0);
+        t.set_focus(Some(1), 100.0);
+        // Delivered after the focus change, but presented before pid 1 had the focus.
+        present_run(&mut t, 1, PresentOrigin::Kernel, 99.0, 0.01, 100); // 99.00..99.99
+        assert!(t.stats(1).is_none());
+        present_run(&mut t, 1, PresentOrigin::Kernel, 100.0, 0.01, 100);
+        let h = t.stats(1).unwrap();
+        assert_eq!(h.frames(), 99);
+        assert!((h.total_secs() - 0.99).abs() < 1e-6, "{}", h.total_secs());
+    }
+
+    #[test]
+    fn late_present_from_previous_focus_is_counted_for_previous_pid() {
+        let mut t = FpsTracker::new();
+        t.set_focus(Some(1), 100.0);
+        t.set_focus(Some(2), 101.0);
+        // Pid 1's last focused second, delivered after the focus moved to pid 2.
+        present_run(&mut t, 1, PresentOrigin::Kernel, 100.0, 0.01, 100); // 100.00..100.99
+        assert_eq!(t.stats(1).unwrap().frames(), 99);
+        // From 101.0 pid 1 is in the background.
+        present_run(&mut t, 1, PresentOrigin::Kernel, 101.0, 0.01, 50);
+        assert_eq!(t.stats(1).unwrap().frames(), 99);
+    }
+
+    #[test]
+    fn background_present_breaks_the_chain() {
+        let mut t = FpsTracker::new();
+        t.set_focus(Some(1), 100.0);
+        present_run(&mut t, 1, PresentOrigin::Kernel, 100.0, 0.01, 100); // 100.00..100.99
+        t.set_focus(Some(2), 101.0);
+        t.set_focus(Some(1), 102.0);
+        // Delivered after both focus changes: a background run, then focused again.
+        present_run(&mut t, 1, PresentOrigin::Kernel, 101.0, 0.01, 100); // 101.00..101.99
+        present_run(&mut t, 1, PresentOrigin::Kernel, 102.0, 0.01, 100); // 102.00..102.99
+        let h = t.stats(1).unwrap();
+        assert_eq!(h.frames(), 2 * 99);
+        assert!((h.total_secs() - 1.98).abs() < 1e-6, "{}", h.total_secs());
+    }
+
+    #[test]
     fn api_presents_replace_kernel_for_stats() {
         let mut t = FpsTracker::new();
-        t.set_focus(Some(9));
+        t.set_focus(Some(9), 0.0);
         present_run(&mut t, 9, PresentOrigin::Kernel, 100.0, 1.0 / 60.0, 30);
         assert_eq!(t.stats(9).unwrap().frames(), 29);
         // A DXGI game: every frame yields an Api present and a slightly later Kernel present.
@@ -452,7 +556,7 @@ mod tests {
         let mut t = FpsTracker::new();
         // The game presents through the API while unfocused, then gets focus.
         t.record_present(9, PresentOrigin::Api, 100.0, 10.0);
-        t.set_focus(Some(9));
+        t.set_focus(Some(9), 100.1);
         // Kernel presents are not counted: the origin already switched to Api.
         t.record_present(9, PresentOrigin::Kernel, 100.2, 10.0);
         t.record_present(9, PresentOrigin::Kernel, 100.4, 10.0);
@@ -471,7 +575,7 @@ mod tests {
     #[test]
     fn out_of_order_present_is_skipped() {
         let mut t = FpsTracker::new();
-        t.set_focus(Some(1));
+        t.set_focus(Some(1), 0.0);
         for at in [1.0, 1.1, 1.05, 1.2] {
             t.record_present(1, PresentOrigin::Kernel, at, 10.0);
         }
@@ -484,7 +588,7 @@ mod tests {
     #[test]
     fn long_pause_is_not_a_frame_time() {
         let mut t = FpsTracker::new();
-        t.set_focus(Some(1));
+        t.set_focus(Some(1), 0.0);
         present_run(&mut t, 1, PresentOrigin::Kernel, 100.0, 1.0 / 60.0, 600);
         // Sleep, a modal dialog or a game that stops presenting: 8 h with no presents.
         present_run(
@@ -504,7 +608,7 @@ mod tests {
     #[test]
     fn clock_step_back_resets_the_chain() {
         let mut t = FpsTracker::new();
-        t.set_focus(Some(1));
+        t.set_focus(Some(1), 0.0);
         present_run(&mut t, 1, PresentOrigin::Kernel, 100.0, 0.01, 11);
         // The system clock stepped back by 50 s: the chain restarts at the new time.
         present_run(&mut t, 1, PresentOrigin::Kernel, 50.0, 0.01, 11);
@@ -516,7 +620,7 @@ mod tests {
     #[test]
     fn gap_just_under_limit_is_counted() {
         let mut t = FpsTracker::new();
-        t.set_focus(Some(1));
+        t.set_focus(Some(1), 0.0);
         t.record_present(1, PresentOrigin::Kernel, 100.0, 10.0);
         t.record_present(
             1,
@@ -532,9 +636,10 @@ mod tests {
     #[test]
     fn same_focus_keeps_interval_chain() {
         let mut t = FpsTracker::new();
-        t.set_focus(Some(1));
+        t.set_focus(Some(1), 0.0);
         t.record_present(1, PresentOrigin::Kernel, 1.0, 10.0);
-        t.set_focus(Some(1));
+        // Same pid: nothing changes, not even the interval start.
+        t.set_focus(Some(1), 1.05);
         t.record_present(1, PresentOrigin::Kernel, 1.1, 10.0);
         assert_eq!(t.stats(1).unwrap().frames(), 1);
     }
@@ -542,7 +647,7 @@ mod tests {
     #[test]
     fn take_stats_removes_them() {
         let mut t = FpsTracker::new();
-        t.set_focus(Some(1));
+        t.set_focus(Some(1), 0.0);
         present_run(&mut t, 1, PresentOrigin::Kernel, 100.0, 0.01, 50);
         let h = t.take_stats(1).unwrap();
         assert_eq!(h.frames(), 49);
@@ -553,7 +658,7 @@ mod tests {
     #[test]
     fn prune_keeps_pids_with_stats() {
         let mut t = FpsTracker::new();
-        t.set_focus(Some(1));
+        t.set_focus(Some(1), 0.0);
         present_run(&mut t, 1, PresentOrigin::Kernel, 100.0, 0.01, 50);
         present_run(&mut t, 2, PresentOrigin::Kernel, 100.0, 0.01, 50);
         t.prune(1000.0);

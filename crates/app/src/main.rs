@@ -71,7 +71,7 @@ mod app {
     };
 
     use crate::elevation::{is_elevated, relaunch_as_admin};
-    use crate::etw::{offers_admin, CaptureError, PresentCapture};
+    use crate::etw::{etw_now_secs, offers_admin, CaptureError, PresentCapture};
     use crate::foreground::{foreground_pid, foreground_title};
     use crate::game_lookup::resolve_name;
     use crate::hotkeys::{self, HotkeyId, Registration};
@@ -233,7 +233,7 @@ mod app {
             self.tracker
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .set_focus(None);
+                .set_focus(None, etw_now_secs());
             // Hide and stop the timer first, so the ETW stop latency is not visible.
             self.overlay.hide();
             // SAFETY: plain FFI on our own window.
@@ -266,7 +266,7 @@ mod app {
                     // recorded.
                     tracker.take_stats(refused);
                 }
-                tracker.set_focus(pid);
+                tracker.set_focus(pid, etw_now_secs());
                 match pid {
                     Some(pid) => {
                         let hist = tracker.stats(pid);
