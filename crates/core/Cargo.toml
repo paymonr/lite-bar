@@ -6,6 +6,4 @@ edition.workspace = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 toml.workspace = true
