@@ -100,18 +100,24 @@ impl FrameHistogram {
     /// `None` below [`MIN_STATS_FRAMES`]. Low = slowest 1% (99th percentile frame time),
     /// high = fastest 1%.
     pub fn summary(&self) -> Option<StatsSummary> {
-        if self.frames < MIN_STATS_FRAMES || self.total_secs <= 0.0 {
+        if self.frames < MIN_STATS_FRAMES || !self.total_secs.is_finite() || self.total_secs <= 0.0
+        {
             return None;
         }
         let slow = self.percentile_frame_secs(0.99)?;
         let fast = self.percentile_frame_secs(0.01)?;
-        Some(StatsSummary {
+        let summary = StatsSummary {
             frames: self.frames,
             play_secs: self.total_secs,
             avg_fps: self.frames as f64 / self.total_secs,
             low_1pct_fps: 1.0 / slow,
             high_1pct_fps: 1.0 / fast,
-        })
+        };
+        // A tiny total (corrupt history) can overflow the average to infinity.
+        let finite = summary.avg_fps.is_finite()
+            && summary.low_1pct_fps.is_finite()
+            && summary.high_1pct_fps.is_finite();
+        finite.then_some(summary)
     }
 
     /// Non-empty buckets as `(index, count)`, ascending by index.
@@ -278,5 +284,16 @@ mod tests {
         merged.merge(&h);
         assert_eq!(merged.frames(), u64::MAX);
         assert_eq!(merged.to_sparse(), vec![(5, u64::MAX), (6, u64::MAX)]);
+    }
+
+    #[test]
+    fn non_finite_or_overflowing_totals_give_no_summary() {
+        for total in [f64::NAN, f64::INFINITY, -1.0, 0.0, 1e-320] {
+            let h = FrameHistogram::from_sparse(&[(5, 200)], total);
+            assert!(h.summary().is_none(), "total {total}");
+        }
+        assert!(FrameHistogram::from_sparse(&[(5, 200)], 2.0)
+            .summary()
+            .is_some());
     }
 }

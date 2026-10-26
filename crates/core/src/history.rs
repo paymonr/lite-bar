@@ -6,7 +6,7 @@ use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::frame_stats::FrameHistogram;
+use crate::frame_stats::{FrameHistogram, StatsSummary};
 use crate::game_name::display_name;
 
 /// Sessions with less counted play time than this are discarded.
@@ -116,6 +116,29 @@ pub struct GameRecord {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GameStore {
     pub games: BTreeMap<String, GameRecord>,
+    /// Raw values of `games.toml` entries that could not be read, kept so saving never drops them.
+    pub unparsed: BTreeMap<String, toml::Value>,
+}
+
+fn parse_game(value: &toml::Value) -> Result<GameRecord, String> {
+    let g: GameIn = value
+        .clone()
+        .try_into()
+        .map_err(|e: toml::de::Error| e.message().replace('\n', " "))?;
+    if !g.total_secs.is_finite() || g.total_secs < 0.0 {
+        return Err(format!(
+            "total_secs {} is not a valid duration",
+            g.total_secs
+        ));
+    }
+    Ok(GameRecord {
+        name: g.name,
+        exe_path: g.exe_path,
+        sessions: g.sessions,
+        first_played: g.first_played,
+        last_played: g.last_played,
+        hist: FrameHistogram::from_sparse(&g.buckets, g.total_secs),
+    })
 }
 
 /// On-disk shape of one game in `games.toml`.
@@ -145,67 +168,77 @@ struct GameOut<'a> {
 }
 
 #[derive(Serialize)]
-struct FileOut<'a> {
-    games: BTreeMap<&'a str, GameOut<'a>>,
+struct FileOut {
+    games: BTreeMap<String, toml::Value>,
 }
 
 impl GameStore {
-    /// Errors on invalid TOML or a `games` value that isn't a table. A single malformed game
-    /// entry is skipped so one bad edit doesn't lose the rest of the history. Unknown fields
-    /// are ignored.
-    pub fn parse(text: &str) -> Result<GameStore, String> {
+    /// Errors on invalid TOML or a `games` value that isn't a table. A malformed game entry
+    /// doesn't fail the file: it is reported in the returned warnings (naming the key and the
+    /// reason) and its raw value is kept in `unparsed`, so saving never loses it. Unknown
+    /// fields are ignored.
+    pub fn parse(text: &str) -> Result<(GameStore, Vec<String>), String> {
         let root: toml::Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
         let entries = match root.get("games") {
-            None => return Ok(GameStore::default()),
+            None => return Ok((GameStore::default(), Vec::new())),
             Some(toml::Value::Table(entries)) => entries,
             Some(_) => return Err("`games` must be a table".to_string()),
         };
-        let games = entries
-            .iter()
-            .filter_map(|(key, value)| {
-                let g: GameIn = value.clone().try_into().ok()?;
-                let record = GameRecord {
-                    name: g.name,
-                    exe_path: g.exe_path,
-                    sessions: g.sessions,
-                    first_played: g.first_played,
-                    last_played: g.last_played,
-                    hist: FrameHistogram::from_sparse(&g.buckets, g.total_secs),
-                };
-                Some((key.clone(), record))
-            })
-            .collect();
-        Ok(GameStore { games })
+        let mut store = GameStore::default();
+        let mut warnings = Vec::new();
+        for (key, value) in entries {
+            match parse_game(value) {
+                Ok(record) => {
+                    store.games.insert(key.clone(), record);
+                }
+                Err(reason) => {
+                    warnings.push(format!("games.{key}: {reason}"));
+                    store.unparsed.insert(key.clone(), value.clone());
+                }
+            }
+        }
+        Ok((store, warnings))
     }
 
     pub fn to_toml(&self) -> String {
-        let games = self
-            .games
-            .iter()
-            .map(|(key, g)| {
-                let out = GameOut {
-                    name: &g.name,
-                    exe_path: &g.exe_path,
-                    sessions: g.sessions,
-                    first_played: g.first_played,
-                    last_played: g.last_played,
-                    total_secs: g.hist.total_secs(),
-                    buckets: g
-                        .hist
-                        .to_sparse()
-                        .into_iter()
-                        .map(|(i, n)| (i, i64::try_from(n).unwrap_or(i64::MAX)))
-                        .collect(),
-                };
-                (key.as_str(), out)
-            })
-            .collect();
+        // Unreadable entries first so a parsed entry would win on a (never expected) key clash.
+        let mut games = self.unparsed.clone();
+        for (key, g) in &self.games {
+            let out = GameOut {
+                name: &g.name,
+                exe_path: &g.exe_path,
+                sessions: g.sessions,
+                first_played: g.first_played,
+                last_played: g.last_played,
+                total_secs: g.hist.total_secs(),
+                buckets: g
+                    .hist
+                    .to_sparse()
+                    .into_iter()
+                    .map(|(i, n)| (i, i64::try_from(n).unwrap_or(i64::MAX)))
+                    .collect(),
+            };
+            let value = toml::Value::try_from(out).expect("game entry converts to a TOML value");
+            games.insert(key.clone(), value);
+        }
         // Panicking beats returning an empty string that the caller would write over the history.
         toml::to_string(&FileOut { games }).expect("games.toml serialization cannot fail")
     }
 
     /// Adds a finished session. `name` and `exe_path` follow the newest session (by end time).
+    /// If `unparsed` holds an entry for this key it moves to `<key>#unreadable` and the session
+    /// starts a fresh record.
     pub fn add_session(&mut self, s: &SessionRecord) {
+        // An unreadable entry under this key is set aside (never overwritten) so both survive.
+        if let Some(raw) = self.unparsed.remove(&s.key) {
+            let mut slot = format!("{}#unreadable", s.key);
+            let mut n = 2;
+            while self.unparsed.contains_key(&slot) {
+                slot = format!("{}#unreadable{n}", s.key);
+                n += 1;
+            }
+            self.unparsed.insert(slot, raw);
+        }
         match self.games.get_mut(&s.key) {
             Some(g) => {
                 g.sessions = g.sessions.saturating_add(1);
@@ -247,7 +280,8 @@ fn csv_field(value: &str) -> String {
 
 /// `H:MM:SS`, seconds truncated, hours unbounded.
 fn play_time(secs: f64) -> String {
-    let total = secs as u64; // saturating: negative and NaN become 0
+    // Negative and NaN become 0 in the cast; infinity would saturate, so it is zeroed too.
+    let total = if secs.is_finite() { secs as u64 } else { 0 };
     format!(
         "{}:{:02}:{:02}",
         total / 3600,
@@ -258,7 +292,10 @@ fn play_time(secs: f64) -> String {
 
 /// `avg_fps,low_1pct_fps,high_1pct_fps`, each with one decimal; empty without a summary.
 fn fps_columns(hist: &FrameHistogram) -> String {
-    match hist.summary() {
+    let finite = |s: &StatsSummary| {
+        s.avg_fps.is_finite() && s.low_1pct_fps.is_finite() && s.high_1pct_fps.is_finite()
+    };
+    match hist.summary().filter(finite) {
         Some(s) => format!(
             "{:.1},{:.1},{:.1}",
             s.avg_fps, s.low_1pct_fps, s.high_1pct_fps
@@ -504,8 +541,9 @@ mod tests {
     fn store_roundtrips_through_toml() {
         let store = sample_store();
         let text = store.to_toml();
-        let back = GameStore::parse(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        let (back, warnings) = GameStore::parse(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
         assert_eq!(back, store, "{text}");
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
@@ -521,7 +559,10 @@ mod tests {
 
     #[test]
     fn parse_empty_text_is_empty_store() {
-        assert_eq!(GameStore::parse("").unwrap(), GameStore::default());
+        assert_eq!(
+            GameStore::parse("").unwrap(),
+            (GameStore::default(), Vec::new())
+        );
     }
 
     #[test]
@@ -540,14 +581,122 @@ mod tests {
         let text = format!(
             "{good}\n[games.broken]\nname = \"Broken\"\nsessions = \"many\"\n\n[games.badtime]\nname = \"B\"\nexe_path = \"b.exe\"\nsessions = 1\nfirst_played = \"yesterday\"\nlast_played = \"2026-10-01 00:00:00\"\ntotal_secs = 1.0\n"
         );
-        let store = GameStore::parse(&text).unwrap();
-        assert_eq!(store, sample_store());
+        let (store, _) = GameStore::parse(&text).unwrap();
+        assert_eq!(store.games, sample_store().games);
+    }
+
+    const BAD_SESSIONS: &str =
+        "[games.broken]\nname = \"Broken\"\nsessions = \"many\"\nfuture = [1, 2]\n";
+    const BAD_TIME: &str = "[games.badtime]\nname = \"B\"\nexe_path = \"b.exe\"\nsessions = 1\nfirst_played = \"yesterday\"\nlast_played = \"2026-10-01 00:00:00\"\ntotal_secs = 1.0\n";
+
+    #[test]
+    fn parse_reports_each_skipped_entry_with_key_and_reason() {
+        let text = format!("{BAD_SESSIONS}\n{BAD_TIME}");
+        let (store, warnings) = GameStore::parse(&text).unwrap();
+        assert!(store.games.is_empty());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("badtime"), "{warnings:?}");
+        assert!(warnings[0].contains("yesterday"), "{warnings:?}");
+        assert!(warnings[1].contains("broken"), "{warnings:?}");
+        assert_eq!(
+            store
+                .unparsed
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["badtime", "broken"]
+        );
+    }
+
+    #[test]
+    fn skipped_entries_survive_to_toml_and_parse_unchanged() {
+        let text = format!("{}\n{BAD_SESSIONS}\n{BAD_TIME}", sample_store().to_toml());
+        let (store, _) = GameStore::parse(&text).unwrap();
+        assert_eq!(store.unparsed.len(), 2);
+        let (again, warnings) = GameStore::parse(&store.to_toml()).unwrap();
+        assert_eq!(again, store);
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(
+            again.unparsed["broken"],
+            text.parse::<toml::Table>().unwrap()["games"]["broken"]
+        );
+    }
+
+    #[test]
+    fn non_table_game_entry_is_kept_as_unparsed() {
+        let (store, warnings) = GameStore::parse("[games]\nweird = 5\n").unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(store.unparsed["weird"], toml::Value::Integer(5));
+        assert!(store.to_toml().contains("weird = 5"));
+    }
+
+    fn game_toml(total_secs: &str) -> String {
+        format!("[games.k]\nname = \"G\"\nexe_path = \"g.exe\"\nsessions = 1\nfirst_played = \"2026-10-01 00:00:00\"\nlast_played = \"2026-10-02 00:00:00\"\ntotal_secs = {total_secs}\nbuckets = [[5, 200]]\n")
+    }
+
+    #[test]
+    fn non_finite_or_negative_total_secs_makes_the_entry_unreadable_but_preserved() {
+        for bad in ["nan", "inf", "-inf", "-1.0"] {
+            let (store, warnings) = GameStore::parse(&game_toml(bad)).unwrap();
+            assert!(store.games.is_empty(), "{bad}");
+            assert!(store.unparsed.contains_key("k"), "{bad}");
+            assert_eq!(warnings.len(), 1, "{bad}: {warnings:?}");
+            assert!(
+                warnings[0].contains('k') && warnings[0].contains("total_secs"),
+                "{warnings:?}"
+            );
+            // Saved and reloaded it is still there with the same raw text.
+            let saved = store.to_toml();
+            assert!(
+                saved.contains(&format!("total_secs = {bad}")),
+                "{bad}: {saved}"
+            );
+            let (again, _) = GameStore::parse(&saved).unwrap();
+            assert!(again.unparsed.contains_key("k"), "{bad}");
+            assert_eq!(again.to_toml(), saved, "{bad}");
+        }
+    }
+
+    #[test]
+    fn add_session_on_an_unparsed_key_keeps_the_raw_entry_as_unreadable() {
+        let (mut store, _) = GameStore::parse(BAD_SESSIONS).unwrap();
+        let raw = store.unparsed["broken"].clone();
+        store.add_session(&session(
+            "broken",
+            "Fresh",
+            t(3, 9, 0),
+            t(3, 10, 0),
+            hist(480, 0.125),
+        ));
+        assert_eq!(store.games["broken"].name, "Fresh");
+        assert_eq!(store.games["broken"].sessions, 1);
+        assert!(!store.unparsed.contains_key("broken"));
+        assert_eq!(store.unparsed["broken#unreadable"], raw);
+        // A second unreadable entry for the same key must not overwrite the first.
+        store
+            .unparsed
+            .insert("broken".into(), toml::Value::Integer(7));
+        store.games.remove("broken");
+        store.add_session(&session(
+            "broken",
+            "Fresh2",
+            t(4, 9, 0),
+            t(4, 10, 0),
+            hist(480, 0.125),
+        ));
+        assert_eq!(store.unparsed["broken#unreadable"], raw);
+        assert_eq!(store.unparsed.len(), 2);
+        assert!(store
+            .unparsed
+            .values()
+            .any(|v| *v == toml::Value::Integer(7)));
     }
 
     #[test]
     fn parse_ignores_unknown_fields() {
         let text = "[games.k]\nname = \"G\"\nexe_path = \"g.exe\"\nsessions = 3\nfirst_played = \"2026-10-01 00:00:00\"\nlast_played = \"2026-10-02 00:00:00\"\ntotal_secs = 90\nbuckets = [[5, 10]]\nfuture_field = true\n";
-        let store = GameStore::parse(text).unwrap();
+        let (store, warnings) = GameStore::parse(text).unwrap();
+        assert!(warnings.is_empty());
         let g = &store.games["k"];
         assert_eq!(g.sessions, 3);
         assert_eq!(g.hist.total_secs(), 90.0);
@@ -564,7 +713,7 @@ mod tests {
         );
         g.sessions = u32::MAX;
         store.games.insert("k".into(), g);
-        let back = GameStore::parse(&store.to_toml()).unwrap();
+        let (back, _) = GameStore::parse(&store.to_toml()).unwrap();
         assert_eq!(back.games["k"].hist.to_sparse(), vec![(5, i64::MAX as u64)]);
     }
 
@@ -675,6 +824,34 @@ mod tests {
             csv.lines().nth(1).unwrap(),
             "\"Tom \"\"Clancy\"\", Inc\",1,0:01:00,2026-10-01 00:00:07,2026-10-02 00:00:07,8.0,8.0,8.0,\"C:\\Games\\Tom \"\"Clancy\"\", Inc.exe\""
         );
+    }
+
+    #[test]
+    fn csv_never_contains_non_finite_numbers() {
+        let mut store = GameStore::default();
+        // 100 frames in a vanishingly small total: avg fps would overflow to infinity.
+        let tiny = FrameHistogram::from_sparse(&[(5, 100)], 1e-320);
+        let nan = FrameHistogram::from_sparse(&[(5, 100)], f64::NAN);
+        let inf = FrameHistogram::from_sparse(&[(5, 100)], f64::INFINITY);
+        store
+            .games
+            .insert("a".into(), game("Tiny", t(1, 0, 0), tiny.clone()));
+        store
+            .games
+            .insert("b".into(), game("NotNum", t(2, 0, 0), nan.clone()));
+        store
+            .games
+            .insert("c".into(), game("Endless", t(3, 0, 0), inf.clone()));
+        let mut all = games_csv(&store, &BTreeMap::new());
+        for h in [tiny, nan, inf] {
+            all.push_str(&session_csv_row(
+                &session("k", "x", t(1, 0, 0), t(1, 1, 0), h),
+                "x",
+            ));
+        }
+        assert!(all.contains("\r\nEndless,1,0:00:00,"), "{all}");
+        let lower = all.to_lowercase();
+        assert!(!lower.contains("nan") && !lower.contains("inf"), "{all}");
     }
 
     #[test]
