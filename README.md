@@ -95,7 +95,7 @@ With `stats` set to `"inline"` or `"stacked"`, the overlay shows three numbers n
 
 They show `—` until the game has at least 100 counted frames. Frame times are kept in buckets about 1% wide, so the percentiles are accurate to about 1%.
 
-Frames only count while the counter is on (capture stops while the overlay is hidden) and while the game is the foreground app. Alt-tabbing away pauses its stats, and coming back resumes them.
+Frames only count while the counter is on (capture stops while the overlay is hidden) and while the game is the foreground app. Alt-tabbing away pauses its stats, and coming back resumes them. A gap of more than 2 s between two frames (sleep or hibernate, a modal dialog, a game that stops drawing) is a break, not a frame time, so it adds nothing to the play time.
 
 A play session runs from a game's first counted frame until its process exits, or until Lite Bar quits or you sign out. Sessions with less than 60 s of counted play are dropped, which keeps out launchers and quick alt-tabs. If the game exits while the overlay is hidden, the session ends at the last time Lite Bar saw it running. Kept sessions are saved in `%APPDATA%\LiteBar\stats\`:
 

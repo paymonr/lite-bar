@@ -12,6 +12,12 @@ use crate::frame_stats::FrameHistogram;
 pub const WINDOW_SECS: f64 = 1.0;
 /// A pid with no events received for longer than this shows no FPS and gets pruned.
 pub const STALE_SECS: f64 = 2.0;
+/// A gap between two presents longer than this (sleep, a modal dialog, a game that stopped
+/// presenting) is a break in play, not a frame time. Same as the live counter's stale limit.
+pub const MAX_FRAME_GAP_SECS: f64 = STALE_SECS;
+/// A present this much older than the previous one means the clock stepped backwards; smaller
+/// out-of-order skips are ordinary ETW reordering.
+const CLOCK_STEP_BACK_SECS: f64 = 1.0;
 
 /// Where a present event came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,13 +112,20 @@ impl StatsState {
             return;
         }
         match self.prev {
+            // A long pause, or the clock stepped backwards: a break, so the chain restarts.
+            Some(prev)
+                if event_time - prev > MAX_FRAME_GAP_SECS
+                    || event_time < prev - CLOCK_STEP_BACK_SECS =>
+            {
+                self.prev = Some(event_time);
+            }
             Some(prev) if event_time > prev => {
                 self.hist
                     .get_or_insert_with(FrameHistogram::new)
                     .add(event_time - prev);
                 self.prev = Some(event_time);
             }
-            // Not newer than the previous present: skipped, and the chain does not move.
+            // Slightly out of order: skipped, and the chain does not move.
             Some(_) => {}
             None => self.prev = Some(event_time),
         }
@@ -466,6 +479,54 @@ mod tests {
         // 1.05 is not newer than 1.1: skipped and does not move the chain, so 1.1 -> 1.2 counts.
         assert_eq!(h.frames(), 2);
         assert!((h.total_secs() - 0.2).abs() < 1e-9, "{}", h.total_secs());
+    }
+
+    #[test]
+    fn long_pause_is_not_a_frame_time() {
+        let mut t = FpsTracker::new();
+        t.set_focus(Some(1));
+        present_run(&mut t, 1, PresentOrigin::Kernel, 100.0, 1.0 / 60.0, 600);
+        // Sleep, a modal dialog or a game that stops presenting: 8 h with no presents.
+        present_run(
+            &mut t,
+            1,
+            PresentOrigin::Kernel,
+            100.0 + 8.0 * 3600.0,
+            1.0 / 60.0,
+            600,
+        );
+        let h = t.stats(1).unwrap();
+        assert_eq!(h.frames(), 2 * 599);
+        let runs = 2.0 * 599.0 / 60.0;
+        assert!((h.total_secs() - runs).abs() < 0.01, "{}", h.total_secs());
+    }
+
+    #[test]
+    fn clock_step_back_resets_the_chain() {
+        let mut t = FpsTracker::new();
+        t.set_focus(Some(1));
+        present_run(&mut t, 1, PresentOrigin::Kernel, 100.0, 0.01, 11);
+        // The system clock stepped back by 50 s: the chain restarts at the new time.
+        present_run(&mut t, 1, PresentOrigin::Kernel, 50.0, 0.01, 11);
+        let h = t.stats(1).unwrap();
+        assert_eq!(h.frames(), 20);
+        assert!((h.total_secs() - 0.2).abs() < 1e-6, "{}", h.total_secs());
+    }
+
+    #[test]
+    fn gap_just_under_limit_is_counted() {
+        let mut t = FpsTracker::new();
+        t.set_focus(Some(1));
+        t.record_present(1, PresentOrigin::Kernel, 100.0, 10.0);
+        t.record_present(
+            1,
+            PresentOrigin::Kernel,
+            100.0 + MAX_FRAME_GAP_SECS - 0.01,
+            10.0,
+        );
+        let h = t.stats(1).unwrap();
+        assert_eq!(h.frames(), 1);
+        assert!((h.total_secs() - 1.99).abs() < 1e-9, "{}", h.total_secs());
     }
 
     #[test]
