@@ -259,6 +259,61 @@ pub fn is_generic_host(exe_path: &str) -> bool {
     name == "java.exe" || name == "javaw.exe"
 }
 
+/// Exe file names (without `.exe`) of common programs that present frames but aren't games.
+const KNOWN_NON_GAMES: &[&str] = &[
+    // Browsers.
+    "chrome",
+    "msedge",
+    "firefox",
+    "opera",
+    "brave",
+    "vivaldi",
+    // System and shell.
+    "explorer",
+    "dwm",
+    "applicationframehost",
+    "systemsettings",
+    "searchhost",
+    "startmenuexperiencehost",
+    "shellexperiencehost",
+    "textinputhost",
+    // Chat.
+    "discord",
+    // Launchers.
+    "steam",
+    "steamwebhelper",
+    "epicgameslauncher",
+    "galaxyclient",
+    "battle.net",
+    "eadesktop",
+    "ubisoftconnect",
+    "upc",
+    // Media and streaming.
+    "obs64",
+    "vlc",
+    "mpc-hc64",
+    "spotify",
+    // Editors and tools.
+    "code",
+    "devenv",
+    "photoshop",
+    "blender",
+    // Windows components, and Lite Bar itself.
+    "msedgewebview2",
+    "lite-bar",
+];
+
+/// True when the exe file name (case-insensitive) is a common program that isn't a game:
+/// no play session is recorded for it.
+pub fn is_known_non_game(exe_path: &str) -> bool {
+    let stem = exe_stem(exe_path);
+    let has_exe_extension = stem.len() + ".exe".len() == file_name(exe_path).len();
+    has_exe_extension
+        && KNOWN_NON_GAMES
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&stem))
+}
+
 // ---- Window titles ----
 
 /// `v?\d+(\.\d+)+` or `v\d+`, optionally followed by `-suffix`. Bare numbers are not versions.
@@ -314,9 +369,45 @@ pub fn exe_stem(exe_path: &str) -> String {
     }
 }
 
-/// Stable per-game key: lowercased path, plus the title name for generic hosts.
+/// `(name, publisher id)` of a Store package folder named
+/// `<name>_<version>_<arch>_<resource id>_<publisher id>`.
+fn package_family(folder: &str) -> Option<(&str, &str)> {
+    let parts: Vec<&str> = folder.split('_').collect();
+    let [name, version, arch, _resource, publisher] = parts[..] else {
+        return None;
+    };
+    let numbers: Vec<&str> = version.split('.').collect();
+    let version_ok = numbers.len() == 4
+        && numbers
+            .iter()
+            .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let arch_ok = matches!(arch, "x86" | "x64" | "arm" | "arm64" | "neutral");
+    (!name.is_empty() && version_ok && arch_ok && !publisher.is_empty())
+        .then_some((name, publisher))
+}
+
+/// In a normalised (lowercase, `\`) path, replaces the Store package folder right under
+/// `\windowsapps\` with `<name>__<publisher id>`, so a game update (new version folder)
+/// keeps its key.
+fn without_package_version(path: String) -> String {
+    const MARKER: &str = r"\windowsapps\";
+    let Some(at) = path.find(MARKER) else {
+        return path;
+    };
+    let start = at + MARKER.len();
+    let end = path[start..].find('\\').map_or(path.len(), |n| start + n);
+    match package_family(&path[start..end]) {
+        Some((name, publisher)) => {
+            format!("{}{name}__{publisher}{}", &path[..start], &path[end..])
+        }
+        None => path,
+    }
+}
+
+/// Stable per-game key: lowercased path (with a Store package's version dropped), plus the
+/// title name for generic hosts.
 pub fn game_key(exe_path: &str, title_name: Option<&str>) -> String {
-    let mut key = exe_path.replace('/', r"\").to_lowercase();
+    let mut key = without_package_version(exe_path.replace('/', r"\").to_lowercase());
     if let Some(title) = title_name.filter(|t| !t.is_empty()) {
         if is_generic_host(exe_path) {
             key.push('|');
@@ -702,6 +793,77 @@ mod tests {
             game_key(r"C:\Java\bin\javaw.exe", None),
             r"c:\java\bin\javaw.exe"
         );
+    }
+
+    #[test]
+    fn game_key_drops_the_version_of_a_store_package() {
+        let v1 = r"C:\Program Files\WindowsApps\Microsoft.MinecraftUWP_1.21.4401.0_x64__8wekyb3d8bbwe\Minecraft.Windows.exe";
+        let v2 = r"C:\Program Files\WindowsApps\Microsoft.MinecraftUWP_1.21.5101.0_x64__8wekyb3d8bbwe\Minecraft.Windows.exe";
+        let key = r"c:\program files\windowsapps\microsoft.minecraftuwp__8wekyb3d8bbwe\minecraft.windows.exe";
+        assert_eq!(game_key(v1, None), key);
+        assert_eq!(game_key(v2, None), key);
+        // A resource id, forward slashes and other casing.
+        assert_eq!(
+            game_key(
+                "C:/Program Files/WINDOWSAPPS/Contoso.Game_2.0.0.0_neutral_split.scale-100_abcdefghjkmnp/Game.exe",
+                None
+            ),
+            r"c:\program files\windowsapps\contoso.game__abcdefghjkmnp\game.exe"
+        );
+    }
+
+    #[test]
+    fn game_key_leaves_other_folders_alone() {
+        for path in [
+            // Not under WindowsApps.
+            r"C:\Games\Foo_1.0.0.0_x64__abc\foo.exe",
+            // Under WindowsApps but not a package full name.
+            r"C:\Program Files\WindowsApps\Deleted\foo.exe",
+            r"C:\Program Files\WindowsApps\Foo_bar\foo.exe",
+            r"C:\Program Files\WindowsApps\Foo_1.0_x64__abc\foo.exe",
+            r"C:\Program Files\WindowsApps\Foo_1.0.0.0_x64__\foo.exe",
+        ] {
+            assert_eq!(game_key(path, None), path.to_lowercase(), "{path}");
+        }
+    }
+
+    // ---- is_known_non_game ----
+
+    #[test]
+    fn browsers_launchers_and_tools_are_known_non_games() {
+        for path in [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\MSEDGE.EXE",
+            r"C:\Windows\explorer.exe",
+            r"C:\Windows\System32\dwm.exe",
+            r"C:\Users\me\AppData\Local\Discord\app-1.0.9\Discord.exe",
+            r"C:\Program Files (x86)\Steam\steam.exe",
+            r"C:\Program Files (x86)\Steam\bin\cef\cef.win7x64\steamwebhelper.exe",
+            r"C:\Program Files (x86)\Battle.net\Battle.net.exe",
+            r"C:\Program Files\obs-studio\bin\64bit\obs64.exe",
+            r"C:\Program Files\VideoLAN\VLC\vlc.exe",
+            r"C:\Users\me\AppData\Local\Programs\Microsoft VS Code\Code.exe",
+            r"C:\Program Files\Blender Foundation\Blender 4.2\blender.exe",
+            r"C:\Program Files (x86)\Microsoft\EdgeWebView\Application\1.0\msedgewebview2.exe",
+            r"C:\Tools\lite-bar.exe",
+            "C:/Windows/ImmersiveControlPanel/SystemSettings.exe",
+        ] {
+            assert!(is_known_non_game(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn games_and_lookalikes_are_not_known_non_games() {
+        for path in [
+            r"D:\SteamLibrary\steamapps\common\ELDEN RING\Game\eldenring.exe",
+            r"C:\Games\chrome_dino.exe",
+            r"C:\Games\steam\game.exe",
+            r"C:\Games\code.exe.bak",
+            r"C:\Program Files\Java\bin\javaw.exe",
+            "",
+        ] {
+            assert!(!is_known_non_game(path), "{path}");
+        }
     }
 
     // ---- pick_name ----

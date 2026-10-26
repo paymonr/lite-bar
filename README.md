@@ -97,7 +97,17 @@ They show `—` until the game has at least 100 counted frames. Frame times are 
 
 Frames only count while the counter is on (capture stops while the overlay is hidden) and while the game is the foreground app. Alt-tabbing away pauses its stats, and coming back resumes them. A gap of more than 2 s between two frames (sleep or hibernate, a modal dialog, a game that stops drawing) is a break, not a frame time, so it adds nothing to the play time.
 
-A play session runs from a game's first counted frame until its process exits, or until Lite Bar quits or you sign out. Sessions with less than 60 s of counted play are dropped, which keeps out launchers and quick alt-tabs. If the game exits while the overlay is hidden, the session ends at the last time Lite Bar saw it running. Kept sessions are saved in `%APPDATA%\LiteBar\stats\`:
+A play session runs from a game's first counted frame until its process exits, or until Lite Bar quits or you sign out. Sessions with less than 60 s of counted play are dropped, which keeps out launchers and quick alt-tabs. Common programs that aren't games never get a session (the overlay still shows their live stats). They are matched by exe file name:
+
+- browsers: `chrome`, `msedge`, `firefox`, `opera`, `brave`, `vivaldi`
+- Windows shell and system: `explorer`, `dwm`, `applicationframehost`, `systemsettings`, `searchhost`, `startmenuexperiencehost`, `shellexperiencehost`, `textinputhost`, `msedgewebview2`
+- chat: `discord`
+- launchers: `steam`, `steamwebhelper`, `epicgameslauncher`, `galaxyclient`, `battle.net`, `eadesktop`, `ubisoftconnect`, `upc`
+- media and streaming: `obs64`, `vlc`, `mpc-hc64`, `spotify`
+- editors and tools: `code`, `devenv`, `photoshop`, `blender`
+- Lite Bar itself: `lite-bar`
+
+The list is built in for now; a later version (M4) will let you mark apps as games or non-games yourself. If the game exits while the overlay is hidden, the session ends at the last time Lite Bar saw it running. Kept sessions are saved in `%APPDATA%\LiteBar\stats\`:
 
 | File | Contents |
 | --- | --- |
@@ -108,7 +118,7 @@ A play session runs from a game's first counted frame until its process exits, o
 
 **Open game stats** in the tray menu opens `games.csv` in its default program (the stats folder, while there is no CSV yet). If a CSV is open in Excel and can't be written, the write is retried after the next session and at quit, and what still can't be written at quit or sign-out is saved to `stats\pending.toml` and retried later, even after a restart; `games.toml` stays the source of truth.
 
-Games are kept apart by the exe's full path. For Java games (`java.exe`, `javaw.exe`) the name from the window title is part of the key too, so Minecraft and another Java game stay separate. The name is the first of these that works:
+Games are kept apart by the exe's full path. For Microsoft Store and Game Pass apps under `WindowsApps`, the version and architecture are dropped from the package folder in the key, so a game update doesn't start a new entry. For Java games (`java.exe`, `javaw.exe`) the name from the window title is part of the key too, so Minecraft and another Java game stay separate. The name is the first of these that works:
 
 1. the launcher's records: Steam, Epic, GOG, or the Xbox app / Game Pass;
 2. the exe's product name or file description, skipping generic ones such as "Unity Player";
@@ -117,7 +127,7 @@ Games are kept apart by the exe's full path. For Java games (`java.exe`, `javaw.
 
 To rename a game, add it to `[game_names]` in the settings file and choose **Reload settings**: `games.csv` is regenerated with the new name, and new `sessions.csv` rows use it (existing rows keep the old name).
 
-Anti-cheat: Lite Bar never injects into, hooks or reads the memory of a game. Its only contact with a game's process is `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` to read the exe path, the start time and whether the process has exited, and the handle is closed straight away. The window title comes from `GetWindowTextW`. Everything else reads files and the registry, with no network lookups. If a game's process refuses even that limited query, its live stats still show on the overlay, but it isn't recorded in the history (a warning goes to the log). Lite Bar asks such a process at most once each time it gets the focus.
+Anti-cheat: Lite Bar never injects into, hooks or reads the memory of a game. Its only contact with a game's process is `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` to read the exe path, the start time and whether the process has exited, and the handle is closed straight away. Lite Bar queries a recorded game's process when its session starts and then about once a second only while the game has stopped presenting frames; while it presents, that alone shows it is running, and it is queried at most every 30 s. The window title comes from `GetWindowTextW`, once, when the session starts. Everything else reads files and the registry, with no network lookups. If a game's process refuses even that limited query, its live stats still show on the overlay, but it isn't recorded in the history (a warning goes to the log). Lite Bar asks such a process at most once each time it gets the focus.
 
 ### Known limitations
 

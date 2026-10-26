@@ -132,8 +132,8 @@ impl SessionBook {
     }
 }
 
-/// Limits process queries for a foreground pid that refused one: it is not asked again until
-/// focus moves away and back. A pid is only remembered while it keeps the focus, so a reused
+/// Limits process queries for a foreground pid that refused one (or turned out to be a known
+/// non-game): it is not asked again until focus moves away and back. A pid is only remembered while it keeps the focus, so a reused
 /// pid can be tracked later.
 #[derive(Debug, Default)]
 pub struct QueryGate {
@@ -169,6 +169,21 @@ pub fn end_time(s: &OpenSession, still_running: bool, now: LocalTime) -> LocalTi
     } else {
         s.last_alive
     }
+}
+
+/// Presents received this recently show that a tracked process is still running.
+pub const ALIVE_BY_PRESENTS_SECS: f64 = 2.0;
+/// A tracked process is queried at least this often, even while it presents.
+pub const MAX_QUERY_INTERVAL_SECS: f64 = 30.0;
+
+/// Whether the liveness check should query a tracked process now. `last_present` is when its
+/// newest present was received and `last_query` when it was last queried, both on the app
+/// clock. A process that presented within `ALIVE_BY_PRESENTS_SECS` is alive, so it is only
+/// queried once presents stop, or every `MAX_QUERY_INTERVAL_SECS`.
+pub fn liveness_query_due(last_present: Option<f64>, last_query: Option<f64>, now: f64) -> bool {
+    let presenting = last_present.is_some_and(|t| now - t <= ALIVE_BY_PRESENTS_SECS);
+    let queried_recently = last_query.is_some_and(|t| now - t < MAX_QUERY_INTERVAL_SECS);
+    !(presenting && queried_recently)
 }
 
 /// One log line for a recorded session: name, play time and average FPS.
@@ -376,5 +391,27 @@ mod tests {
             session_log_line(&record, "Alpha Renamed"),
             "session recorded: Alpha Renamed, play time 0:01:04, avg 128.0 FPS"
         );
+    }
+
+    #[test]
+    fn presenting_process_is_not_queried() {
+        assert!(!liveness_query_due(Some(99.0), Some(90.0), 100.0));
+        assert!(
+            !liveness_query_due(Some(98.0), Some(90.0), 100.0),
+            "2 s is still recent"
+        );
+    }
+
+    #[test]
+    fn process_that_stopped_presenting_is_queried() {
+        assert!(liveness_query_due(Some(97.9), Some(99.0), 100.0));
+        assert!(liveness_query_due(None, Some(99.0), 100.0));
+    }
+
+    #[test]
+    fn presenting_process_is_still_queried_every_30_s() {
+        assert!(!liveness_query_due(Some(99.5), Some(70.5), 100.0));
+        assert!(liveness_query_due(Some(99.5), Some(70.0), 100.0));
+        assert!(liveness_query_due(Some(99.5), None, 100.0), "never queried");
     }
 }

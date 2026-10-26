@@ -44,16 +44,19 @@ fn main() {
 mod app {
     use std::any::Any;
     use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use lite_bar_core::fps::FpsTracker;
-    use lite_bar_core::game_name::display_name;
+    use lite_bar_core::game_name::{display_name, is_known_non_game};
     use lite_bar_core::history::LocalTime;
     use lite_bar_core::layout::{fps_text, stats_text};
-    use lite_bar_core::sessions::{session_log_line, OpenSession, QueryGate, SessionBook};
+    use lite_bar_core::sessions::{
+        liveness_query_due, session_log_line, OpenSession, QueryGate, SessionBook,
+    };
     use lite_bar_core::settings::{Settings, StatsLayout};
     use windows::core::{w, HSTRING};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -72,12 +75,12 @@ mod app {
 
     use crate::elevation::{is_elevated, relaunch_as_admin};
     use crate::etw::{etw_now_secs, offers_admin, CaptureError, PresentCapture};
-    use crate::foreground::{foreground_pid, foreground_title};
+    use crate::foreground::{foreground_window, window_title};
     use crate::game_lookup::resolve_name;
     use crate::hotkeys::{self, HotkeyId, Registration};
     use crate::overlay::Overlay;
     use crate::paths::{app_dir, load_or_create_settings};
-    use crate::process_info::{process_info, process_state, ProcessState};
+    use crate::process_info::{process_info, process_state, ProcessInfo, ProcessState};
     use crate::single_instance::{acquire_single_instance, InstanceGuard};
     use crate::stats_files::{local_now, StatsWriter};
     use crate::tray::{MenuItem, Tray, TrayMenuState, WM_TRAY};
@@ -175,6 +178,8 @@ mod app {
         gate: QueryGate,
         /// Set by `start_overlay`: the next tick runs the process-exit check.
         just_shown: bool,
+        /// App-clock time each tracked pid's process was last queried.
+        last_query: HashMap<u32, f64>,
     }
 
     impl App {
@@ -255,7 +260,9 @@ mod app {
 
         fn on_timer(&mut self) {
             let now = self.clock.elapsed().as_secs_f64();
-            let pid = foreground_pid();
+            // One read of the foreground window: the pid and the title come from the same one.
+            let foreground = foreground_window();
+            let pid = foreground.map(|(pid, _)| pid);
             let want_stats = self.settings.overlay.stats != StatsLayout::Off;
             let refused = self.gate.on_focus(pid);
             // One lock for focus, FPS and stats; the summary is Copy so it is released early.
@@ -287,8 +294,10 @@ mod app {
             if session_check_due(self.ticks, std::mem::take(&mut self.just_shown)) {
                 self.check_sessions();
             }
-            if let Some(pid) = pid_to_track(pid, has_stats, &self.sessions, &self.gate) {
-                self.start_session(pid);
+            if let Some((pid, hwnd)) = foreground {
+                if pid_to_track(Some(pid), has_stats, &self.sessions, &self.gate).is_some() {
+                    self.start_session(pid, hwnd, now);
+                }
             }
             if self.ticks.is_multiple_of(PRUNE_EVERY_TICKS) {
                 self.tracker
@@ -299,19 +308,21 @@ mod app {
         }
 
         /// Opens a session for the foreground `pid`, which has just counted its first frames.
-        fn start_session(&mut self, pid: u32) {
-            match process_info(pid) {
-                Some(info) => {
-                    let now = local_now();
-                    let displaced = self.sessions.track(OpenSession {
-                        pid,
-                        created: info.created,
-                        exe_path: info.exe_path,
-                        window_title: foreground_title(),
-                        start: now,
-                        last_alive: now,
-                    });
-                    if let Some(old) = displaced {
+        /// `hwnd` is the foreground window read on this tick (the session takes its title);
+        /// `now` is the app clock.
+        fn start_session(&mut self, pid: u32, hwnd: HWND, now: f64) {
+            let Some(info) = process_info(pid) else {
+                // Live stats still show; the frames are discarded when focus moves away.
+                self.gate.refused(pid);
+                log::warn(&format!(
+                    "stats: cannot query process {pid}; its play time is not recorded"
+                ));
+                return;
+            };
+            self.last_query.insert(pid, now);
+            match new_session(pid, info, || window_title(hwnd), local_now()) {
+                Some(session) => {
+                    if let Some(old) = self.sessions.track(session) {
                         log::warn(&format!(
                             "stats: pid {} was reused; ending the earlier session",
                             old.pid
@@ -320,20 +331,37 @@ mod app {
                         self.finish_session(old, end);
                     }
                 }
-                None => {
-                    // Live stats still show; the frames are discarded when focus moves away.
-                    self.gate.refused(pid);
-                    log::warn(&format!(
-                        "stats: cannot query process {pid}; its play time is not recorded"
-                    ));
-                }
+                // A known non-game: not asked again during this focus, and its frames are
+                // discarded when focus moves away. Live stats still show.
+                None => self.gate.refused(pid),
             }
         }
 
-        /// The 1 s check: sessions whose process exited end when it was last seen alive.
+        /// The 1 s check: sessions whose process exited end when it was last seen alive. A
+        /// process that is still presenting is alive and is only queried every 30 s.
         fn check_sessions(&mut self) {
-            let finished = self.sessions.sweep(local_now(), still_running);
+            let now = self.clock.elapsed().as_secs_f64();
+            let last_present: Vec<(u32, Option<f64>)> = {
+                let tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
+                let pids = self.sessions.pids();
+                pids.into_iter()
+                    .map(|pid| (pid, tracker.last_received(pid)))
+                    .collect()
+            };
+            let last_query = &mut self.last_query;
+            let finished = self.sessions.sweep(local_now(), |s| {
+                let presented = last_present
+                    .iter()
+                    .find(|(pid, _)| *pid == s.pid)
+                    .and_then(|(_, at)| *at);
+                if !liveness_query_due(presented, last_query.get(&s.pid).copied(), now) {
+                    return true;
+                }
+                last_query.insert(s.pid, now);
+                still_running(s)
+            });
             for (session, end) in finished {
+                self.last_query.remove(&session.pid);
                 self.finish_session(session, end);
             }
         }
@@ -494,6 +522,28 @@ mod app {
         /// The session is ending: stop the ETW session so it does not outlive the logoff, and
         /// save the open play sessions.
         StopCapture,
+    }
+
+    /// The session for `pid`, started at `now`; `None` for a known non-game (a browser,
+    /// launcher, the shell, ...). `window_title` reads the title of the window found on the
+    /// same tick, and only runs for a game.
+    fn new_session(
+        pid: u32,
+        info: ProcessInfo,
+        window_title: impl FnOnce() -> Option<String>,
+        now: LocalTime,
+    ) -> Option<OpenSession> {
+        if is_known_non_game(&info.exe_path) {
+            return None;
+        }
+        Some(OpenSession {
+            pid,
+            created: info.created,
+            exe_path: info.exe_path,
+            window_title: window_title(),
+            start: now,
+            last_alive: now,
+        })
     }
 
     /// The foreground pid that needs a new session: it has counted frames, none is open, and
@@ -710,6 +760,7 @@ mod app {
             writer,
             gate: QueryGate::default(),
             just_shown: false,
+            last_query: HashMap::new(),
         };
         app.register_hotkey();
         if start_visible {
@@ -830,6 +881,46 @@ mod app {
             gate.on_focus(Some(7));
             let none = SessionBook::new();
             assert_eq!(pid_to_track(Some(7), true, &none, &gate), None);
+        }
+
+        fn info(exe_path: &str) -> ProcessInfo {
+            ProcessInfo {
+                exe_path: exe_path.into(),
+                created: 5,
+            }
+        }
+
+        #[test]
+        fn game_gets_a_session_with_the_title_from_its_tick() {
+            let at = LocalTime {
+                year: 2026,
+                month: 10,
+                day: 26,
+                hour: 10,
+                minute: 0,
+                second: 0,
+            };
+            let s = new_session(7, info(r"C:\Games\a.exe"), || Some("A - Menu".into()), at)
+                .expect("a game is tracked");
+            assert_eq!(s.pid, 7);
+            assert_eq!(s.created, 5);
+            assert_eq!(s.window_title.as_deref(), Some("A - Menu"));
+            assert_eq!((s.start, s.last_alive), (at, at));
+        }
+
+        #[test]
+        fn known_non_game_gets_no_session() {
+            let at = LocalTime {
+                year: 2026,
+                month: 10,
+                day: 26,
+                hour: 10,
+                minute: 0,
+                second: 0,
+            };
+            let chrome = r"C:\Program Files\Google\Chrome\Application\chrome.exe";
+            let title = || -> Option<String> { panic!("a non-game's title is never read") };
+            assert_eq!(new_session(7, info(chrome), title, at), None);
         }
 
         #[test]

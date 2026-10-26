@@ -1,6 +1,7 @@
 //! Foreground window queries.
 
 use lite_bar_core::layout::Rect;
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTOPRIMARY,
 };
@@ -12,8 +13,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const BASE_DPI: f32 = 96.0;
 
-/// Process id owning the foreground window; `None` when there is no foreground window.
-pub fn foreground_pid() -> Option<u32> {
+/// The foreground window and the process id owning it; `None` when there is no foreground
+/// window. Read once per tick so the pid and the title come from the same window.
+pub fn foreground_window() -> Option<(u32, HWND)> {
     // SAFETY: plain FFI calls; a null window handle is checked before use.
     unsafe {
         let hwnd = GetForegroundWindow();
@@ -22,22 +24,16 @@ pub fn foreground_pid() -> Option<u32> {
         }
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
-        (pid != 0).then_some(pid)
+        (pid != 0).then_some((pid, hwnd))
     }
 }
 
-/// Title of the foreground window; `None` when there is no window or it has no title.
-pub fn foreground_title() -> Option<String> {
-    // SAFETY: plain FFI calls; the buffer outlives the call and its length is passed implicitly.
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        if hwnd.is_invalid() {
-            return None;
-        }
-        let mut buf = [0u16; 512];
-        let len = usize::try_from(GetWindowTextW(hwnd, &mut buf)).ok()?;
-        (len > 0).then(|| String::from_utf16_lossy(&buf[..len]))
-    }
+/// Title of `hwnd`; `None` when it has none (or the window is gone).
+pub fn window_title(hwnd: HWND) -> Option<String> {
+    let mut buf = [0u16; 512];
+    // SAFETY: plain FFI; the buffer outlives the call and its length is passed implicitly.
+    let len = usize::try_from(unsafe { GetWindowTextW(hwnd, &mut buf) }).ok()?;
+    (len > 0).then(|| String::from_utf16_lossy(&buf[..len]))
 }
 
 /// Full rectangle (not the work area: games cover the taskbar) and DPI scale of the monitor
@@ -90,16 +86,50 @@ mod tests {
     }
 
     #[test]
-    fn foreground_title_is_none_or_nonempty() {
-        if let Some(title) = foreground_title() {
-            assert!(!title.is_empty());
+    fn foreground_window_has_a_nonzero_pid() {
+        if let Some((pid, hwnd)) = foreground_window() {
+            assert_ne!(pid, 0);
+            assert!(!hwnd.is_invalid());
         }
     }
 
     #[test]
-    fn foreground_pid_is_none_or_nonzero() {
-        if let Some(pid) = foreground_pid() {
-            assert_ne!(pid, 0);
+    fn window_title_reads_that_window() {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, HWND_MESSAGE, WINDOW_EX_STYLE, WS_OVERLAPPED,
+        };
+        let create = |title: PCWSTR| {
+            // SAFETY: plain FFI; the predefined STATIC class needs no registration.
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("STATIC"),
+                    title,
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            .unwrap()
+        };
+        let titled = create(w!("Lite Bar title test"));
+        let untitled = create(w!(""));
+        assert_eq!(
+            window_title(titled),
+            Some("Lite Bar title test".to_string())
+        );
+        assert_eq!(window_title(untitled), None);
+        // SAFETY: created above on this thread.
+        unsafe {
+            let _ = DestroyWindow(titled);
+            let _ = DestroyWindow(untitled);
         }
     }
 }

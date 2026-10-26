@@ -82,11 +82,19 @@ impl Series {
     }
 }
 
+/// The stats origin goes back to `Kernel` when the pid's last `Api` present is this much older
+/// than its latest `Kernel` present (an OpenGL or Vulkan game after a DXGI splash screen).
+const API_STALE_SECS: f64 = 2.0;
+
 /// Focus-gated frame-time accounting for one pid.
 struct StatsState {
-    /// Which origin feeds the histogram. Starts as `Kernel` and switches to `Api` for good on
-    /// the first `Api` present, because a DXGI game produces both and would be counted twice.
+    /// Which origin feeds the histogram. Starts as `Kernel` and switches to `Api` on the first
+    /// `Api` present, because a DXGI game produces both and would be counted twice. It goes
+    /// back to `Kernel` while `Api` presents have stopped (see `API_STALE_SECS`).
     origin: PresentOrigin,
+    /// Event times of the latest present of each origin.
+    last_api: Option<f64>,
+    last_kernel: Option<f64>,
     /// Time of the previous counted present of `origin`.
     prev: Option<f64>,
     /// Focus span `prev` was counted in. A chain never links two spans.
@@ -98,6 +106,8 @@ impl Default for StatsState {
     fn default() -> Self {
         Self {
             origin: PresentOrigin::Kernel,
+            last_api: None,
+            last_kernel: None,
             prev: None,
             span: 0,
             hist: None,
@@ -109,10 +119,23 @@ impl StatsState {
     /// `span` is the id of the focus span the present falls in, or `None` when the pid was
     /// not focused at `event_time`.
     fn observe(&mut self, origin: PresentOrigin, event_time: f64, span: Option<u64>) {
-        if origin == PresentOrigin::Api && self.origin == PresentOrigin::Kernel {
-            self.origin = PresentOrigin::Api;
+        let first_api = self.last_api.is_none() && origin == PresentOrigin::Api;
+        match origin {
+            PresentOrigin::Api => self.last_api = Some(event_time),
+            PresentOrigin::Kernel => self.last_kernel = Some(event_time),
+        }
+        let wanted = match (self.last_api, self.last_kernel) {
+            (Some(api), Some(kernel)) if kernel - api > API_STALE_SECS => PresentOrigin::Kernel,
+            (Some(_), _) => PresentOrigin::Api,
+            (None, _) => PresentOrigin::Kernel,
+        };
+        if wanted != self.origin {
+            self.origin = wanted;
             self.prev = None;
-            self.hist = None;
+            if first_api {
+                // Kernel frames of a DXGI game: the Api series replaces them.
+                self.hist = None;
+            }
         }
         let Some(span) = span else {
             // Not focused then: a background run never bridges two focused intervals.
@@ -248,6 +271,13 @@ impl FpsTracker {
             since: at,
             until: f64::INFINITY,
         };
+    }
+
+    /// App-clock time the newest present of `pid` (either origin) was received.
+    pub fn last_received(&self, pid: u32) -> Option<f64> {
+        let state = self.pids.get(&pid)?;
+        let newest = state.api.last_received.max(state.kernel.last_received);
+        newest.is_finite().then_some(newest)
     }
 
     /// Frame-time histogram accumulated for `pid` while it was focused.
@@ -552,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn unfocused_api_present_still_switches_origin_for_good() {
+    fn unfocused_api_present_still_switches_origin() {
         let mut t = FpsTracker::new();
         // The game presents through the API while unfocused, then gets focus.
         t.record_present(9, PresentOrigin::Api, 100.0, 10.0);
@@ -666,5 +696,50 @@ mod tests {
         // Pid 1's sliding window is stale but its stats survive; pid 2 has neither and is gone.
         assert_eq!(t.pids.len(), 1);
         assert!(t.pids.contains_key(&1));
+    }
+
+    #[test]
+    fn stale_api_falls_back_to_kernel_for_stats() {
+        let mut t = FpsTracker::new();
+        t.set_focus(Some(9), 0.0);
+        // A DXGI splash screen, then an OpenGL or Vulkan game that only shows kernel presents.
+        present_run(&mut t, 9, PresentOrigin::Api, 100.0, 1.0 / 60.0, 61); // to 101.0
+        for i in 0..=540 {
+            // Half a frame off the Api grid, so no present sits exactly on the 2 s limit.
+            let at = 101.0 + (i as f64 + 0.5) / 60.0;
+            t.record_present(9, PresentOrigin::Kernel, at, 10.0);
+        }
+        // Kernel takes over once the last Api present is more than 2 s older (i = 120); that
+        // present restarts the chain, so i = 121..=540 add 420 frames to the splash's 60.
+        let h = t.stats(9).unwrap();
+        assert_eq!(h.frames(), 60 + 420);
+        assert!((h.frames() as f64 / h.total_secs() - 60.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn histogram_kept_across_later_origin_switches() {
+        let mut t = FpsTracker::new();
+        t.set_focus(Some(9), 0.0);
+        present_run(&mut t, 9, PresentOrigin::Kernel, 90.0, 0.01, 50);
+        // The first Api present still clears the Kernel-only histogram, as before.
+        present_run(&mut t, 9, PresentOrigin::Api, 100.0, 0.01, 101); // to 101.0
+        assert_eq!(t.stats(9).unwrap().frames(), 100);
+        // Kernel only: switches at 103.005 (i = 200), then 99 frames to 103.995.
+        present_run(&mut t, 9, PresentOrigin::Kernel, 101.005, 0.01, 300);
+        assert_eq!(t.stats(9).unwrap().frames(), 100 + 99);
+        // Api again: it is newest, so it takes over without clearing anything.
+        present_run(&mut t, 9, PresentOrigin::Api, 104.5, 0.01, 101);
+        assert_eq!(t.stats(9).unwrap().frames(), 100 + 99 + 100);
+    }
+
+    #[test]
+    fn last_received_is_the_newest_of_either_origin() {
+        let mut t = FpsTracker::new();
+        assert_eq!(t.last_received(5), None);
+        t.record_present(5, PresentOrigin::Api, 100.0, 10.0);
+        t.record_present(5, PresentOrigin::Kernel, 100.1, 12.5);
+        t.record_present(5, PresentOrigin::Api, 100.2, 11.0);
+        assert_eq!(t.last_received(5), Some(12.5));
+        assert_eq!(t.last_received(6), None);
     }
 }
