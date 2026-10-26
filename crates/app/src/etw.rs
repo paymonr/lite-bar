@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ferrisetw::native::EvntraceNativeError;
+use ferrisetw::parser::Parser;
 use ferrisetw::provider::{EventFilter, Provider};
 use ferrisetw::trace::{stop_trace_by_name, TraceError, TraceProperties, UserTrace};
 use ferrisetw::{EventRecord, SchemaLocator};
@@ -36,6 +37,8 @@ pub struct ProviderSpec {
     /// `EnableTraceEx2` MatchAnyKeyword: the OR of the PresentMon keyword masks of the events
     /// above, so the provider emits them on every Windows version.
     pub keywords: u64,
+    /// Read the payload `Flags` and skip `DXGI_PRESENT_TEST` presents (DXGI only).
+    pub reads_flags: bool,
     pub origin: PresentOrigin,
 }
 
@@ -56,6 +59,7 @@ pub const PROVIDERS: [ProviderSpec; 3] = [
         guid: "CA11C036-0102-4A2D-A6AD-F03CFED5D3C9",
         present_event_ids: &[42],
         keywords: 0x8000_0000_0000_0002,
+        reads_flags: true,
         origin: PresentOrigin::Api,
     },
     ProviderSpec {
@@ -63,6 +67,7 @@ pub const PROVIDERS: [ProviderSpec; 3] = [
         guid: "783ACA0A-790E-4D7F-8451-AA850511C6B9",
         present_event_ids: &[1],
         keywords: 0x8000_0000_0000_0002,
+        reads_flags: false,
         origin: PresentOrigin::Api,
     },
     ProviderSpec {
@@ -70,6 +75,7 @@ pub const PROVIDERS: [ProviderSpec; 3] = [
         guid: "802EC45A-1E99-4B83-9920-87C98277BA9D",
         present_event_ids: &[184],
         keywords: 0x0800_0001,
+        reads_flags: false,
         origin: PresentOrigin::Kernel,
     },
 ];
@@ -117,6 +123,16 @@ fn map_trace_error(e: TraceError) -> CaptureError {
     }
 }
 
+/// `DXGI_PRESENT_TEST`: a probe (e.g. "am I fullscreen?") that presents nothing. PresentMon
+/// ignores it (PresentMonTraceConsumer.cpp `RuntimePresentStart`).
+const DXGI_PRESENT_TEST: u32 = 0x1;
+
+/// Whether a DXGI `Present_Start` with payload `flags` is a real frame. `None` means the flags
+/// could not be read; fail open and count it rather than drop frames on a parse error.
+fn counts_as_frame(flags: Option<u32>) -> bool {
+    flags.is_none_or(|f| f & DXGI_PRESENT_TEST == 0)
+}
+
 /// Hot path: runs once per present event, at the game's frame rate. Allocation-free, never
 /// panics, and recovers a poisoned tracker mutex instead of unwinding into ETW.
 fn record_present(
@@ -142,21 +158,37 @@ fn build_provider(
     let tracker = Arc::clone(tracker);
     let ids = spec.present_event_ids;
     let origin = spec.origin;
+    let reads_flags = spec.reads_flags;
     Provider::by_guid(spec.guid)
         .any(spec.keywords)
         .add_filter(EventFilter::ByEventIds(ids.to_vec()))
-        .add_callback(move |record: &EventRecord, _: &SchemaLocator| {
+        .add_callback(move |record: &EventRecord, locator: &SchemaLocator| {
             // The kernel-side event id filter should already have dropped everything else; this
             // is a cheap guard for systems where that filter is not honoured.
-            if ids.contains(&record.event_id()) {
-                record_present(
-                    &tracker,
-                    record.process_id(),
-                    origin,
-                    record.raw_timestamp(),
-                    clock,
-                );
+            if !ids.contains(&record.event_id()) {
+                return;
             }
+            // DXGI only: read `Flags` to skip DXGI_PRESENT_TEST. Hot-path cost: a cached schema
+            // lookup (one uncontended mutex + Arc clone after the first event) and a Parser that
+            // allocates a little per event, on the ETW consumer thread, never the game's. D3D9 and
+            // DxgKrnl skip all of this.
+            if reads_flags {
+                let flags = locator.event_schema(record).ok().and_then(|schema| {
+                    Parser::create(record, &schema)
+                        .try_parse::<u32>("Flags")
+                        .ok()
+                });
+                if !counts_as_frame(flags) {
+                    return;
+                }
+            }
+            record_present(
+                &tracker,
+                record.process_id(),
+                origin,
+                record.raw_timestamp(),
+                clock,
+            );
         })
         .build()
 }
@@ -308,5 +340,35 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .fps(7, clock.elapsed().as_secs_f64());
         assert!(fps.is_some());
+    }
+
+    #[test]
+    fn present_test_flag_is_not_a_frame() {
+        assert!(!counts_as_frame(Some(DXGI_PRESENT_TEST)));
+        assert!(!counts_as_frame(Some(DXGI_PRESENT_TEST | 0x8)));
+    }
+
+    #[test]
+    fn plain_and_other_flags_are_frames() {
+        assert!(counts_as_frame(Some(0)));
+        // DO_NOT_SEQUENCE, RESTART, DO_NOT_WAIT, STEREO_*, RESTRICT_TO_OUTPUT: no TEST bit.
+        assert!(counts_as_frame(Some(0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40)));
+    }
+
+    #[test]
+    fn unparsed_flags_fail_open_and_count() {
+        assert!(counts_as_frame(None));
+    }
+
+    #[test]
+    fn only_dxgi_reads_present_flags() {
+        for p in PROVIDERS {
+            assert_eq!(
+                p.reads_flags,
+                p.name == "Microsoft-Windows-DXGI",
+                "{}",
+                p.name
+            );
+        }
     }
 }
