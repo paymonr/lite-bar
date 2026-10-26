@@ -26,7 +26,11 @@ impl Rgb {
             return Err(invalid());
         }
         let channel = |i: usize| u8::from_str_radix(&digits[i..i + 2], 16).map_err(|_| invalid());
-        Ok(Rgb { r: channel(0)?, g: channel(2)?, b: channel(4)? })
+        Ok(Rgb {
+            r: channel(0)?,
+            g: channel(2)?,
+            b: channel(4)?,
+        })
     }
 
     /// Formats as uppercase `#RRGGBB`.
@@ -65,8 +69,22 @@ mod tests {
 
     #[test]
     fn parses_with_and_without_hash() {
-        assert_eq!(Rgb::parse_hex("#7CFC7C").unwrap(), Rgb { r: 0x7C, g: 0xFC, b: 0x7C });
-        assert_eq!(Rgb::parse_hex(" 7cfc7c ").unwrap(), Rgb { r: 0x7C, g: 0xFC, b: 0x7C });
+        assert_eq!(
+            Rgb::parse_hex("#7CFC7C").unwrap(),
+            Rgb {
+                r: 0x7C,
+                g: 0xFC,
+                b: 0x7C
+            }
+        );
+        assert_eq!(
+            Rgb::parse_hex(" 7cfc7c ").unwrap(),
+            Rgb {
+                r: 0x7C,
+                g: 0xFC,
+                b: 0x7C
+            }
+        );
     }
 
     #[test]
@@ -83,7 +101,10 @@ mod tests {
 
     #[test]
     fn rgba_applies_opacity() {
-        assert_eq!(rgba_f32(Rgb { r: 255, g: 0, b: 0 }, 55), [1.0, 0.0, 0.0, 0.55]);
+        assert_eq!(
+            rgba_f32(Rgb { r: 255, g: 0, b: 0 }, 55),
+            [1.0, 0.0, 0.0, 0.55]
+        );
         assert_eq!(rgba_f32(Rgb { r: 0, g: 0, b: 0 }, 250)[3], 1.0);
     }
 
