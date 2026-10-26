@@ -66,9 +66,9 @@ impl FrameHistogram {
 
     pub fn merge(&mut self, other: &FrameHistogram) {
         for (mine, theirs) in self.buckets.iter_mut().zip(&other.buckets) {
-            *mine += theirs;
+            *mine = mine.saturating_add(*theirs);
         }
-        self.frames += other.frames;
+        self.frames = self.frames.saturating_add(other.frames);
         self.total_secs += other.total_secs;
     }
 
@@ -87,9 +87,9 @@ impl FrameHistogram {
         }
         let p = if p.is_nan() { 0.0 } else { p.clamp(0.0, 1.0) };
         let rank = ((p * self.frames as f64).ceil() as u64).clamp(1, self.frames);
-        let mut cumulative = 0;
+        let mut cumulative = 0u64;
         for (i, &count) in self.buckets.iter().enumerate() {
-            cumulative += count;
+            cumulative = cumulative.saturating_add(count);
             if cumulative >= rank {
                 return Some(bucket_value(i));
             }
@@ -130,8 +130,8 @@ impl FrameHistogram {
         let mut h = FrameHistogram::new();
         for &(index, count) in buckets {
             if let Some(slot) = h.buckets.get_mut(index as usize) {
-                *slot += count;
-                h.frames += count;
+                *slot = slot.saturating_add(count);
+                h.frames = h.frames.saturating_add(count);
             }
         }
         h.total_secs = total_secs;
@@ -265,5 +265,18 @@ mod tests {
         assert_eq!(lo, h.percentile_frame_secs(0.0).unwrap());
         assert_eq!(hi, h.percentile_frame_secs(1.0).unwrap());
         assert!(within_pct(lo, 0.01, 1.0));
+    }
+
+    #[test]
+    fn corrupt_counts_saturate_instead_of_overflowing() {
+        // Hand-edited history: duplicate indexes with counts near u64::MAX.
+        let h = FrameHistogram::from_sparse(&[(5, u64::MAX), (5, 10), (6, u64::MAX)], 1.0);
+        assert_eq!(h.frames(), u64::MAX);
+        assert_eq!(h.to_sparse(), vec![(5, u64::MAX), (6, u64::MAX)]);
+        assert!(h.percentile_frame_secs(1.0).is_some());
+        let mut merged = h.clone();
+        merged.merge(&h);
+        assert_eq!(merged.frames(), u64::MAX);
+        assert_eq!(merged.to_sparse(), vec![(5, u64::MAX), (6, u64::MAX)]);
     }
 }
