@@ -90,6 +90,14 @@ pub enum CaptureError {
     Other(String),
 }
 
+/// Whether the tray should offer "Restart as administrator" after a failed capture start.
+pub fn offers_admin(err: &CaptureError, elevated: bool) -> bool {
+    match err {
+        CaptureError::NeedsAdmin => true,
+        CaptureError::Other(_) => !elevated,
+    }
+}
+
 /// Maps a Win32 error code from starting the trace session.
 pub fn map_start_error(win32_code: u32) -> CaptureError {
     if win32_code == ERROR_ACCESS_DENIED {
@@ -241,6 +249,21 @@ mod tests {
     use lite_bar_core::fps::{FpsTracker, PresentOrigin};
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
+
+    #[test]
+    fn needs_admin_always_offers_the_admin_restart() {
+        assert!(offers_admin(&CaptureError::NeedsAdmin, false));
+        assert!(offers_admin(&CaptureError::NeedsAdmin, true));
+    }
+
+    #[test]
+    fn other_errors_offer_the_admin_restart_only_when_not_elevated() {
+        // A stale session from a crashed elevated run fails a non-elevated start with a code
+        // that is not access-denied; restarting elevated can clear it.
+        let other = CaptureError::Other("x".into());
+        assert!(offers_admin(&other, false));
+        assert!(!offers_admin(&other, true));
+    }
 
     #[test]
     fn provider_guids_are_valid() {

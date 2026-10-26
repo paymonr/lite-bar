@@ -59,7 +59,7 @@ mod app {
     };
 
     use crate::elevation::{is_elevated, relaunch_as_admin};
-    use crate::etw::{CaptureError, PresentCapture};
+    use crate::etw::{offers_admin, CaptureError, PresentCapture};
     use crate::foreground::foreground_pid;
     use crate::hotkeys::{self, HotkeyId, Registration};
     use crate::overlay::Overlay;
@@ -178,11 +178,17 @@ mod app {
             self.needs_admin = false;
             match PresentCapture::start(self.tracker.clone(), self.clock) {
                 Ok(capture) => self.capture = Some(capture),
-                Err(CaptureError::NeedsAdmin) => {
-                    self.needs_admin = true;
-                    log::info("FPS capture needs administrator rights");
+                Err(err) => {
+                    match &err {
+                        CaptureError::NeedsAdmin => {
+                            log::info("FPS capture needs administrator rights")
+                        }
+                        CaptureError::Other(msg) => {
+                            log::error(&format!("FPS capture failed: {msg}"))
+                        }
+                    }
+                    self.needs_admin = offers_admin(&err, is_elevated());
                 }
-                Err(CaptureError::Other(msg)) => log::error(&format!("FPS capture failed: {msg}")),
             }
             self.overlay.show();
             // SAFETY: plain FFI on our own window.
