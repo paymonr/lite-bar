@@ -27,7 +27,6 @@ pub fn foreground_pid() -> Option<u32> {
 }
 
 /// Title of the foreground window; `None` when there is no window or it has no title.
-#[allow(dead_code)] // wired in Task 8
 pub fn foreground_title() -> Option<String> {
     // SAFETY: plain FFI calls; the buffer outlives the call and its length is passed implicitly.
     unsafe {

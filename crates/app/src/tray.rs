@@ -29,6 +29,7 @@ const TOOLTIP: &str = "Lite Bar";
 pub enum MenuItem {
     ToggleOverlay,
     OpenSettingsFile,
+    OpenGameStats,
     ReloadSettings,
     RestartAsAdmin,
     Quit,
@@ -56,6 +57,7 @@ pub fn menu_labels(state: &TrayMenuState) -> Vec<(MenuItem, String)> {
     let mut items = vec![
         (MenuItem::ToggleOverlay, toggle),
         (MenuItem::OpenSettingsFile, "Open settings file".to_owned()),
+        (MenuItem::OpenGameStats, "Open game stats".to_owned()),
         (MenuItem::ReloadSettings, "Reload settings".to_owned()),
     ];
     if state.needs_admin {
@@ -286,6 +288,7 @@ mod tests {
                 "Hide FPS overlay\tCtrl+Alt+Shift+L".into()
             )
         );
+        assert!(l.contains(&(MenuItem::OpenGameStats, "Open game stats".into())));
         assert!(!l.iter().any(|(m, _)| *m == MenuItem::RestartAsAdmin));
         assert_eq!(l.last().unwrap().0, MenuItem::Quit);
     }
@@ -320,6 +323,7 @@ mod tests {
             vec![
                 MenuItem::ToggleOverlay,
                 MenuItem::OpenSettingsFile,
+                MenuItem::OpenGameStats,
                 MenuItem::ReloadSettings,
                 MenuItem::RestartAsAdmin,
                 MenuItem::Quit

@@ -279,7 +279,7 @@ fn csv_field(value: &str) -> String {
 }
 
 /// `H:MM:SS`, seconds truncated, hours unbounded.
-fn play_time(secs: f64) -> String {
+pub(crate) fn play_time(secs: f64) -> String {
     // Negative and NaN become 0 in the cast; infinity would saturate, so it is zeroed too.
     let total = if secs.is_finite() { secs as u64 } else { 0 };
     format!(

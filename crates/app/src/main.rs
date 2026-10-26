@@ -8,7 +8,6 @@ mod etw;
 #[cfg(windows)]
 mod foreground;
 #[cfg(windows)]
-#[allow(dead_code)] // wired in Task 8
 mod game_lookup;
 #[cfg(windows)]
 mod hotkeys;
@@ -19,12 +18,10 @@ mod overlay;
 #[cfg(windows)]
 mod paths;
 #[cfg(windows)]
-#[allow(dead_code)] // wired in Task 8
 mod process_info;
 #[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]
-#[allow(dead_code)] // wired in Task 8
 mod stats_files;
 #[cfg(all(windows, test))]
 mod test_util;
@@ -47,13 +44,17 @@ fn main() {
 mod app {
     use std::any::Any;
     use std::cell::{Cell, RefCell};
-    use std::path::PathBuf;
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
     use lite_bar_core::fps::FpsTracker;
+    use lite_bar_core::game_name::display_name;
+    use lite_bar_core::history::LocalTime;
     use lite_bar_core::layout::{fps_text, stats_text};
+    use lite_bar_core::sessions::{session_log_line, OpenSession, SessionBook};
     use lite_bar_core::settings::{Settings, StatsLayout};
     use windows::core::{w, HSTRING};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -72,19 +73,26 @@ mod app {
 
     use crate::elevation::{is_elevated, relaunch_as_admin};
     use crate::etw::{offers_admin, CaptureError, PresentCapture};
-    use crate::foreground::foreground_pid;
+    use crate::foreground::{foreground_pid, foreground_title};
+    use crate::game_lookup::resolve_name;
     use crate::hotkeys::{self, HotkeyId, Registration};
     use crate::overlay::Overlay;
     use crate::paths::{app_dir, load_or_create_settings};
+    use crate::process_info::{is_running, process_info};
     use crate::single_instance::{acquire_single_instance, InstanceGuard};
+    use crate::stats_files::{local_now, StatsWriter};
     use crate::tray::{MenuItem, Tray, TrayMenuState, WM_TRAY};
     use crate::{log, tray};
 
     const MUTEX_NAME: &str = "Local\\LiteBar.SingleInstance";
     const TIMER_ID: usize = 1;
     const TIMER_MS: u32 = 250;
+    /// Subfolder of the app dir holding `games.toml`, `games.csv` and `sessions.csv`.
+    const STATS_DIR: &str = "stats";
     /// Prune the tracker every this many timer ticks (5 s).
     const PRUNE_EVERY_TICKS: u32 = 20;
+    /// Check whether tracked game processes are still running every this many ticks (1 s).
+    const ALIVE_CHECK_EVERY_TICKS: u32 = 4;
 
     thread_local! {
         static APP: RefCell<Option<App>> = const { RefCell::new(None) };
@@ -161,6 +169,11 @@ mod app {
         needs_admin: bool,
         hotkey_ok: bool,
         ticks: u32,
+        /// Open play sessions; they survive the overlay being hidden.
+        sessions: SessionBook,
+        writer: StatsWriter,
+        /// Pids whose process could not be queried, so the failure is logged once per pid.
+        untrackable: HashSet<u32>,
     }
 
     impl App {
@@ -243,20 +256,30 @@ mod app {
             let pid = foreground_pid();
             let want_stats = self.settings.overlay.stats != StatsLayout::Off;
             // One lock for focus, FPS and stats; the summary is Copy so it is released early.
-            let (fps, summary) = {
+            let (fps, summary, has_stats) = {
                 let mut tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
                 tracker.set_focus(pid);
                 match pid {
-                    Some(pid) => (
-                        tracker.fps(pid, now),
-                        tracker.stats(pid).and_then(|h| h.summary()),
-                    ),
-                    None => (None, None),
+                    Some(pid) => {
+                        let hist = tracker.stats(pid);
+                        (
+                            tracker.fps(pid, now),
+                            hist.and_then(|h| h.summary()),
+                            hist.is_some(),
+                        )
+                    }
+                    None => (None, None, false),
                 }
             };
             let stats = want_stats.then(|| stats_text(summary.as_ref()));
             self.overlay.update(&fps_text(fps), stats.as_ref());
+            if let Some(pid) = pid_to_track(pid, has_stats, &self.sessions) {
+                self.start_session(pid);
+            }
             self.ticks = self.ticks.wrapping_add(1);
+            if alive_check_due(self.ticks) {
+                self.check_sessions();
+            }
             if self.ticks.is_multiple_of(PRUNE_EVERY_TICKS) {
                 self.tracker
                     .lock()
@@ -265,27 +288,101 @@ mod app {
             }
         }
 
+        /// Opens a session for the foreground `pid`, which has just counted its first frames.
+        fn start_session(&mut self, pid: u32) {
+            match process_info(pid) {
+                Some(info) => {
+                    let now = local_now();
+                    self.sessions.track(OpenSession {
+                        pid,
+                        created: info.created,
+                        exe_path: info.exe_path,
+                        window_title: foreground_title(),
+                        start: now,
+                        last_alive: now,
+                    });
+                }
+                None => {
+                    // Without its identity the frames can't be stored; drop them.
+                    self.tracker
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .take_stats(pid);
+                    if self.untrackable.insert(pid) {
+                        log::warn(&format!(
+                            "stats: cannot query process {pid}; its play time is not recorded"
+                        ));
+                    }
+                }
+            }
+        }
+
+        /// The 1 s check: sessions whose process exited end when it was last seen alive.
+        fn check_sessions(&mut self) {
+            let finished = self
+                .sessions
+                .sweep(local_now(), |s| is_running(s.pid, s.created));
+            for (session, end) in finished {
+                self.finish_session(session, end);
+            }
+        }
+
+        /// Quit or sign-out: every session ends (now, if its process still runs) and queued
+        /// stats writes are retried.
+        fn finish_all_sessions(&mut self) {
+            let finished = self
+                .sessions
+                .drain(local_now(), |s| is_running(s.pid, s.created));
+            for (session, end) in finished {
+                self.finish_session(session, end);
+            }
+            self.writer.flush(&self.settings.game_names);
+        }
+
+        /// Takes the session's frame stats and stores it if it is long enough.
+        fn finish_session(&mut self, session: OpenSession, end: LocalTime) {
+            let hist = self
+                .tracker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take_stats(session.pid);
+            let Some(hist) = hist else {
+                return;
+            };
+            if let Some(record) = session.finish(end, hist, resolve_name) {
+                let names = &self.settings.game_names;
+                let shown = display_name(&record.name, &record.exe_path, names);
+                log::info(&session_log_line(&record, &shown));
+                self.writer.record(&record, names);
+            }
+        }
+
         fn reload_settings(&mut self) {
             let (settings, warnings) = load_or_create_settings(&self.dir);
             for w in &warnings {
                 log::warn(w);
             }
+            if game_names_changed(&self.settings, &settings) {
+                self.writer.mark_games_csv_dirty();
+            }
             self.overlay.set_settings(&settings.overlay);
             self.settings = settings;
+            self.writer.flush(&self.settings.game_names);
             self.register_hotkey();
             log::info("settings reloaded");
         }
 
         fn open_settings_file(&self) {
-            let path = HSTRING::from(self.dir.join("settings.toml").as_os_str());
-            // SAFETY: valid NUL-terminated strings for the duration of the call.
-            let result =
-                unsafe { ShellExecuteW(None, w!("open"), &path, None, None, SW_SHOWNORMAL) };
-            if result.0 as usize <= 32 {
-                log::error(&format!(
-                    "could not open settings file: {}",
-                    windows::core::Error::from_thread()
-                ));
+            shell_open(&self.dir.join("settings.toml"), "settings file");
+        }
+
+        fn open_game_stats(&self) {
+            match self.writer.open_target() {
+                Ok(target) => shell_open(&target, "game stats"),
+                Err(e) => log::error(&format!(
+                    "could not create {}: {e}",
+                    self.writer.stats_dir().display()
+                )),
             }
         }
 
@@ -318,6 +415,7 @@ mod app {
             match item {
                 MenuItem::ToggleOverlay => self.toggle_overlay(),
                 MenuItem::OpenSettingsFile => self.open_settings_file(),
+                MenuItem::OpenGameStats => self.open_game_stats(),
                 MenuItem::ReloadSettings => self.reload_settings(),
                 MenuItem::RestartAsAdmin => {
                     if self.restart_as_admin() {
@@ -328,12 +426,34 @@ mod app {
             }
         }
 
-        /// Stops capture and removes the tray icon (the icon and window go with the drop).
+        /// Stops capture, removes the tray icon and saves the open sessions (the icon and
+        /// window go with the drop).
         fn shutdown(&mut self) {
             log::info("shutting down");
             hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
             self.stop_overlay();
             self.tray.remove();
+            self.finish_all_sessions();
+        }
+
+        /// The user is signing out or Windows is shutting down: the process may be ended as
+        /// soon as this returns.
+        fn end_session(&mut self) {
+            self.stop_overlay();
+            self.finish_all_sessions();
+        }
+    }
+
+    /// Opens `path` (a file or a folder) in its default program.
+    fn shell_open(path: &Path, what: &str) {
+        let path = HSTRING::from(path.as_os_str());
+        // SAFETY: valid NUL-terminated strings for the duration of the call.
+        let result = unsafe { ShellExecuteW(None, w!("open"), &path, None, None, SW_SHOWNORMAL) };
+        if result.0 as usize <= 32 {
+            log::error(&format!(
+                "could not open {what}: {}",
+                windows::core::Error::from_thread()
+            ));
         }
     }
 
@@ -344,8 +464,24 @@ mod app {
         Quit,
         /// The window is going away anyway: make sure the message loop ends.
         PostQuit,
-        /// The session is ending: stop the ETW session so it does not outlive the logoff.
+        /// The session is ending: stop the ETW session so it does not outlive the logoff, and
+        /// save the open play sessions.
         StopCapture,
+    }
+
+    /// The foreground pid that needs a new session: it has counted frames and none is open.
+    fn pid_to_track(pid: Option<u32>, has_stats: bool, sessions: &SessionBook) -> Option<u32> {
+        pid.filter(|pid| has_stats && !sessions.contains(*pid))
+    }
+
+    /// Whether this tick (counted after incrementing) runs the 1 s process-exit check.
+    fn alive_check_due(ticks: u32) -> bool {
+        ticks.is_multiple_of(ALIVE_CHECK_EVERY_TICKS)
+    }
+
+    /// A reload regenerates `games.csv` only when the display-name overrides changed.
+    fn game_names_changed(old: &Settings, new: &Settings) -> bool {
+        old.game_names != new.game_names
     }
 
     fn window_command(msg: u32, wparam: usize) -> Option<Command> {
@@ -438,7 +574,7 @@ mod app {
             }
             Some(Command::PostQuit) => quit(),
             Some(Command::StopCapture) => {
-                with_app(App::stop_overlay);
+                with_app(App::end_session);
                 return LRESULT(0);
             }
             None => {}
@@ -517,6 +653,7 @@ mod app {
         let overlay = Overlay::new(&settings.overlay)?;
 
         let start_visible = settings.overlay.visible;
+        let writer = StatsWriter::new(dir.join(STATS_DIR));
         let mut app = App {
             hwnd: owner.0,
             dir,
@@ -531,6 +668,9 @@ mod app {
             needs_admin: false,
             hotkey_ok: false,
             ticks: 0,
+            sessions: SessionBook::new(),
+            writer,
+            untrackable: HashSet::new(),
         };
         app.register_hotkey();
         if start_visible {
@@ -598,6 +738,58 @@ mod app {
             assert_eq!(window_command(WM_CLOSE, 0), Some(Command::Quit));
             assert_eq!(window_command(WM_DESTROY, 0), Some(Command::PostQuit));
             assert_eq!(window_command(WM_ENDSESSION, 1), Some(Command::StopCapture));
+        }
+
+        fn tracked(pid: u32) -> SessionBook {
+            let at = LocalTime {
+                year: 2026,
+                month: 10,
+                day: 26,
+                hour: 10,
+                minute: 0,
+                second: 0,
+            };
+            let mut book = SessionBook::new();
+            book.track(OpenSession {
+                pid,
+                created: 1,
+                exe_path: r"C:\Games\a.exe".into(),
+                window_title: None,
+                start: at,
+                last_alive: at,
+            });
+            book
+        }
+
+        #[test]
+        fn foreground_with_stats_and_no_session_is_tracked() {
+            assert_eq!(pid_to_track(Some(7), true, &SessionBook::new()), Some(7));
+            assert_eq!(pid_to_track(Some(8), true, &tracked(7)), Some(8));
+        }
+
+        #[test]
+        fn tracked_pid_or_one_without_stats_is_not_tracked_again() {
+            assert_eq!(pid_to_track(Some(7), true, &tracked(7)), None);
+            assert_eq!(pid_to_track(Some(7), false, &SessionBook::new()), None);
+            assert_eq!(pid_to_track(None, true, &SessionBook::new()), None);
+        }
+
+        #[test]
+        fn exit_check_runs_every_fourth_tick() {
+            let due: Vec<u32> = (1..=12).filter(|t| alive_check_due(*t)).collect();
+            assert_eq!(due, vec![4, 8, 12]);
+            assert_eq!(ALIVE_CHECK_EVERY_TICKS * TIMER_MS, 1000);
+        }
+
+        #[test]
+        fn only_changed_game_names_regenerate_games_csv() {
+            let old = Settings::default();
+            let mut new = Settings::default();
+            new.overlay.visible = !old.overlay.visible;
+            assert!(!game_names_changed(&old, &new));
+            new.game_names
+                .insert("javaw.exe".into(), "Minecraft".into());
+            assert!(game_names_changed(&old, &new));
         }
 
         #[test]

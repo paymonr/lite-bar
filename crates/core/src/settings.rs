@@ -90,7 +90,8 @@ impl Default for HotkeySettings {
 pub struct Settings {
     pub overlay: OverlaySettings,
     pub hotkeys: HotkeySettings,
-    /// Display names for the history view. Keys are an exe file name or a full path.
+    /// Display names used in the game stats files (`games.csv`, `sessions.csv`). Keys are an
+    /// exe file name or a full path.
     pub game_names: BTreeMap<String, String>,
 }
 
@@ -251,8 +252,9 @@ text_size = 18
 toggle_overlay = "Ctrl+Alt+Shift+L"
 
 [game_names]
-# Display names shown in the history view. The key is an exe file name or a full path;
-# the value is the name to show. Use single quotes for a path so backslashes need no escaping.
+# Display names used in the game stats files (games.csv, sessions.csv). The key is an exe
+# file name or a full path; the value is the name to use. Use single quotes for a path so
+# backslashes need no escaping.
 # "javaw.exe" = "Minecraft"
 # 'C:\Games\Foo\foo.exe' = "Foo: Remastered"
 "##;

@@ -63,6 +63,17 @@ impl StatsWriter {
         &self.dir
     }
 
+    /// What "Open game stats" opens: `games.csv`, or the stats folder (created if missing)
+    /// while there is no CSV yet.
+    pub fn open_target(&self) -> std::io::Result<PathBuf> {
+        let csv = self.dir.join(GAMES_CSV);
+        if csv.is_file() {
+            return Ok(csv);
+        }
+        std::fs::create_dir_all(&self.dir)?;
+        Ok(self.dir.clone())
+    }
+
     /// Stores a finished session in all three files (or queues whatever can't be written now).
     pub fn record(&mut self, s: &SessionRecord, overrides: &BTreeMap<String, String>) {
         let display = display_name(&s.name, &s.exe_path, overrides);
@@ -271,6 +282,21 @@ mod tests {
         let now = local_now();
         assert!(now.year >= 2024, "{now:?}");
         assert!((1..=12).contains(&now.month) && (1..=31).contains(&now.day));
+    }
+
+    #[test]
+    fn open_target_is_the_created_folder_until_games_csv_exists() {
+        let tmp = TempDir::new("stats-open-target");
+        let dir = tmp.path().join("stats");
+        let mut writer = StatsWriter::new(dir.clone());
+        assert_eq!(writer.open_target().unwrap(), dir);
+        assert!(dir.is_dir(), "the folder is created so it can be opened");
+
+        writer.record(
+            &session("alpha", "Alpha", time(10, 0), time(10, 10)),
+            &no_overrides(),
+        );
+        assert_eq!(writer.open_target().unwrap(), dir.join("games.csv"));
     }
 
     #[test]

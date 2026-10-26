@@ -7,4 +7,5 @@ pub mod game_name;
 pub mod history;
 pub mod hotkey;
 pub mod layout;
+pub mod sessions;
 pub mod settings;
