@@ -182,13 +182,18 @@ fn decode_xml_entities(s: &str) -> String {
     out
 }
 
+fn is_resource_ref(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("ms-resource:")
+}
+
 fn non_empty_decoded(raw: &str) -> Option<String> {
     let decoded = decode_xml_entities(raw);
     let trimmed = decoded.trim();
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// `DefaultDisplayName` of the `<ShellVisuals .../>` element in `MicrosoftGame.config`.
+/// `DefaultDisplayName` of the `<ShellVisuals .../>` element in `MicrosoftGame.config`;
+/// `None` for unresolved `ms-resource:` values.
 pub fn parse_microsoft_game_config(xml: &str) -> Option<String> {
     let tag_start = xml.find("<ShellVisuals")?;
     let tag = &xml[tag_start..];
@@ -206,7 +211,7 @@ pub fn parse_microsoft_game_config(xml: &str) -> Option<String> {
                 let quote = value.chars().next().filter(|q| *q == '"' || *q == '\'')?;
                 let inner = &value[1..];
                 let end = inner.find(quote)?;
-                return non_empty_decoded(&inner[..end]);
+                return non_empty_decoded(&inner[..end]).filter(|n| !is_resource_ref(n));
             }
         }
         search = &search[at + "DefaultDisplayName".len()..];
@@ -220,7 +225,7 @@ pub fn parse_appx_display_name(xml: &str) -> Option<String> {
     let start = xml.find(OPEN)? + OPEN.len();
     let len = xml[start..].find("</DisplayName>")?;
     let name = non_empty_decoded(&xml[start..start + len])?;
-    (!name.to_ascii_lowercase().starts_with("ms-resource:")).then_some(name)
+    (!is_resource_ref(&name)).then_some(name)
 }
 
 // ---- Generic names ----
@@ -256,22 +261,28 @@ pub fn is_generic_host(exe_path: &str) -> bool {
 
 // ---- Window titles ----
 
+/// `v?\d+(\.\d+)+` or `v\d+`, optionally followed by `-suffix`. Bare numbers are not versions.
 fn is_version_token(token: &str) -> bool {
-    let rest = token.strip_prefix(['v', 'V']).unwrap_or(token);
+    let (has_v, rest) = match token.strip_prefix(['v', 'V']) {
+        Some(rest) => (true, rest),
+        None => (false, token),
+    };
     let digits = |s: &str| s.bytes().take_while(u8::is_ascii_digit).count();
     let mut n = digits(rest);
     if n == 0 {
         return false;
     }
-    loop {
-        let tail = &rest[n..];
-        match tail.strip_prefix('.') {
-            Some(after) if digits(after) > 0 => n += 1 + digits(after),
-            _ => break,
+    let mut dots = 0;
+    while let Some(after) = rest[n..].strip_prefix('.') {
+        let d = digits(after);
+        if d == 0 {
+            break;
         }
+        n += 1 + d;
+        dots += 1;
     }
     let tail = &rest[n..];
-    tail.is_empty() || (tail.starts_with('-') && tail.len() > 1)
+    (has_v || dots > 0) && (tail.is_empty() || (tail.starts_with('-') && tail.len() > 1))
 }
 
 /// Strips subtitle, dirty-marker and version tokens from a window title.
@@ -522,6 +533,12 @@ mod tests {
     }
 
     #[test]
+    fn game_config_ms_resource_is_none() {
+        let xml = r#"<Game><ShellVisuals DefaultDisplayName="ms-resource:AppName"/></Game>"#;
+        assert_eq!(parse_microsoft_game_config(xml), None);
+    }
+
+    #[test]
     fn appx_reads_display_name_element_and_decodes_entities() {
         let xml = r#"<Package><Properties><DisplayName>Tom &lt;&amp;&gt; Jerry&apos;s</DisplayName></Properties></Package>"#;
         assert_eq!(
@@ -625,6 +642,22 @@ mod tests {
         );
         assert_eq!(clean_window_title("Foo 1.0a"), Some("Foo 1.0a".to_string()));
         assert_eq!(clean_window_title("Foo 1.0-"), Some("Foo 1.0-".to_string()));
+    }
+
+    #[test]
+    fn title_keeps_bare_numbers() {
+        assert_eq!(clean_window_title("Portal 2"), Some("Portal 2".to_string()));
+        assert_eq!(
+            clean_window_title("Cyberpunk 2077 v2.1"),
+            Some("Cyberpunk 2077".to_string())
+        );
+        assert_eq!(clean_window_title("Game v3"), Some("Game".to_string()));
+        assert_eq!(
+            clean_window_title("Minecraft 1.21-pre1"),
+            Some("Minecraft".to_string())
+        );
+        assert_eq!(clean_window_title("1.2.3"), None);
+        assert_eq!(clean_window_title("2077"), Some("2077".to_string()));
     }
 
     #[test]
