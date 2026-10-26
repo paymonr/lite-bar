@@ -34,6 +34,7 @@ fn main() {
 
 #[cfg(windows)]
 mod app {
+    use std::any::Any;
     use std::cell::{Cell, RefCell};
     use std::path::PathBuf;
     use std::rc::Rc;
@@ -418,6 +419,30 @@ mod app {
         unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
 
+    /// Human-readable text for the panic hook's log line.
+    fn panic_message(payload: &(dyn Any + Send), location: Option<(&str, u32, u32)>) -> String {
+        let text = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("<non-string payload>");
+        match location {
+            Some((file, line, col)) => format!("panic: {text} at {file}:{line}:{col}"),
+            None => format!("panic: {text} at <unknown location>"),
+        }
+    }
+
+    /// A panic in the window procedure would abort at the FFI boundary: the app would vanish
+    /// silently and leak its ETW session. Log it and stop the session on the way out. The
+    /// previous hook is not called (there is no console).
+    fn install_panic_hook() {
+        std::panic::set_hook(Box::new(|info| {
+            let location = info.location().map(|l| (l.file(), l.line(), l.column()));
+            log::error(&panic_message(info.payload(), location));
+            let _ = ferrisetw::trace::stop_trace_by_name(crate::etw::SESSION_NAME);
+        }));
+    }
+
     pub fn run() {
         // SAFETY: plain FFI. Fails (ignored) if a manifest already set the awareness.
         unsafe {
@@ -425,6 +450,7 @@ mod app {
         }
         let dir = app_dir();
         log::init(&dir);
+        install_panic_hook();
 
         let guard = match acquire_single_instance(MUTEX_NAME) {
             Ok(Some(guard)) => Some(guard),
@@ -508,6 +534,33 @@ mod app {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn panic_message_formats_str_payload_and_location() {
+            let payload: Box<dyn Any + Send> = Box::new("boom");
+            assert_eq!(
+                panic_message(&*payload, Some(("src/main.rs", 12, 5))),
+                "panic: boom at src/main.rs:12:5"
+            );
+        }
+
+        #[test]
+        fn panic_message_formats_string_payload() {
+            let payload: Box<dyn Any + Send> = Box::new(String::from("bad index 7"));
+            assert_eq!(
+                panic_message(&*payload, Some(("a.rs", 1, 2))),
+                "panic: bad index 7 at a.rs:1:2"
+            );
+        }
+
+        #[test]
+        fn panic_message_handles_unknown_payload_and_location() {
+            let payload: Box<dyn Any + Send> = Box::new(42_u32);
+            assert_eq!(
+                panic_message(&*payload, None),
+                "panic: <non-string payload> at <unknown location>"
+            );
+        }
         use windows::Win32::UI::WindowsAndMessaging::{
             HWND_MESSAGE, WM_CLOSE, WM_DESTROY, WM_ENDSESSION,
         };
