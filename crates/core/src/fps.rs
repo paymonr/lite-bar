@@ -21,16 +21,28 @@ pub enum PresentOrigin {
 }
 
 /// Event times (seconds) inside the sliding window for one origin.
-#[derive(Default)]
 struct Series {
     times: VecDeque<f64>,
     /// Largest event time pushed. Events may arrive slightly out of order, so the back of the
     /// deque is not always the newest.
     newest: f64,
+    /// Largest `received_at` seen for this origin. Negative infinity until the first event.
+    last_received: f64,
+}
+
+impl Default for Series {
+    fn default() -> Self {
+        Self {
+            times: VecDeque::new(),
+            newest: 0.0,
+            last_received: f64::NEG_INFINITY,
+        }
+    }
 }
 
 impl Series {
-    fn push(&mut self, event_time: f64) {
+    fn push(&mut self, event_time: f64, received_at: f64) {
+        self.last_received = self.last_received.max(received_at);
         if self.times.is_empty() || event_time > self.newest {
             self.newest = event_time;
         }
@@ -42,8 +54,16 @@ impl Series {
         }
     }
 
-    /// Frames per second over the window, or `None` with fewer than two entries or no time span.
-    fn rate(&self) -> Option<f64> {
+    fn is_fresh(&self, now: f64) -> bool {
+        now - self.last_received <= STALE_SECS
+    }
+
+    /// Frames per second over the window, or `None` when stale, with fewer than two entries, or
+    /// with no time span.
+    fn rate(&self, now: f64) -> Option<f64> {
+        if !self.is_fresh(now) {
+            return None;
+        }
         let n = self.times.len();
         if n < 2 {
             return None;
@@ -57,7 +77,6 @@ impl Series {
 struct PidState {
     api: Series,
     kernel: Series,
-    last_received: f64,
 }
 
 /// Tracks present timestamps per process and derives a recent FPS value.
@@ -80,32 +99,26 @@ impl FpsTracker {
         received_at: f64,
     ) {
         let state = self.pids.entry(pid).or_default();
-        if received_at > state.last_received {
-            state.last_received = received_at;
-        }
         match origin {
-            PresentOrigin::Api => state.api.push(event_time),
-            PresentOrigin::Kernel => state.kernel.push(event_time),
+            PresentOrigin::Api => state.api.push(event_time, received_at),
+            PresentOrigin::Kernel => state.kernel.push(event_time, received_at),
         }
     }
 
-    /// FPS for `pid` at app-clock time `now`. Prefers `Api` events and falls back to `Kernel`
-    /// ones; the two are never summed because a DXGI game produces both.
+    /// FPS for `pid` at app-clock time `now`. Prefers a fresh `Api` series with at least two
+    /// entries and otherwise falls back to a fresh `Kernel` one. The two are never summed
+    /// because a DXGI game produces both. Freshness is judged per series, so an `Api` series
+    /// that went quiet cannot mask live `Kernel` data.
     pub fn fps(&self, pid: u32, now: f64) -> Option<f64> {
         let state = self.pids.get(&pid)?;
-        if now - state.last_received > STALE_SECS {
-            return None;
-        }
-        if state.api.times.len() >= 2 {
-            state.api.rate()
-        } else {
-            state.kernel.rate()
-        }
+        state.api.rate(now).or_else(|| state.kernel.rate(now))
     }
 
-    /// Forgets pids that have not been heard from for more than `STALE_SECS`.
+    /// Forgets pids whose series have all gone stale (nothing received for more than
+    /// `STALE_SECS`).
     pub fn prune(&mut self, now: f64) {
-        self.pids.retain(|_, s| now - s.last_received <= STALE_SECS);
+        self.pids
+            .retain(|_, s| s.api.is_fresh(now) || s.kernel.is_fresh(now));
     }
 }
 
@@ -252,5 +265,36 @@ mod tests {
         t.record_present(1, PresentOrigin::Api, 1.0, 1.0);
         t.record_present(1, PresentOrigin::Api, 1.5, 1.0);
         assert_eq!(t.fps(1, 1.0), Some(2.0));
+    }
+
+    #[test]
+    fn late_out_of_order_event_does_not_move_the_newest_endpoint() {
+        let mut t = FpsTracker::new();
+        t.record_present(1, PresentOrigin::Api, 100.0, 10.0);
+        t.record_present(1, PresentOrigin::Api, 101.0, 10.0);
+        t.record_present(1, PresentOrigin::Api, 100.9, 10.0); // late event arrives last
+                                                              // The span is 100.0..101.0 (newest, not the back at 100.9): 2 intervals / 1.0 s.
+        assert_eq!(t.fps(1, 10.0), Some(2.0));
+    }
+
+    #[test]
+    fn stale_api_falls_back_to_live_kernel() {
+        let mut t = FpsTracker::new();
+        feed(&mut t, 8, PresentOrigin::Api, 60.0, 1.0, 10.0); // event times 100..101
+        for i in 0..=90 {
+            t.record_present(8, PresentOrigin::Kernel, 111.0 + i as f64 / 90.0, 12.5);
+        }
+        assert!((t.fps(8, 12.6).unwrap() - 90.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn prune_keeps_pid_with_only_one_fresh_series() {
+        let mut t = FpsTracker::new();
+        feed(&mut t, 8, PresentOrigin::Api, 60.0, 1.0, 10.0);
+        feed(&mut t, 8, PresentOrigin::Kernel, 60.0, 1.0, 12.5);
+        t.prune(12.6);
+        assert!(t.fps(8, 12.6).is_some());
+        t.prune(20.0);
+        assert_eq!(t.fps(8, 12.6), None);
     }
 }
