@@ -177,6 +177,14 @@ mod app {
         fn start_overlay(&mut self) {
             self.overlay_on = true;
             self.needs_admin = false;
+            // Show the overlay (with "—") and start the timer first, so the ETW start latency
+            // is not part of what the user sees.
+            self.overlay.show();
+            // SAFETY: plain FFI on our own window.
+            unsafe {
+                SetTimer(Some(self.hwnd), TIMER_ID, TIMER_MS, None);
+            }
+            self.on_timer();
             match PresentCapture::start(self.tracker.clone(), self.clock) {
                 Ok(capture) => self.capture = Some(capture),
                 Err(err) => {
@@ -191,16 +199,12 @@ mod app {
                     self.needs_admin = offers_admin(&err, is_elevated());
                 }
             }
-            self.overlay.show();
-            // SAFETY: plain FFI on our own window.
-            unsafe {
-                SetTimer(Some(self.hwnd), TIMER_ID, TIMER_MS, None);
-            }
-            self.on_timer();
         }
 
         fn stop_overlay(&mut self) {
             self.overlay_on = false;
+            // Hide and stop the timer first, so the ETW stop latency is not visible.
+            self.overlay.hide();
             // SAFETY: plain FFI on our own window.
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), TIMER_ID);
@@ -208,7 +212,6 @@ mod app {
             if let Some(capture) = self.capture.take() {
                 capture.stop();
             }
-            self.overlay.hide();
         }
 
         fn toggle_overlay(&mut self) {
