@@ -37,7 +37,8 @@ impl fmt::Display for Key {
     }
 }
 
-/// A modifier combination plus one key. At least one modifier is required.
+/// A modifier combination plus one key. At least one modifier is required; for letter and
+/// digit keys that must be Ctrl, Alt or Win (Shift alone would block typing).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Hotkey {
     pub ctrl: bool,
@@ -53,7 +54,7 @@ pub enum HotkeyError {
     NoKey,
     #[error("hotkey has more than one key")]
     MultipleKeys,
-    #[error("hotkey needs at least one modifier (Ctrl, Alt, Shift or Win)")]
+    #[error("hotkey needs a Ctrl, Alt or Win modifier (Shift alone only works with F1-F24)")]
     NoModifier,
     #[error("unknown hotkey part: {0:?}")]
     UnknownPart(String),
@@ -103,7 +104,14 @@ impl FromStr for Hotkey {
             }
         }
         let key = key.ok_or(HotkeyError::NoKey)?;
-        if !(ctrl || alt || shift || win) {
+        // Shift alone types capital letters and shifted digits, so it only counts as a
+        // modifier for function keys.
+        let has_modifier = if matches!(key, Key::F(_)) {
+            ctrl || alt || shift || win
+        } else {
+            ctrl || alt || win
+        };
+        if !has_modifier {
             return Err(HotkeyError::NoModifier);
         }
         Ok(Hotkey {
@@ -189,5 +197,29 @@ mod tests {
             "Ctrl+F25".parse::<Hotkey>(),
             Err(HotkeyError::UnknownPart(_))
         ));
+    }
+
+    #[test]
+    fn shift_alone_is_not_enough_for_letters_and_digits() {
+        assert!(matches!(
+            "Shift+A".parse::<Hotkey>(),
+            Err(HotkeyError::NoModifier)
+        ));
+        assert!(matches!(
+            "Shift+1".parse::<Hotkey>(),
+            Err(HotkeyError::NoModifier)
+        ));
+    }
+
+    #[test]
+    fn shift_alone_is_fine_for_function_keys() {
+        assert!("Shift+F5".parse::<Hotkey>().is_ok());
+    }
+
+    #[test]
+    fn shift_with_another_modifier_is_fine_for_letters() {
+        assert!("Ctrl+Shift+A".parse::<Hotkey>().is_ok());
+        assert!("Alt+Shift+1".parse::<Hotkey>().is_ok());
+        assert!("Win+Shift+A".parse::<Hotkey>().is_ok());
     }
 }
