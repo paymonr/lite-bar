@@ -274,7 +274,7 @@ mod tests {
     fn menu_labels_normal() {
         let s = TrayMenuState {
             overlay_visible: true,
-            toggle_hotkey: "Ctrl+Alt+Shift+F".into(),
+            toggle_hotkey: "Ctrl+Alt+Shift+L".into(),
             toggle_available: true,
             needs_admin: false,
         };
@@ -283,7 +283,7 @@ mod tests {
             l[0],
             (
                 MenuItem::ToggleOverlay,
-                "Hide FPS overlay\tCtrl+Alt+Shift+F".into()
+                "Hide FPS overlay\tCtrl+Alt+Shift+L".into()
             )
         );
         assert!(!l.iter().any(|(m, _)| *m == MenuItem::RestartAsAdmin));
@@ -294,12 +294,12 @@ mod tests {
     fn menu_labels_unavailable_hotkey_and_admin() {
         let s = TrayMenuState {
             overlay_visible: false,
-            toggle_hotkey: "Ctrl+Alt+Shift+F".into(),
+            toggle_hotkey: "Ctrl+Alt+Shift+L".into(),
             toggle_available: false,
             needs_admin: true,
         };
         let l = menu_labels(&s);
-        assert_eq!(l[0].1, "Show FPS overlay\t(Ctrl+Alt+Shift+F unavailable)");
+        assert_eq!(l[0].1, "Show FPS overlay\t(Ctrl+Alt+Shift+L unavailable)");
         assert!(l.contains(&(
             MenuItem::RestartAsAdmin,
             "Restart as administrator to show FPS".into()
@@ -310,7 +310,7 @@ mod tests {
     fn menu_order_matches_spec() {
         let s = TrayMenuState {
             overlay_visible: true,
-            toggle_hotkey: "Ctrl+Alt+Shift+F".into(),
+            toggle_hotkey: "Ctrl+Alt+Shift+L".into(),
             toggle_available: true,
             needs_admin: true,
         };

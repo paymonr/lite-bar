@@ -38,7 +38,7 @@ Lite Bar lives in the system tray and shows an FPS overlay for the foreground ap
 
 The tray menu also has **Reload settings**, which re-reads the settings file and keeps the current on/off state of the overlay, and **Open settings file**.
 
-The overlay toggles with `Ctrl+Alt+Shift+F` by default.
+The overlay toggles with `Ctrl+Alt+Shift+L` by default.
 
 ### Files
 
@@ -47,7 +47,7 @@ The overlay toggles with `Ctrl+Alt+Shift+F` by default.
 | Settings | `%APPDATA%\LiteBar\settings.toml` |
 | Log | `%APPDATA%\LiteBar\lite-bar.log` |
 
-The settings file is created with the default values on first run and is never overwritten afterwards. An invalid value falls back to its default and a warning is written to the log. Unknown keys are ignored.
+The settings file is created with the default values and a comment for every key on first run and is never overwritten afterwards. An invalid value falls back to its default and a warning is written to the log. Unknown keys are ignored.
 
 ### Settings
 
@@ -56,7 +56,8 @@ The settings file is created with the default values on first run and is never o
 | Key | Type and values | Default |
 | --- | --- | --- |
 | `visible` | bool; whether the overlay is shown at startup | `true` |
-| `corner` | `"top-left"`, `"top-right"`, `"bottom-left"` or `"bottom-right"` | `"top-left"` |
+| `location` | `"top-left"`, `"top-center"`, `"top-right"`, `"center-left"`, `"center-right"`, `"bottom-left"`, `"bottom-center"` or `"bottom-right"` | `"top-left"` |
+| `stats` | live FPS statistics layout: `"off"`, `"inline"` or `"stacked"` | `"inline"` |
 | `number_color` | `"#RRGGBB"` | `"#7CFC7C"` |
 | `label_color` | `"#RRGGBB"` | `"#FFFFFF"` |
 | `background_color` | `"#RRGGBB"` | `"#000000"` |
@@ -67,9 +68,21 @@ The settings file is created with the default values on first run and is never o
 
 | Key | Type and values | Default |
 | --- | --- | --- |
-| `toggle_overlay` | string, e.g. `"Ctrl+Alt+Shift+F"` | `"Ctrl+Alt+Shift+F"` |
+| `toggle_overlay` | string, e.g. `"Ctrl+Alt+Shift+L"` | `"Ctrl+Alt+Shift+L"` |
 
 Hotkey syntax: zero or more modifiers (`Ctrl`, `Alt`, `Shift`, `Win`) and exactly one key (`A`-`Z`, `0`-`9` or `F1`-`F24`), joined with `+`, case-insensitive. For letter and digit keys at least one of `Ctrl`, `Alt` or `Win` is required (`Shift` alone would stop you typing capital letters). Function keys also accept `Shift` alone, e.g. `Shift+F5`. If the combination is already taken by another program, the tray menu shows the hotkey as unavailable.
+
+`[game_names]`
+
+Optional display names for games. Each key is an exe file name or a full path, and each value is the name to show. Use a single-quoted string for a path so backslashes need no escaping. There are no entries by default. A value that is not a string is ignored with a warning.
+
+```toml
+[game_names]
+"javaw.exe" = "Minecraft"
+'C:\Games\Foo\foo.exe' = "Foo: Remastered"
+```
+
+If you ran an earlier build, delete `%APPDATA%\LiteBar\settings.toml` to get the commented version (the old `corner` key is no longer read).
 
 ### Known limitations
 

@@ -1,5 +1,7 @@
 //! Tolerant settings: every invalid field falls back to its default with a warning.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::color::Rgb;
@@ -7,17 +9,31 @@ use crate::hotkey::{Hotkey, Key};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum Corner {
+pub enum Location {
     TopLeft,
+    TopCenter,
     TopRight,
+    CenterLeft,
+    CenterRight,
     BottomLeft,
+    BottomCenter,
     BottomRight,
+}
+
+/// How the live FPS statistics are drawn next to the counter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StatsLayout {
+    Off,
+    Inline,
+    Stacked,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize)]
 pub struct OverlaySettings {
     pub visible: bool,
-    pub corner: Corner,
+    pub location: Location,
+    pub stats: StatsLayout,
     pub number_color: Rgb,
     pub label_color: Rgb,
     pub background_color: Rgb,
@@ -31,7 +47,8 @@ impl Default for OverlaySettings {
     fn default() -> Self {
         OverlaySettings {
             visible: true,
-            corner: Corner::TopLeft,
+            location: Location::TopLeft,
+            stats: StatsLayout::Inline,
             number_color: Rgb {
                 r: 0x7C,
                 g: 0xFC,
@@ -55,7 +72,7 @@ pub struct HotkeySettings {
 }
 
 impl Default for HotkeySettings {
-    /// `Ctrl+Alt+Shift+F`: plain `Ctrl+Shift+F` would steal Find-in-Files from editors.
+    /// `Ctrl+Alt+Shift+L`: a plain `Ctrl+Shift+<letter>` would collide with editor shortcuts.
     fn default() -> Self {
         HotkeySettings {
             toggle_overlay: Hotkey {
@@ -63,7 +80,7 @@ impl Default for HotkeySettings {
                 alt: true,
                 shift: true,
                 win: false,
-                key: Key::Letter('F'),
+                key: Key::Letter('L'),
             },
         }
     }
@@ -73,6 +90,8 @@ impl Default for HotkeySettings {
 pub struct Settings {
     pub overlay: OverlaySettings,
     pub hotkeys: HotkeySettings,
+    /// Display names for the history view. Keys are an exe file name or a full path.
+    pub game_names: BTreeMap<String, String>,
 }
 
 /// Reads `section.key` as a `T`, pushing a warning and returning `None` when it is
@@ -150,8 +169,11 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
     if let Some(v) = read_field(&overlay, "overlay", "visible", &mut warnings) {
         o.visible = v;
     }
-    if let Some(v) = read_field(&overlay, "overlay", "corner", &mut warnings) {
-        o.corner = v;
+    if let Some(v) = read_field(&overlay, "overlay", "location", &mut warnings) {
+        o.location = v;
+    }
+    if let Some(v) = read_field(&overlay, "overlay", "stats", &mut warnings) {
+        o.stats = v;
     }
     if let Some(v) = read_field(&overlay, "overlay", "number_color", &mut warnings) {
         o.number_color = v;
@@ -180,13 +202,60 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
         settings.hotkeys.toggle_overlay = v;
     }
 
+    let game_names = read_section(&root, "game_names", &mut warnings);
+    for (key, value) in &game_names {
+        match value {
+            toml::Value::String(name) => {
+                settings.game_names.insert(key.clone(), name.clone());
+            }
+            _ => warnings.push(format!(
+                "game_names.{key}: expected a string; ignoring this entry"
+            )),
+        }
+    }
+
     (settings, warnings)
 }
 
-/// The default settings serialized as TOML, used to create a first-run settings file.
+/// The commented first-run settings file. It parses back to `Settings::default()`.
 pub fn default_settings_toml() -> String {
-    toml::to_string_pretty(&Settings::default()).expect("default settings serialize to TOML")
+    DEFAULT_SETTINGS_TOML.to_string()
 }
+
+const DEFAULT_SETTINGS_TOML: &str = r##"# Lite Bar settings. Edit and save, then choose "Reload settings" in the tray menu.
+# A value that is missing or invalid falls back to its default.
+
+[overlay]
+# Show the FPS overlay at startup: true or false.
+visible = true
+# Where the counter sits: top-left, top-center, top-right, center-left,
+# center-right, bottom-left, bottom-center or bottom-right.
+location = "top-left"
+# Live FPS statistics next to the counter: "off", "inline" (one line) or "stacked" (below).
+stats = "inline"
+# Color of the FPS number, as #RRGGBB.
+number_color = "#7CFC7C"
+# Color of the "FPS" label, as #RRGGBB.
+label_color = "#FFFFFF"
+# Color of the panel behind the text, as #RRGGBB.
+background_color = "#000000"
+# Opacity of that panel in percent, 0-100.
+background_opacity = 55
+# Height of the FPS number in pixels, 8-72.
+text_size = 18
+
+[hotkeys]
+# Key that shows or hides the overlay: modifiers joined by "+", then one key,
+# e.g. "Ctrl+Alt+Shift+L" or "Win+F9". A letter or digit needs Ctrl, Alt or Win;
+# Shift alone is only enough for F1-F24.
+toggle_overlay = "Ctrl+Alt+Shift+L"
+
+[game_names]
+# Display names shown in the history view. The key is an exe file name or a full path;
+# the value is the name to show. Use single quotes for a path so backslashes need no escaping.
+# "javaw.exe" = "Minecraft"
+# 'C:\Games\Foo\foo.exe' = "Foo: Remastered"
+"##;
 
 #[cfg(test)]
 mod tests {
@@ -199,7 +268,7 @@ mod tests {
         assert!(w.is_empty());
         assert_eq!(s.overlay.number_color.to_hex(), "#7CFC7C");
         assert_eq!(s.overlay.background_opacity, 55);
-        assert_eq!(s.hotkeys.toggle_overlay.to_string(), "Ctrl+Alt+Shift+F");
+        assert_eq!(s.hotkeys.toggle_overlay.to_string(), "Ctrl+Alt+Shift+L");
     }
 
     #[test]
@@ -215,7 +284,7 @@ mod tests {
     #[test]
     fn bad_hotkey_falls_back_with_warning() {
         let (s, w) = parse_settings("[hotkeys]\ntoggle_overlay = \"F\"\n");
-        assert_eq!(s.hotkeys.toggle_overlay.to_string(), "Ctrl+Alt+Shift+F");
+        assert_eq!(s.hotkeys.toggle_overlay.to_string(), "Ctrl+Alt+Shift+L");
         assert!(w[0].contains("hotkeys.toggle_overlay"));
     }
 
@@ -231,6 +300,128 @@ mod tests {
         let (s, w) = parse_settings(&default_settings_toml());
         assert_eq!(s, Settings::default());
         assert!(w.is_empty());
+    }
+
+    #[test]
+    fn default_hotkey_is_ctrl_alt_shift_l() {
+        assert_eq!(
+            Settings::default().hotkeys.toggle_overlay.to_string(),
+            "Ctrl+Alt+Shift+L"
+        );
+    }
+
+    #[test]
+    fn parses_every_location() {
+        let cases = [
+            ("top-left", Location::TopLeft),
+            ("top-center", Location::TopCenter),
+            ("top-right", Location::TopRight),
+            ("center-left", Location::CenterLeft),
+            ("center-right", Location::CenterRight),
+            ("bottom-left", Location::BottomLeft),
+            ("bottom-center", Location::BottomCenter),
+            ("bottom-right", Location::BottomRight),
+        ];
+        for (text, want) in cases {
+            let (s, w) = parse_settings(&format!("[overlay]\nlocation = \"{text}\"\n"));
+            assert_eq!(s.overlay.location, want, "{text}");
+            assert!(w.is_empty(), "{text}: {w:?}");
+        }
+        let (s, w) = parse_settings("[overlay]\nlocation = \"middle\"\n");
+        assert_eq!(s.overlay.location, Location::TopLeft);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("overlay.location"));
+    }
+
+    #[test]
+    fn old_corner_key_is_ignored() {
+        let (s, w) = parse_settings("[overlay]\ncorner = \"bottom-right\"\n");
+        assert_eq!(s.overlay.location, Location::TopLeft);
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn parses_stats_layout() {
+        assert_eq!(Settings::default().overlay.stats, StatsLayout::Inline);
+        for (text, want) in [
+            ("off", StatsLayout::Off),
+            ("inline", StatsLayout::Inline),
+            ("stacked", StatsLayout::Stacked),
+        ] {
+            let (s, w) = parse_settings(&format!("[overlay]\nstats = \"{text}\"\n"));
+            assert_eq!(s.overlay.stats, want, "{text}");
+            assert!(w.is_empty(), "{text}: {w:?}");
+        }
+        let (s, w) = parse_settings("[overlay]\nstats = \"big\"\n");
+        assert_eq!(s.overlay.stats, StatsLayout::Inline);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("overlay.stats"));
+    }
+
+    #[test]
+    fn parses_game_names() {
+        let (s, w) = parse_settings(
+            "[game_names]\n\"javaw.exe\" = \"Minecraft\"\n'C:\\Games\\x.exe' = \"X\"\nbad = 3\n",
+        );
+        assert_eq!(s.game_names.len(), 2);
+        assert_eq!(s.game_names["javaw.exe"], "Minecraft");
+        assert_eq!(s.game_names["C:\\Games\\x.exe"], "X");
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("game_names.bad"));
+    }
+
+    #[test]
+    fn template_has_a_comment_for_every_key() {
+        let template = default_settings_toml();
+        let lines: Vec<&str> = template.lines().collect();
+        for key in [
+            "visible",
+            "location",
+            "stats",
+            "number_color",
+            "label_color",
+            "background_color",
+            "background_opacity",
+            "text_size",
+            "toggle_overlay",
+        ] {
+            let at = lines
+                .iter()
+                .position(|l| l.starts_with(&format!("{key} =")))
+                .unwrap_or_else(|| panic!("no `{key} =` line"));
+            assert!(
+                at > 0 && lines[at - 1].starts_with('#'),
+                "`{key}` has no comment line before it"
+            );
+        }
+        for location in [
+            "top-left",
+            "top-center",
+            "top-right",
+            "center-left",
+            "center-right",
+            "bottom-left",
+            "bottom-center",
+            "bottom-right",
+        ] {
+            assert!(template.contains(location), "missing {location}");
+        }
+        assert!(template.contains("0-100"));
+        assert!(template.contains("8-72"));
+        assert!(lines.contains(&"[game_names]"));
+        let example = lines
+            .iter()
+            .skip_while(|l| **l != "[game_names]")
+            .any(|l| l.starts_with('#') && l.contains("= \""));
+        assert!(example, "[game_names] needs a commented-out example entry");
+        assert!(
+            !lines
+                .iter()
+                .skip_while(|l| **l != "[game_names]")
+                .skip(1)
+                .any(|l| !l.starts_with('#') && !l.trim().is_empty()),
+            "[game_names] must have no active entries"
+        );
     }
 
     #[test]

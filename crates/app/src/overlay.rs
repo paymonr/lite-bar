@@ -314,7 +314,7 @@ impl Overlay {
         }
     }
 
-    /// Redraws if needed, then places the window in its corner of the foreground monitor.
+    /// Redraws if needed, then places the window in its location on the foreground monitor.
     fn refresh(&mut self) {
         let (area, scale) = crate::foreground::foreground_monitor();
         if scale != self.scale {
@@ -333,7 +333,7 @@ impl Overlay {
         }
 
         let margin = px(BASE_MARGIN_PX as f32, self.scale) as i32;
-        let origin = overlay_origin(self.settings.corner, area, self.size, margin);
+        let origin = overlay_origin(self.settings.location, area, self.size, margin);
         if redrawn {
             // Pushes bitmap, size and position in one call, so the window never shows a new
             // size at the old position.
@@ -615,7 +615,7 @@ fn measure(layout: &IDWriteTextLayout) -> windows::core::Result<(f32, f32, f32)>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lite_bar_core::settings::{Corner, Settings};
+    use lite_bar_core::settings::{Location, Settings};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, GetWindowRect, IsWindow, IsWindowVisible, SendMessageW, GWL_EXSTYLE,
@@ -658,7 +658,7 @@ mod tests {
         o.update("144");
         o.update("—");
         let mut s = Settings::default().overlay;
-        s.corner = Corner::BottomRight;
+        s.location = Location::BottomRight;
         s.background_opacity = 0;
         o.set_settings(&s);
         o.update("60");
