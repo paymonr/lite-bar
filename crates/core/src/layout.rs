@@ -1,5 +1,6 @@
 //! Overlay placement and FPS text formatting. Pure logic, no Windows types.
 
+use crate::frame_stats::StatsSummary;
 use crate::settings::Location;
 
 /// Overlay margin from the screen corner at 100% DPI. The app multiplies it by the DPI scale.
@@ -49,6 +50,36 @@ pub fn fps_text(fps: Option<f64>) -> String {
         Some(v) if v.is_nan() => "0".to_string(),
         Some(v) => (v.round().clamp(0.0, 9999.0) as u32).to_string(),
     }
+}
+
+/// Overlay statistics line and where its labels sit, for coloring them apart from the values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsText {
+    pub text: String,
+    /// `(offset, length)` in UTF-16 code units of the labels `avg`, `1%L` and `1%H`.
+    pub label_ranges: Vec<(usize, usize)>,
+}
+
+/// `"avg 138  1%L  92  1%H 160"`: rounded values right-aligned to width 3 (wider when needed)
+/// so a monospace font keeps the box steady. `None` shows an em dash for every value.
+pub fn stats_text(summary: Option<&StatsSummary>) -> StatsText {
+    let values = [
+        summary.map(|s| s.avg_fps),
+        summary.map(|s| s.low_1pct_fps),
+        summary.map(|s| s.high_1pct_fps),
+    ];
+    let mut text = String::new();
+    let mut label_ranges = Vec::with_capacity(3);
+    for (label, value) in ["avg", "1%L", "1%H"].into_iter().zip(values) {
+        if !text.is_empty() {
+            text.push_str("  ");
+        }
+        label_ranges.push((text.encode_utf16().count(), label.encode_utf16().count()));
+        text.push_str(label);
+        text.push(' ');
+        text.push_str(&format!("{:>3}", fps_text(value)));
+    }
+    StatsText { text, label_ranges }
 }
 
 #[cfg(test)]
@@ -124,5 +155,43 @@ mod tests {
         assert_eq!(fps_text(Some(f64::NAN)), "0");
         assert_eq!(fps_text(Some(f64::INFINITY)), "9999");
         assert_eq!(fps_text(Some(9999.4)), "9999");
+    }
+
+    fn summary(avg: f64, low: f64, high: f64) -> StatsSummary {
+        StatsSummary {
+            frames: 1000,
+            play_secs: 10.0,
+            avg_fps: avg,
+            low_1pct_fps: low,
+            high_1pct_fps: high,
+        }
+    }
+
+    #[test]
+    fn stats_text_pads_values_to_width_three() {
+        let t = stats_text(Some(&summary(138.4, 91.6, 160.0)));
+        assert_eq!(t.text, "avg 138  1%L  92  1%H 160");
+        assert_eq!(t.label_ranges, vec![(0, 3), (9, 3), (18, 3)]);
+    }
+
+    #[test]
+    fn stats_text_without_data_shows_dashes() {
+        let t = stats_text(None);
+        assert_eq!(t.text, "avg   —  1%L   —  1%H   —");
+        assert_eq!(t.label_ranges, vec![(0, 3), (9, 3), (18, 3)]);
+    }
+
+    #[test]
+    fn stats_text_grows_for_four_digit_values() {
+        let t = stats_text(Some(&summary(300.0, 250.0, 1200.0)));
+        assert_eq!(t.text, "avg 300  1%L 250  1%H 1200");
+        assert_eq!(t.label_ranges, vec![(0, 3), (9, 3), (18, 3)]);
+    }
+
+    #[test]
+    fn stats_text_label_ranges_follow_wider_values() {
+        let t = stats_text(Some(&summary(1500.0, 99.0, 2000.0)));
+        assert_eq!(t.text, "avg 1500  1%L  99  1%H 2000");
+        assert_eq!(t.label_ranges, vec![(0, 3), (10, 3), (19, 3)]);
     }
 }

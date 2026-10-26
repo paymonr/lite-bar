@@ -42,8 +42,8 @@ mod app {
     use std::time::Instant;
 
     use lite_bar_core::fps::FpsTracker;
-    use lite_bar_core::layout::fps_text;
-    use lite_bar_core::settings::Settings;
+    use lite_bar_core::layout::{fps_text, stats_text};
+    use lite_bar_core::settings::{Settings, StatsLayout};
     use windows::core::{w, HSTRING};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -203,6 +203,11 @@ mod app {
 
         fn stop_overlay(&mut self) {
             self.overlay_on = false;
+            // A capture restart must never count the gap as a frame time.
+            self.tracker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_focus(None);
             // Hide and stop the timer first, so the ETW stop latency is not visible.
             self.overlay.hide();
             // SAFETY: plain FFI on our own window.
@@ -224,13 +229,22 @@ mod app {
 
         fn on_timer(&mut self) {
             let now = self.clock.elapsed().as_secs_f64();
-            let fps = foreground_pid().and_then(|pid| {
-                self.tracker
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .fps(pid, now)
-            });
-            self.overlay.update(&fps_text(fps));
+            let pid = foreground_pid();
+            let want_stats = self.settings.overlay.stats != StatsLayout::Off;
+            // One lock for focus, FPS and stats; the summary is Copy so it is released early.
+            let (fps, summary) = {
+                let mut tracker = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
+                tracker.set_focus(pid);
+                match pid {
+                    Some(pid) => (
+                        tracker.fps(pid, now),
+                        tracker.stats(pid).and_then(|h| h.summary()),
+                    ),
+                    None => (None, None),
+                }
+            };
+            let stats = want_stats.then(|| stats_text(summary.as_ref()));
+            self.overlay.update(&fps_text(fps), stats.as_ref());
             self.ticks = self.ticks.wrapping_add(1);
             if self.ticks.is_multiple_of(PRUNE_EVERY_TICKS) {
                 self.tracker

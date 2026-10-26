@@ -6,9 +6,9 @@
 use std::sync::Once;
 
 use lite_bar_core::color::{rgba_f32, Rgb};
-use lite_bar_core::layout::{overlay_origin, Size, BASE_MARGIN_PX};
-use lite_bar_core::settings::OverlaySettings;
-use windows::core::{w, PCWSTR};
+use lite_bar_core::layout::{overlay_origin, Size, StatsText, BASE_MARGIN_PX};
+use lite_bar_core::settings::{OverlaySettings, StatsLayout};
+use windows::core::{w, IUnknown, Interface, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D_RECT_F,
@@ -23,7 +23,7 @@ use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
     DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_LINE_METRICS,
-    DWRITE_TEXT_METRICS, DWRITE_WORD_WRAPPING_NO_WRAP,
+    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
@@ -52,6 +52,8 @@ const BASE_PAD_X: f32 = 8.0;
 const BASE_PAD_Y: f32 = 4.0;
 const BASE_GAP: f32 = 4.0;
 const BASE_RADIUS: f32 = 4.0;
+/// Inline stats sit this many gaps to the right of the `FPS` label.
+const INLINE_STATS_GAP_FACTOR: f32 = 3.0;
 /// Placeholder shown until the first `update`.
 const INITIAL_TEXT: &str = "—";
 
@@ -177,6 +179,7 @@ impl Drop for Dib {
 struct Style {
     key: (u16, f32),
     number_format: IDWriteTextFormat,
+    stats_format: IDWriteTextFormat,
     label_layout: IDWriteTextLayout,
     label_width: f32,
     label_height: f32,
@@ -190,7 +193,15 @@ struct Frame {
     number: IDWriteTextLayout,
     number_pos: Vector2,
     label_pos: Vector2,
+    stats: Option<StatsFrame>,
     radius: f32,
+}
+
+/// The stats line: its layout, position and the UTF-16 ranges drawn in the label color.
+struct StatsFrame {
+    layout: IDWriteTextLayout,
+    pos: Vector2,
+    label_ranges: Vec<(usize, usize)>,
 }
 
 pub struct Overlay {
@@ -205,6 +216,7 @@ pub struct Overlay {
     style: Option<Style>,
     settings: OverlaySettings,
     text: String,
+    stats: Option<StatsText>,
     scale: f32,
     size: Size,
     pos: Option<(i32, i32)>,
@@ -265,6 +277,7 @@ impl Overlay {
                 style: None,
                 settings: settings.clone(),
                 text: INITIAL_TEXT.to_owned(),
+                stats: None,
                 scale: 1.0,
                 size: Size { w: 1, h: 1 },
                 pos: None,
@@ -283,14 +296,24 @@ impl Overlay {
     pub fn set_settings(&mut self, s: &OverlaySettings) {
         if *s != self.settings {
             self.settings = s.clone();
+            if self.settings.stats == StatsLayout::Off {
+                self.stats = None;
+            }
             self.dirty = true;
         }
     }
 
-    /// Sets the text and re-runs placement. Only redraws when the text, settings or DPI changed.
-    pub fn update(&mut self, text: &str) {
+    /// Sets the FPS text and the stats line (`None`, or a settings layout of `Off`, draws the
+    /// plain counter) and re-runs placement. Only redraws when the FPS text, the stats text,
+    /// the settings or the DPI changed.
+    pub fn update(&mut self, text: &str, stats: Option<&StatsText>) {
         if text != self.text {
             self.text = text.to_owned();
+            self.dirty = true;
+        }
+        let stats = stats.filter(|_| self.settings.stats != StatsLayout::Off);
+        if stats != self.stats.as_ref() {
+            self.stats = stats.cloned();
             self.dirty = true;
         }
         self.refresh();
@@ -402,6 +425,7 @@ impl Overlay {
             self.style = Some(Style {
                 key,
                 number_format,
+                stats_format: label_format,
                 label_layout,
                 label_width,
                 label_height,
@@ -450,10 +474,20 @@ impl Overlay {
     fn build_frame(&mut self) -> windows::core::Result<Frame> {
         let scale = self.scale;
         let text = self.text.clone();
-        let (number_format, label_width, label_height, label_baseline, min_number_width) = {
+        let stats_text = self.stats.clone();
+        let layout_mode = self.settings.stats;
+        let (
+            number_format,
+            stats_format,
+            label_width,
+            label_height,
+            label_baseline,
+            min_number_width,
+        ) = {
             let s = self.style()?;
             (
                 s.number_format.clone(),
+                s.stats_format.clone(),
                 s.label_width,
                 s.label_height,
                 s.label_baseline,
@@ -470,11 +504,44 @@ impl Overlay {
         // The label sits on the number's baseline.
         let label_dy = number_baseline - label_baseline;
         let content_h = number_height.max(label_dy + label_height);
+        let label_right = pad_x + number_box + gap + label_width.ceil();
+
+        let mut width = label_right + pad_x;
+        let mut height = pad_y * 2.0 + content_h;
+        let mut stats = None;
+        if let Some(st) = stats_text {
+            let layout = self.layout(&st.text, &stats_format)?;
+            let (stats_width, stats_height, stats_baseline) = measure(&layout)?;
+            let pos = if layout_mode == StatsLayout::Stacked {
+                // Under the number, left-aligned with it.
+                width = width.max(pad_x * 2.0 + stats_width.ceil());
+                height += stats_height.ceil();
+                Vector2 {
+                    X: pad_x,
+                    Y: pad_y + content_h,
+                }
+            } else {
+                // Right of the label, on the number's baseline.
+                let x = label_right + gap * INLINE_STATS_GAP_FACTOR;
+                let dy = number_baseline - stats_baseline;
+                width = x + stats_width.ceil() + pad_x;
+                height = height.max(pad_y * 2.0 + dy + stats_height);
+                Vector2 {
+                    X: x,
+                    Y: pad_y + dy,
+                }
+            };
+            stats = Some(StatsFrame {
+                layout,
+                pos,
+                label_ranges: st.label_ranges,
+            });
+        }
 
         Ok(Frame {
             size: Size {
-                w: (pad_x * 2.0 + number_box + gap + label_width.ceil()).ceil() as i32,
-                h: (pad_y * 2.0 + content_h).ceil() as i32,
+                w: width.ceil() as i32,
+                h: height.ceil() as i32,
             },
             number,
             number_pos: Vector2 { X: pad_x, Y: pad_y },
@@ -482,6 +549,7 @@ impl Overlay {
                 X: pad_x + number_box + gap,
                 Y: pad_y + label_dy,
             },
+            stats,
             radius: px(BASE_RADIUS, scale),
         })
     }
@@ -520,11 +588,24 @@ impl Overlay {
             bottom: size.h,
         };
         // SAFETY: plain COM calls. BeginDraw is always paired with EndDraw (no early return
-        // between them); brushes are created first so their errors can't leave a draw open.
+        // between them); brushes and text effects are set up first so their errors can't leave a draw open.
         unsafe {
             let number_brush = self.target.CreateSolidColorBrush(&nc, None)?;
             let label_brush = self.target.CreateSolidColorBrush(&lc, None)?;
             let bg_brush = self.target.CreateSolidColorBrush(&bg, None)?;
+            if let Some(stats) = &frame.stats {
+                // Values use the layout's default brush; the labels get their own color.
+                let effect: IUnknown = label_brush.cast()?;
+                for &(start, len) in &stats.label_ranges {
+                    stats.layout.SetDrawingEffect(
+                        &effect,
+                        DWRITE_TEXT_RANGE {
+                            startPosition: start as u32,
+                            length: len as u32,
+                        },
+                    )?;
+                }
+            }
             self.target.BindDC(self.dc.dc, &bounds)?;
             self.target.BeginDraw();
             self.target.Clear(Some(&D2D1_COLOR_F::default()));
@@ -553,6 +634,14 @@ impl Overlay {
                 &label_brush,
                 D2D1_DRAW_TEXT_OPTIONS_NONE,
             );
+            if let Some(stats) = &frame.stats {
+                self.target.DrawTextLayout(
+                    stats.pos,
+                    &stats.layout,
+                    &number_brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                );
+            }
             self.target.EndDraw(None, None)?;
         }
         Ok(size)
@@ -615,7 +704,8 @@ fn measure(layout: &IDWriteTextLayout) -> windows::core::Result<(f32, f32, f32)>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lite_bar_core::settings::{Location, Settings};
+    use lite_bar_core::layout::stats_text;
+    use lite_bar_core::settings::{Location, Settings, StatsLayout};
     use windows::Win32::Foundation::RECT;
     use windows::Win32::UI::WindowsAndMessaging::{
         GetWindowLongPtrW, GetWindowRect, IsWindow, IsWindowVisible, SendMessageW, GWL_EXSTYLE,
@@ -655,13 +745,13 @@ mod tests {
     fn update_and_settings_change_do_not_fail() {
         let mut o = Overlay::new(&Settings::default().overlay).unwrap();
         o.show();
-        o.update("144");
-        o.update("—");
+        o.update("144", None);
+        o.update("—", None);
         let mut s = Settings::default().overlay;
         s.location = Location::BottomRight;
         s.background_opacity = 0;
         o.set_settings(&s);
-        o.update("60");
+        o.update("60", None);
         o.hide();
     }
 
@@ -678,9 +768,9 @@ mod tests {
     #[test]
     fn box_width_does_not_jump_between_two_and_three_digits() {
         let mut o = Overlay::new(&Settings::default().overlay).unwrap();
-        o.update("99");
+        o.update("99", None);
         let two = window_size(&o);
-        o.update("100");
+        o.update("100", None);
         let three = window_size(&o);
         assert!(two.0 > 0 && two.1 > 0, "{two:?}");
         assert_eq!(two, three);
@@ -690,11 +780,11 @@ mod tests {
     fn larger_text_size_makes_a_larger_window() {
         let mut s = Settings::default().overlay;
         let mut o = Overlay::new(&s).unwrap();
-        o.update("144");
+        o.update("144", None);
         let small = window_size(&o);
         s.text_size = 36;
         o.set_settings(&s);
-        o.update("144");
+        o.update("144", None);
         let big = window_size(&o);
         assert!(big.0 > small.0 && big.1 > small.1, "{small:?} -> {big:?}");
     }
@@ -706,12 +796,67 @@ mod tests {
         for i in 0..5 {
             let mut o = Overlay::new(&s).unwrap();
             o.show();
-            o.update(&format!("{}", 100 + i));
+            o.update(&format!("{}", 100 + i), None);
             hwnds.push(o.hwnd());
             drop(o);
         }
         for h in hwnds {
             assert!(!unsafe { IsWindow(Some(h)) }.as_bool(), "window leaked");
         }
+    }
+
+    /// Window size after showing "144" with the given layout and (optionally) stats.
+    fn size_with(layout: StatsLayout, stats: bool) -> (i32, i32) {
+        let mut s = Settings::default().overlay;
+        s.stats = layout;
+        let mut o = Overlay::new(&s).unwrap();
+        let text = stats_text(None);
+        o.update("144", stats.then_some(&text));
+        window_size(&o)
+    }
+
+    #[test]
+    fn inline_stats_make_the_box_wider() {
+        let plain = size_with(StatsLayout::Inline, false);
+        let inline = size_with(StatsLayout::Inline, true);
+        assert!(inline.0 > plain.0, "{plain:?} -> {inline:?}");
+        assert!(inline.1 >= plain.1, "{plain:?} -> {inline:?}");
+    }
+
+    #[test]
+    fn stacked_stats_make_the_box_taller_not_wider_than_inline() {
+        let plain = size_with(StatsLayout::Stacked, false);
+        let stacked = size_with(StatsLayout::Stacked, true);
+        let inline = size_with(StatsLayout::Inline, true);
+        assert!(stacked.1 > plain.1, "{plain:?} -> {stacked:?}");
+        assert!(
+            stacked.1 > inline.1,
+            "stacked {stacked:?} inline {inline:?}"
+        );
+        assert!(
+            stacked.0 < inline.0,
+            "stacked {stacked:?} inline {inline:?}"
+        );
+    }
+
+    #[test]
+    fn no_stats_keeps_the_m1_size() {
+        let m1 = size_with(StatsLayout::Off, false);
+        assert_eq!(size_with(StatsLayout::Inline, false), m1);
+        assert_eq!(size_with(StatsLayout::Stacked, false), m1);
+        // Layout Off ignores any stats text it is handed.
+        assert_eq!(size_with(StatsLayout::Off, true), m1);
+    }
+
+    #[test]
+    fn dropping_the_stats_text_shrinks_the_box_back() {
+        let mut o = Overlay::new(&Settings::default().overlay).unwrap();
+        let text = stats_text(None);
+        o.update("144", None);
+        let plain = window_size(&o);
+        o.update("144", Some(&text));
+        assert_ne!(window_size(&o), plain);
+        o.update("144", None);
+        assert_eq!(window_size(&o), plain);
     }
 }
