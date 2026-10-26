@@ -124,3 +124,9 @@ Anti-cheat: Lite Bar never injects into, hooks or reads the memory of a game. It
 - FPS needs administrator rights in M1. The tray menu offers **Restart as administrator** when capture cannot start.
 - The FPS value lags by roughly 0.5-1 s because of ETW buffering.
 - A graceful `taskkill` (without `/F`) does not close the app. Use the tray icon's **Quit**.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
