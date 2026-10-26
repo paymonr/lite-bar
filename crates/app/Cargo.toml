@@ -1,0 +1,7 @@
+[package]
+name = "lite-bar"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+lite-bar-core.workspace = true
