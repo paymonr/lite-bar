@@ -6,6 +6,7 @@
 //! `received_at` / `now` is the app's monotonic clock in seconds and is only used to detect processes that stopped presenting.
 
 use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 
 use crate::frame_stats::FrameHistogram;
 
@@ -203,6 +204,34 @@ struct PidState {
     api: Series,
     kernel: Series,
     stats: StatsState,
+}
+
+/// Stamps focus changes in the ETW event time base. ETW converts its QPC timestamps to system
+/// time linearly from the trace start and does not follow later clock corrections (w32time
+/// slews and steps, resume), while the system clock does. So the clock is anchored once per
+/// capture start (system time and an `Instant`, which is QPC on Windows) and then advances
+/// with the monotonic clock, like the event timestamps do.
+#[derive(Clone, Copy, Debug)]
+pub struct FocusClock {
+    /// System time at `anchor`, in event-base seconds.
+    anchor_sys: f64,
+    anchor: Instant,
+}
+
+impl FocusClock {
+    pub fn new(anchor_sys: f64, anchor: Instant) -> Self {
+        Self { anchor_sys, anchor }
+    }
+
+    /// The event-base time now.
+    pub fn now(&self) -> f64 {
+        self.at(self.anchor.elapsed().as_secs_f64())
+    }
+
+    /// The event-base time `elapsed_secs` after the anchor.
+    pub fn at(&self, elapsed_secs: f64) -> f64 {
+        self.anchor_sys + elapsed_secs
+    }
 }
 
 /// Tracks present timestamps per process and derives a recent FPS value.
@@ -741,5 +770,15 @@ mod tests {
         t.record_present(5, PresentOrigin::Api, 100.2, 11.0);
         assert_eq!(t.last_received(5), Some(12.5));
         assert_eq!(t.last_received(6), None);
+    }
+
+    #[test]
+    fn focus_clock_counts_from_its_anchor() {
+        let clock = FocusClock::new(1_000.0, std::time::Instant::now());
+        assert_eq!(clock.at(0.0), 1_000.0);
+        assert_eq!(clock.at(2.5), 1_002.5);
+        let (a, b) = (clock.now(), clock.now());
+        assert!((1_000.0..1_001.0).contains(&a), "{a}");
+        assert!(b >= a, "monotonic: {a} then {b}");
     }
 }

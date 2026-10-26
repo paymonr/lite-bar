@@ -261,7 +261,9 @@ impl StatsWriter {
                     text.push_str("\r\n");
                 }
                 text.extend(self.rows.iter().map(String::as_str));
-                file.write_all(text.as_bytes())
+                file.write_all(text.as_bytes())?;
+                // On disk before `sync_pending` rewrites or deletes pending.toml.
+                file.sync_all()
             });
         match result {
             Ok(()) => self.rows.clear(),

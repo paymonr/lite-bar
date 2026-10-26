@@ -50,7 +50,7 @@ mod app {
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
-    use lite_bar_core::fps::FpsTracker;
+    use lite_bar_core::fps::{FocusClock, FpsTracker};
     use lite_bar_core::game_name::{display_name, is_known_non_game};
     use lite_bar_core::history::LocalTime;
     use lite_bar_core::layout::{fps_text, stats_text};
@@ -74,7 +74,7 @@ mod app {
     };
 
     use crate::elevation::{is_elevated, relaunch_as_admin};
-    use crate::etw::{etw_now_secs, offers_admin, CaptureError, PresentCapture};
+    use crate::etw::{anchored_focus_clock, offers_admin, CaptureError, PresentCapture};
     use crate::foreground::{foreground_window, window_title};
     use crate::game_lookup::resolve_name;
     use crate::hotkeys::{self, HotkeyId, Registration};
@@ -164,6 +164,8 @@ mod app {
         tracker: Arc<Mutex<FpsTracker>>,
         /// Time base shared with the ETW callback (`received_at`).
         clock: Instant,
+        /// Stamps focus changes in the ETW event time base; anchored at each capture start.
+        focus_clock: FocusClock,
         capture: Option<PresentCapture>,
         guard: Option<InstanceGuard>,
         /// Whether the overlay is currently running (timer, capture, window shown).
@@ -207,6 +209,9 @@ mod app {
         fn start_overlay(&mut self) {
             self.overlay_on = true;
             self.needs_admin = false;
+            // ETW's event times run on QPC from the trace start, without later clock
+            // corrections: anchor the focus stamps to the same start.
+            self.focus_clock = anchored_focus_clock();
             // Show the overlay (with "—") and start the timer first, so the ETW start latency
             // is not part of what the user sees.
             self.overlay.show();
@@ -238,7 +243,7 @@ mod app {
             self.tracker
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .set_focus(None, etw_now_secs());
+                .set_focus(None, self.focus_clock.now());
             // Hide and stop the timer first, so the ETW stop latency is not visible.
             self.overlay.hide();
             // SAFETY: plain FFI on our own window.
@@ -273,7 +278,7 @@ mod app {
                     // recorded.
                     tracker.take_stats(refused);
                 }
-                tracker.set_focus(pid, etw_now_secs());
+                tracker.set_focus(pid, self.focus_clock.now());
                 match pid {
                     Some(pid) => {
                         let hist = tracker.stats(pid);
@@ -319,9 +324,10 @@ mod app {
                 ));
                 return;
             };
-            self.last_query.insert(pid, now);
             match new_session(pid, info, || window_title(hwnd), local_now()) {
                 Some(session) => {
+                    // The query just made counts for the liveness check.
+                    self.last_query.insert(pid, now);
                     if let Some(old) = self.sessions.track(session) {
                         log::warn(&format!(
                             "stats: pid {} was reused; ending the earlier session",
@@ -750,6 +756,7 @@ mod app {
             tray,
             tracker: Arc::new(Mutex::new(FpsTracker::new())),
             clock: Instant::now(),
+            focus_clock: anchored_focus_clock(),
             capture: None,
             guard,
             overlay_on: false,
