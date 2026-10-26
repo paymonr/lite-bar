@@ -6,6 +6,9 @@
 mod elevation;
 #[cfg(windows)]
 #[allow(dead_code)]
+mod etw;
+#[cfg(windows)]
+#[allow(dead_code)]
 mod paths;
 #[cfg(windows)]
 #[allow(dead_code)]

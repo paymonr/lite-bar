@@ -1,0 +1,312 @@
+//! ETW present capture (the PresentMon approach): consumes frame-present events from Windows
+//! Event Tracing and feeds them to the core `FpsTracker`. Only ETW events are read; no game
+//! process is ever opened, hooked or injected into.
+//!
+//! Provider constants were checked against Intel PresentMon, GameTechDev/PresentMon commit
+//! 9db97248df5322a0aa1581d9141d1de6b058085b (PresentData/ETW/Microsoft_Windows_{DXGI,D3D9,DxgKrnl}.h,
+//! PresentData/PresentMonTraceSession.cpp, PresentData/PresentMonTraceConsumer.cpp).
+//!
+//! ferrisetw uses its own `windows` 0.57; no `windows` types cross that boundary here. GUIDs are
+//! passed as strings and timestamps as plain integers.
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use ferrisetw::native::EvntraceNativeError;
+use ferrisetw::provider::{EventFilter, Provider};
+use ferrisetw::trace::{stop_trace_by_name, TraceError, TraceProperties, UserTrace};
+use ferrisetw::{EventRecord, SchemaLocator};
+use lite_bar_core::fps::{FpsTracker, PresentOrigin};
+
+/// Name of our real-time ETW session.
+pub const SESSION_NAME: &str = "LiteBar-FPS";
+
+/// `ERROR_ACCESS_DENIED`: starting a session needs admin or Performance Log Users membership.
+const ERROR_ACCESS_DENIED: u32 = 5;
+
+/// ETW header timestamps (system time, not raw QPC; see `PresentCapture::start`) are 100 ns ticks.
+const TICKS_PER_SEC: f64 = 10_000_000.0;
+
+/// One ETW provider and the events in it that mean "a frame was presented".
+#[derive(Clone, Copy, Debug)]
+pub struct ProviderSpec {
+    pub name: &'static str,
+    pub guid: &'static str,
+    pub present_event_ids: &'static [u16],
+    /// `EnableTraceEx2` MatchAnyKeyword: the OR of the PresentMon keyword masks of the events
+    /// above, so the provider emits them on every Windows version.
+    pub keywords: u64,
+    pub origin: PresentOrigin,
+}
+
+/// DXGI, D3D9 and DxgKrnl present providers.
+///
+/// - DXGI `Present_Start` (0x2a = 42): every `IDXGISwapChain::Present` of D3D10/11/12 games.
+///   Keyword 0x8000000000000002.
+/// - D3D9 `Present_Start` (0x1): D3D9 games. Keyword 0x8000000000000002.
+/// - DxgKrnl `Present_Info` (0xb8 = 184): emitted at the end of every kernel present
+///   (`D3DKMTPresent`) on the presenting thread, whatever the API, so it also covers Vulkan and
+///   OpenGL. PresentMon attributes DxgKrnl presents with the event header's process id and its
+///   thread id (it creates presents from `hdr.ProcessId` for non-instrumented APIs), so the
+///   header pid is the presenting process. Keyword 0x4000000008000001 minus the Performance bit
+///   (PresentMon masks it out): 0x8000001 (Present | 0x1) on Windows 11, 0x1 before.
+pub const PROVIDERS: [ProviderSpec; 3] = [
+    ProviderSpec {
+        name: "Microsoft-Windows-DXGI",
+        guid: "CA11C036-0102-4A2D-A6AD-F03CFED5D3C9",
+        present_event_ids: &[42],
+        keywords: 0x8000_0000_0000_0002,
+        origin: PresentOrigin::Api,
+    },
+    ProviderSpec {
+        name: "Microsoft-Windows-D3D9",
+        guid: "783ACA0A-790E-4D7F-8451-AA850511C6B9",
+        present_event_ids: &[1],
+        keywords: 0x8000_0000_0000_0002,
+        origin: PresentOrigin::Api,
+    },
+    ProviderSpec {
+        name: "Microsoft-Windows-DxgKrnl",
+        guid: "802EC45A-1E99-4B83-9920-87C98277BA9D",
+        present_event_ids: &[184],
+        keywords: 0x0800_0001,
+        origin: PresentOrigin::Kernel,
+    },
+];
+
+#[derive(thiserror::Error, Debug)]
+pub enum CaptureError {
+    #[error("administrator rights needed")]
+    NeedsAdmin,
+    #[error("{0}")]
+    Other(String),
+}
+
+/// Maps a Win32 error code from starting the trace session.
+pub fn map_start_error(win32_code: u32) -> CaptureError {
+    if win32_code == ERROR_ACCESS_DENIED {
+        CaptureError::NeedsAdmin
+    } else {
+        CaptureError::Other(format!(
+            "could not start ETW session (Win32 error {win32_code})"
+        ))
+    }
+}
+
+/// ferrisetw reports `StartTraceW`/`EnableTraceEx2` failures as `HRESULT_FROM_WIN32(code)`
+/// (0x8007xxxx) and `OpenTraceW` failures as the plain code. Normalise both to the Win32 code.
+fn win32_code(raw: i32) -> u32 {
+    let v = raw as u32;
+    if v & 0xFFFF_0000 == 0x8007_0000 {
+        v & 0xFFFF
+    } else {
+        v
+    }
+}
+
+fn map_trace_error(e: TraceError) -> CaptureError {
+    match e {
+        TraceError::EtwNativeError(EvntraceNativeError::IoError(io)) => match io.raw_os_error() {
+            Some(raw) => match map_start_error(win32_code(raw)) {
+                CaptureError::NeedsAdmin => CaptureError::NeedsAdmin,
+                CaptureError::Other(_) => CaptureError::Other(io.to_string()),
+            },
+            None => CaptureError::Other(io.to_string()),
+        },
+        other => CaptureError::Other(format!("{other:?}")),
+    }
+}
+
+/// Hot path: runs once per present event, at the game's frame rate. Allocation-free, never
+/// panics, and recovers a poisoned tracker mutex instead of unwinding into ETW.
+fn record_present(
+    tracker: &Mutex<FpsTracker>,
+    pid: u32,
+    origin: PresentOrigin,
+    raw_ticks: i64,
+    clock: Instant,
+) {
+    let event_time = raw_ticks as f64 / TICKS_PER_SEC;
+    let received_at = clock.elapsed().as_secs_f64();
+    tracker
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .record_present(pid, origin, event_time, received_at);
+}
+
+fn build_provider(
+    spec: &ProviderSpec,
+    tracker: &Arc<Mutex<FpsTracker>>,
+    clock: Instant,
+) -> Provider {
+    let tracker = Arc::clone(tracker);
+    let ids = spec.present_event_ids;
+    let origin = spec.origin;
+    Provider::by_guid(spec.guid)
+        .any(spec.keywords)
+        .add_filter(EventFilter::ByEventIds(ids.to_vec()))
+        .add_callback(move |record: &EventRecord, _: &SchemaLocator| {
+            // The kernel-side event id filter should already have dropped everything else; this
+            // is a cheap guard for systems where that filter is not honoured.
+            if ids.contains(&record.event_id()) {
+                record_present(
+                    &tracker,
+                    record.process_id(),
+                    origin,
+                    record.raw_timestamp(),
+                    clock,
+                );
+            }
+        })
+        .build()
+}
+
+/// A running ETW session feeding present events into an `FpsTracker`. Dropping it stops it.
+pub struct PresentCapture {
+    trace: UserTrace,
+}
+
+impl PresentCapture {
+    /// Starts the `LiteBar-FPS` session. `clock` is the app's monotonic clock (the tracker's
+    /// `received_at` base).
+    pub fn start(
+        tracker: Arc<Mutex<FpsTracker>>,
+        clock: Instant,
+    ) -> Result<PresentCapture, CaptureError> {
+        // Clear a stale session left behind by a crash. Failure (none exists, or no rights) is
+        // expected and ignored; a real problem surfaces from the start below.
+        let _ = stop_trace_by_name(SESSION_NAME);
+
+        // Header timestamps are system time in 100 ns ticks because ferrisetw does not request
+        // PROCESS_TRACE_MODE_RAW_TIMESTAMP. A 1 s flush timer caps how stale delivered events get.
+        let properties = TraceProperties {
+            flush_timer: Duration::from_secs(1),
+            ..TraceProperties::default()
+        };
+        let mut builder = UserTrace::new()
+            .named(SESSION_NAME.into())
+            .set_trace_properties(properties);
+        for spec in &PROVIDERS {
+            builder = builder.enable(build_provider(spec, &tracker, clock));
+        }
+        let trace = builder.start_and_process().map_err(map_trace_error)?;
+        Ok(PresentCapture { trace })
+    }
+
+    /// Stops the session. Dropping does the same.
+    pub fn stop(self) {
+        let _ = self.trace.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrisetw::native::EvntraceNativeError;
+    use ferrisetw::trace::TraceError;
+    use lite_bar_core::fps::{FpsTracker, PresentOrigin};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    #[test]
+    fn provider_guids_are_valid() {
+        for p in PROVIDERS {
+            assert!(windows::core::GUID::try_from(p.guid).is_ok(), "{}", p.name);
+            assert!(!p.present_event_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn capture_error_maps_access_denied() {
+        assert!(matches!(map_start_error(5), CaptureError::NeedsAdmin));
+        assert!(matches!(map_start_error(183), CaptureError::Other(_)));
+    }
+
+    #[test]
+    fn start_without_admin_reports_needs_admin_or_succeeds() {
+        // Runs in both elevated and non-elevated shells; must never panic or hang.
+        let t = Arc::new(Mutex::new(FpsTracker::new()));
+        match PresentCapture::start(t, Instant::now()) {
+            Ok(c) => {
+                assert!(crate::elevation::is_elevated());
+                c.stop();
+            }
+            Err(CaptureError::NeedsAdmin) => assert!(!crate::elevation::is_elevated()),
+            Err(e) => panic!("unexpected: {e}"),
+        }
+    }
+
+    fn io_error(raw: i32) -> TraceError {
+        TraceError::EtwNativeError(EvntraceNativeError::IoError(
+            std::io::Error::from_raw_os_error(raw),
+        ))
+    }
+
+    #[test]
+    fn trace_error_with_hresult_access_denied_needs_admin() {
+        // ferrisetw reports StartTraceW failures as HRESULT_FROM_WIN32(code).
+        assert!(matches!(
+            map_trace_error(io_error(0x8007_0005_u32 as i32)),
+            CaptureError::NeedsAdmin
+        ));
+    }
+
+    #[test]
+    fn trace_error_with_plain_win32_access_denied_needs_admin() {
+        // OpenTrace failures carry the plain GetLastError() value.
+        assert!(matches!(
+            map_trace_error(io_error(5)),
+            CaptureError::NeedsAdmin
+        ));
+    }
+
+    #[test]
+    fn other_trace_errors_are_not_needs_admin() {
+        assert!(matches!(
+            map_trace_error(io_error(0x8007_00B7_u32 as i32)),
+            CaptureError::Other(_)
+        ));
+        assert!(matches!(
+            map_trace_error(TraceError::EtwNativeError(
+                EvntraceNativeError::AlreadyExist
+            )),
+            CaptureError::Other(_)
+        ));
+    }
+
+    #[test]
+    fn present_ticks_are_100ns_and_feed_the_tracker() {
+        let tracker = Mutex::new(FpsTracker::new());
+        let clock = Instant::now();
+        // Two presents 10 ms apart (100_000 ticks of 100 ns) is 100 fps.
+        let base = 133_000_000_000_000_000_i64;
+        record_present(&tracker, 42, PresentOrigin::Api, base, clock);
+        record_present(&tracker, 42, PresentOrigin::Api, base + 100_000, clock);
+        let fps = tracker
+            .lock()
+            .unwrap()
+            .fps(42, clock.elapsed().as_secs_f64())
+            .expect("fps");
+        assert!((fps - 100.0).abs() < 0.5, "fps = {fps}");
+    }
+
+    #[test]
+    fn record_present_survives_a_poisoned_tracker_mutex() {
+        let tracker = Arc::new(Mutex::new(FpsTracker::new()));
+        let t2 = Arc::clone(&tracker);
+        let _ = std::thread::spawn(move || {
+            let _guard = t2.lock().unwrap();
+            panic!("poison the mutex");
+        })
+        .join();
+        assert!(tracker.is_poisoned());
+        let clock = Instant::now();
+        record_present(&tracker, 7, PresentOrigin::Kernel, 1, clock);
+        record_present(&tracker, 7, PresentOrigin::Kernel, 5_000_001, clock);
+        let fps = tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fps(7, clock.elapsed().as_secs_f64());
+        assert!(fps.is_some());
+    }
+}
