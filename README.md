@@ -31,3 +31,49 @@ scripts/xwin.sh build --release -p lite-bar
 ```
 
 FPS capture needs an elevated (administrator) run in M1.
+
+## Using Lite Bar
+
+Lite Bar lives in the system tray and shows an FPS overlay for the foreground application. It shows `—` while the foreground application is not presenting frames. Quit it from the tray icon: right-click, then **Quit**.
+
+The tray menu also has **Reload settings**, which re-reads the settings file and keeps the current on/off state of the overlay, and **Open settings file**.
+
+The overlay toggles with `Ctrl+Alt+Shift+F` by default.
+
+### Files
+
+| File | Path |
+| --- | --- |
+| Settings | `%APPDATA%\LiteBar\settings.toml` |
+| Log | `%APPDATA%\LiteBar\lite-bar.log` |
+
+The settings file is created with the default values on first run and is never overwritten afterwards. An invalid value falls back to its default and a warning is written to the log. Unknown keys are ignored.
+
+### Settings
+
+`[overlay]`
+
+| Key | Type and values | Default |
+| --- | --- | --- |
+| `visible` | bool; whether the overlay is shown at startup | `true` |
+| `corner` | `"top-left"`, `"top-right"`, `"bottom-left"` or `"bottom-right"` | `"top-left"` |
+| `number_color` | `"#RRGGBB"` | `"#7CFC7C"` |
+| `label_color` | `"#RRGGBB"` | `"#FFFFFF"` |
+| `background_color` | `"#RRGGBB"` | `"#000000"` |
+| `background_opacity` | integer percent, 0-100 | `55` |
+| `text_size` | integer pixels, 8-72 | `18` |
+
+`[hotkeys]`
+
+| Key | Type and values | Default |
+| --- | --- | --- |
+| `toggle_overlay` | string, e.g. `"Ctrl+Alt+Shift+F"` | `"Ctrl+Alt+Shift+F"` |
+
+Hotkey syntax: zero or more modifiers (`Ctrl`, `Alt`, `Shift`, `Win`) and exactly one key (`A`-`Z`, `0`-`9` or `F1`-`F24`), joined with `+`, case-insensitive. For letter and digit keys at least one of `Ctrl`, `Alt` or `Win` is required (`Shift` alone would stop you typing capital letters). Function keys also accept `Shift` alone, e.g. `Shift+F5`. If the combination is already taken by another program, the tray menu shows the hotkey as unavailable.
+
+### Known limitations
+
+- Exclusive fullscreen games may hide the overlay. Use borderless or windowed fullscreen.
+- FPS needs administrator rights in M1. The tray menu offers **Restart as administrator** when capture cannot start.
+- The FPS value lags by roughly 0.5-1 s because of ETW buffering.
+- A graceful `taskkill` (without `/F`) does not close the app. Use the tray icon's **Quit**.

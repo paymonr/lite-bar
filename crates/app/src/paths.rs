@@ -23,7 +23,7 @@ pub fn app_dir() -> PathBuf {
 }
 
 /// Loads `settings.toml` from `dir`. If the file is missing, writes the
-/// commented defaults and returns them. An existing file is never written to.
+/// default values (no comments) and returns them. An existing file is never written to.
 pub fn load_or_create_settings(dir: &Path) -> (Settings, Vec<String>) {
     let path = dir.join(SETTINGS_FILE);
     match std::fs::read_to_string(&path) {
