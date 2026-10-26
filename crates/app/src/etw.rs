@@ -31,6 +31,8 @@ const TICKS_PER_SEC: f64 = 10_000_000.0;
 /// One ETW provider and the events in it that mean "a frame was presented".
 #[derive(Clone, Copy, Debug)]
 pub struct ProviderSpec {
+    /// Human-readable provider name; used in test diagnostics and to identify the table row.
+    #[allow(dead_code)]
     pub name: &'static str,
     pub guid: &'static str,
     pub present_event_ids: &'static [u16],

@@ -270,6 +270,8 @@ impl Overlay {
         }
     }
 
+    /// The overlay's window handle (tests inspect the window's styles and visibility).
+    #[cfg(test)]
     pub fn hwnd(&self) -> HWND {
         self.window.0
     }
