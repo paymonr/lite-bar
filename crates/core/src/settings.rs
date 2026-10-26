@@ -55,11 +55,12 @@ pub struct HotkeySettings {
 }
 
 impl Default for HotkeySettings {
+    /// `Ctrl+Alt+Shift+F`: plain `Ctrl+Shift+F` would steal Find-in-Files from editors.
     fn default() -> Self {
         HotkeySettings {
             toggle_overlay: Hotkey {
                 ctrl: true,
-                alt: false,
+                alt: true,
                 shift: true,
                 win: false,
                 key: Key::Letter('F'),
@@ -198,7 +199,7 @@ mod tests {
         assert!(w.is_empty());
         assert_eq!(s.overlay.number_color.to_hex(), "#7CFC7C");
         assert_eq!(s.overlay.background_opacity, 55);
-        assert_eq!(s.hotkeys.toggle_overlay.to_string(), "Ctrl+Shift+F");
+        assert_eq!(s.hotkeys.toggle_overlay.to_string(), "Ctrl+Alt+Shift+F");
     }
 
     #[test]
@@ -214,7 +215,7 @@ mod tests {
     #[test]
     fn bad_hotkey_falls_back_with_warning() {
         let (s, w) = parse_settings("[hotkeys]\ntoggle_overlay = \"F\"\n");
-        assert_eq!(s.hotkeys.toggle_overlay.to_string(), "Ctrl+Shift+F");
+        assert_eq!(s.hotkeys.toggle_overlay.to_string(), "Ctrl+Alt+Shift+F");
         assert!(w[0].contains("hotkeys.toggle_overlay"));
     }
 
