@@ -9,6 +9,7 @@
 //! ferrisetw uses its own `windows` 0.57; no `windows` types cross that boundary here. GUIDs are
 //! passed as strings and timestamps as plain integers.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -143,6 +144,45 @@ fn counts_as_frame(flags: Option<u32>) -> bool {
     flags.is_none_or(|f| f & DXGI_PRESENT_TEST == 0)
 }
 
+/// What the DXGI `Flags` filter should say in the log, at most once each per process.
+#[derive(Debug, PartialEq, Eq)]
+enum FlagsLog {
+    /// The first time `Flags` could not be read (schema or parse failure).
+    Unreadable,
+    /// The first time `Flags` was read successfully.
+    Readable,
+}
+
+static FLAGS_UNREADABLE_LOGGED: AtomicBool = AtomicBool::new(false);
+static FLAGS_READABLE_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Decides whether this `Flags` result deserves a log line. After each kind has been reported
+/// once this is two relaxed atomic ops and no allocation, so it is fine on the ETW callback
+/// thread; the one-off log line allocates once.
+fn flags_log_event(
+    flags: Option<u32>,
+    unreadable_logged: &AtomicBool,
+    readable_logged: &AtomicBool,
+) -> Option<FlagsLog> {
+    let (flag, event) = match flags {
+        None => (unreadable_logged, FlagsLog::Unreadable),
+        Some(_) => (readable_logged, FlagsLog::Readable),
+    };
+    (!flag.swap(true, Ordering::Relaxed)).then_some(event)
+}
+
+/// Logs the first unreadable and the first readable DXGI `Flags` (so a log shows whether the
+/// TEST-present filter works), then stays silent and fails open.
+fn note_flags_result(flags: Option<u32>) {
+    match flags_log_event(flags, &FLAGS_UNREADABLE_LOGGED, &FLAGS_READABLE_LOGGED) {
+        Some(FlagsLog::Unreadable) => crate::log::warn(
+            "DXGI present flags unreadable (schema or parse failure); counting presents unfiltered",
+        ),
+        Some(FlagsLog::Readable) => crate::log::info("DXGI present flags readable"),
+        None => {}
+    }
+}
+
 /// Hot path: runs once per present event, at the game's frame rate. Allocation-free, never
 /// panics, and recovers a poisoned tracker mutex instead of unwinding into ETW.
 fn record_present(
@@ -188,6 +228,7 @@ fn build_provider(
                         .try_parse::<u32>("Flags")
                         .ok()
                 });
+                note_flags_result(flags);
                 if !counts_as_frame(flags) {
                     return;
                 }
@@ -231,8 +272,15 @@ impl PresentCapture {
         for spec in &PROVIDERS {
             builder = builder.enable(build_provider(spec, &tracker, clock));
         }
-        let trace = builder.start_and_process().map_err(map_trace_error)?;
-        Ok(PresentCapture { trace })
+        match builder.start_and_process() {
+            Ok(trace) => Ok(PresentCapture { trace }),
+            Err(e) => {
+                // StartTrace may have succeeded before a later step failed; do not leave the
+                // session running with no owner.
+                let _ = stop_trace_by_name(SESSION_NAME);
+                Err(map_trace_error(e))
+            }
+        }
     }
 
     /// Stops the session. Dropping does the same.
@@ -247,6 +295,7 @@ mod tests {
     use ferrisetw::native::EvntraceNativeError;
     use ferrisetw::trace::TraceError;
     use lite_bar_core::fps::{FpsTracker, PresentOrigin};
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
     use std::time::Instant;
 
@@ -383,6 +432,41 @@ mod tests {
     #[test]
     fn unparsed_flags_fail_open_and_count() {
         assert!(counts_as_frame(None));
+    }
+
+    #[test]
+    fn first_unreadable_flags_warn_once_then_stay_silent() {
+        let (warned, read) = (AtomicBool::new(false), AtomicBool::new(false));
+        assert_eq!(
+            flags_log_event(None, &warned, &read),
+            Some(FlagsLog::Unreadable)
+        );
+        assert_eq!(flags_log_event(None, &warned, &read), None);
+        assert_eq!(flags_log_event(None, &warned, &read), None);
+    }
+
+    #[test]
+    fn first_readable_flags_log_once_then_stay_silent() {
+        let (warned, read) = (AtomicBool::new(false), AtomicBool::new(false));
+        assert_eq!(
+            flags_log_event(Some(0), &warned, &read),
+            Some(FlagsLog::Readable)
+        );
+        assert_eq!(flags_log_event(Some(0), &warned, &read), None);
+        assert_eq!(flags_log_event(Some(1), &warned, &read), None);
+    }
+
+    #[test]
+    fn unreadable_and_readable_are_tracked_independently() {
+        let (warned, read) = (AtomicBool::new(false), AtomicBool::new(false));
+        assert_eq!(
+            flags_log_event(None, &warned, &read),
+            Some(FlagsLog::Unreadable)
+        );
+        assert_eq!(
+            flags_log_event(Some(0), &warned, &read),
+            Some(FlagsLog::Readable)
+        );
     }
 
     #[test]
