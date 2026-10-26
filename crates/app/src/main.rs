@@ -9,6 +9,12 @@ mod elevation;
 mod etw;
 #[cfg(windows)]
 #[allow(dead_code)]
+mod foreground;
+#[cfg(windows)]
+#[allow(dead_code)]
+mod overlay;
+#[cfg(windows)]
+#[allow(dead_code)]
 mod paths;
 #[cfg(windows)]
 #[allow(dead_code)]

@@ -92,6 +92,7 @@ dependencies = [
  "lite-bar-core",
  "thiserror",
  "windows 0.62.2",
+ "windows-numerics",
 ]
 
 [[package]]

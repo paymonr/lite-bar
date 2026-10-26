@@ -9,6 +9,7 @@ version = "0.1.0"
 [workspace.dependencies]
 lite-bar-core = { path = "crates/core" }
 windows = "0.62.2"
+windows-numerics = "0.3.1"
 ferrisetw = "1.2.0"
 serde = { version = "1.0.229", features = ["derive"] }
 toml = "1.1.8"
