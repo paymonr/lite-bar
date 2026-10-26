@@ -6,7 +6,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId, SM_CXSCREEN, SM_CYSCREEN,
+    GetForegroundWindow, GetSystemMetrics, GetWindowTextW, GetWindowThreadProcessId, SM_CXSCREEN,
+    SM_CYSCREEN,
 };
 
 const BASE_DPI: f32 = 96.0;
@@ -22,6 +23,21 @@ pub fn foreground_pid() -> Option<u32> {
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
         (pid != 0).then_some(pid)
+    }
+}
+
+/// Title of the foreground window; `None` when there is no window or it has no title.
+#[allow(dead_code)] // wired in Task 8
+pub fn foreground_title() -> Option<String> {
+    // SAFETY: plain FFI calls; the buffer outlives the call and its length is passed implicitly.
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let mut buf = [0u16; 512];
+        let len = usize::try_from(GetWindowTextW(hwnd, &mut buf)).ok()?;
+        (len > 0).then(|| String::from_utf16_lossy(&buf[..len]))
     }
 }
 
@@ -72,6 +88,13 @@ mod tests {
         let (rect, scale) = foreground_monitor();
         assert!(rect.right > rect.left && rect.bottom > rect.top, "{rect:?}");
         assert!((1.0..=6.0).contains(&scale), "scale {scale}");
+    }
+
+    #[test]
+    fn foreground_title_is_none_or_nonempty() {
+        if let Some(title) = foreground_title() {
+            assert!(!title.is_empty());
+        }
     }
 
     #[test]

@@ -8,6 +8,9 @@ mod etw;
 #[cfg(windows)]
 mod foreground;
 #[cfg(windows)]
+#[allow(dead_code)] // wired in Task 8
+mod game_lookup;
+#[cfg(windows)]
 mod hotkeys;
 #[cfg(windows)]
 mod log;
@@ -16,7 +19,15 @@ mod overlay;
 #[cfg(windows)]
 mod paths;
 #[cfg(windows)]
+#[allow(dead_code)] // wired in Task 8
+mod process_info;
+#[cfg(windows)]
 mod single_instance;
+#[cfg(windows)]
+#[allow(dead_code)] // wired in Task 8
+mod stats_files;
+#[cfg(all(windows, test))]
+mod test_util;
 #[cfg(windows)]
 mod tray;
 
