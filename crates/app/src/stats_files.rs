@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -17,7 +17,6 @@ use crate::log;
 const GAMES_TOML: &str = "games.toml";
 const GAMES_CSV: &str = "games.csv";
 const SESSIONS_CSV: &str = "sessions.csv";
-const BAD_SUFFIX: &str = ".bad";
 
 /// Current local date and time.
 pub fn local_now() -> LocalTime {
@@ -53,6 +52,11 @@ impl StatsWriter {
             rows: Vec::new(),
             games_csv_dirty: false,
         }
+    }
+
+    /// Makes the next `flush` regenerate `games.csv` (e.g. after the name overrides changed).
+    pub fn mark_games_csv_dirty(&mut self) {
+        self.games_csv_dirty = true;
     }
 
     pub fn stats_dir(&self) -> &Path {
@@ -166,7 +170,7 @@ impl StatsWriter {
                 Some(store)
             }
             Err(reason) => {
-                let bad = with_suffix(&path, BAD_SUFFIX);
+                let bad = free_backup_path(&path);
                 match std::fs::rename(&path, &bad) {
                     Ok(()) => {
                         log::warn(&format!(
@@ -193,10 +197,28 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Writes `<path>.tmp` then renames it over `path` (which replaces an existing file).
+/// First of `<path>.bad`, `<path>.bad2`, `<path>.bad3`, ... that doesn't exist yet.
+fn free_backup_path(path: &Path) -> PathBuf {
+    let first = with_suffix(path, ".bad");
+    if !first.exists() {
+        return first;
+    }
+    (2..)
+        .map(|n| with_suffix(path, &format!(".bad{n}")))
+        .find(|candidate| !candidate.exists())
+        .expect("an unused backup name exists")
+}
+
+/// Writes `<path>.tmp`, flushes it to disk, then renames it over `path` (which replaces an
+/// existing file), so a crash or power loss leaves either the old or the complete new file.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = with_suffix(path, ".tmp");
-    let result = std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path));
+    let write = || -> std::io::Result<()> {
+        let mut file = File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    };
+    let result = write().and_then(|()| std::fs::rename(&tmp, path));
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -208,8 +230,6 @@ mod tests {
     use super::*;
     use crate::test_util::TempDir;
     use lite_bar_core::frame_stats::FrameHistogram;
-    use lite_bar_core::history::{CSV_BOM, SESSIONS_CSV_HEADER};
-    use std::fs::OpenOptions;
     use std::os::windows::fs::OpenOptionsExt;
 
     fn time(h: u8, m: u8) -> LocalTime {
@@ -396,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_store_is_moved_aside() {
+    fn corrupt_store_is_moved_aside_without_replacing_older_backups() {
         let tmp = TempDir::new("stats-corrupt");
         let dir = tmp.path().to_path_buf();
         std::fs::write(dir.join("games.toml"), "games = [ not toml").unwrap();
@@ -407,10 +427,88 @@ mod tests {
             &no_overrides(),
         );
 
-        assert_eq!(read(&dir, "games.toml.bad"), "games = [ not toml");
+        assert_eq!(read(&dir, "games.toml.bad"), "older backup");
+        assert_eq!(read(&dir, "games.toml.bad2"), "games = [ not toml");
         let (store, _) =
             lite_bar_core::history::GameStore::parse(&read(&dir, "games.toml")).unwrap();
         assert_eq!(store.games.len(), 1);
+
+        // Corrupted again: the next free name is used and every backup survives.
+        std::fs::write(dir.join("games.toml"), "again = = broken").unwrap();
+        writer.record(
+            &session("beta", "Beta", time(11, 0), time(11, 10)),
+            &no_overrides(),
+        );
+        assert_eq!(read(&dir, "games.toml.bad"), "older backup");
+        assert_eq!(read(&dir, "games.toml.bad2"), "games = [ not toml");
+        assert_eq!(read(&dir, "games.toml.bad3"), "again = = broken");
+    }
+
+    #[test]
+    fn locked_games_toml_is_never_overwritten_and_sessions_stay_pending() {
+        let tmp = TempDir::new("stats-locked-toml");
+        let dir = tmp.path().to_path_buf();
+        let toml = dir.join("games.toml");
+        let mut writer = StatsWriter::new(dir.clone());
+        writer.record(
+            &session("alpha", "Alpha", time(10, 0), time(10, 10)),
+            &no_overrides(),
+        );
+        let before = std::fs::read(&toml).unwrap();
+
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&toml)
+            .unwrap();
+        writer.record(
+            &session("beta", "Beta", time(11, 0), time(11, 10)),
+            &no_overrides(),
+        );
+        drop(lock);
+        assert_eq!(
+            std::fs::read(&toml).unwrap(),
+            before,
+            "must not be replaced"
+        );
+        assert!(!dir.join("games.toml.bad").exists());
+
+        writer.flush(&no_overrides());
+        let (store, warnings) =
+            lite_bar_core::history::GameStore::parse(&read(&dir, "games.toml")).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(store.games.len(), 2, "old and new sessions are both stored");
+        let games = read(&dir, "games.csv");
+        assert!(games.contains("Alpha") && games.contains("Beta"), "{games}");
+        let sessions = read(&dir, "sessions.csv");
+        assert_eq!(sessions.matches(",Alpha,").count(), 1);
+        assert_eq!(sessions.matches(",Beta,").count(), 1);
+    }
+
+    #[test]
+    fn marking_games_csv_dirty_regenerates_it_on_flush() {
+        let tmp = TempDir::new("stats-dirty");
+        let dir = tmp.path().to_path_buf();
+        let mut writer = StatsWriter::new(dir.clone());
+        writer.record(
+            &session("alpha", "Alpha", time(10, 0), time(10, 10)),
+            &no_overrides(),
+        );
+        assert!(!read(&dir, "games.csv").contains("Renamed"));
+        let sessions_before = read(&dir, "sessions.csv");
+
+        let mut overrides = BTreeMap::new();
+        overrides.insert("Alpha.exe".to_string(), "Renamed".to_string());
+        writer.flush(&overrides);
+        assert!(
+            !read(&dir, "games.csv").contains("Renamed"),
+            "clean flush is a no-op"
+        );
+
+        writer.mark_games_csv_dirty();
+        writer.flush(&overrides);
+        assert!(read(&dir, "games.csv").contains("Renamed"));
+        assert_eq!(read(&dir, "sessions.csv"), sessions_before);
     }
 
     #[test]

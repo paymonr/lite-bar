@@ -106,11 +106,10 @@ fn epic_name(exe_path: &str) -> Option<String> {
 }
 
 fn epic_name_in(manifest_dir: &Path, exe_path: &str) -> Option<String> {
-    let installs: Vec<(String, String)> = manifest_files(manifest_dir, "", "item")
+    manifest_files(manifest_dir, "", "item")
         .iter()
         .filter_map(|path| parse_epic_item(&read_text(path)?))
-        .collect();
-    match_install_dir(exe_path, &installs)
+        .find_map(|install| match_install_dir(exe_path, &[install]))
 }
 
 // ---- GOG ----
