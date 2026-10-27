@@ -65,6 +65,9 @@ pub struct GameRow {
     pub stored_name: String,
     /// The user's name from `[game_names]`, if any.
     pub override_name: Option<String>,
+    /// The `[game_names]` key `override_name` came from (the full path or the exe file name);
+    /// renames and clears edit this key. `None` adds a key for `exe_path`.
+    pub override_key: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -82,6 +85,8 @@ pub enum UiAction {
 #[derive(Clone, Debug)]
 struct GameEdit {
     edit: TextEdit,
+    /// The `[game_names]` key a commit edits (see `GameRow::override_key`).
+    key: String,
     /// The override the field last showed or emitted.
     synced: Option<String>,
     /// Edited since the last commit.
@@ -89,9 +94,10 @@ struct GameEdit {
 }
 
 impl GameEdit {
-    fn new(name: Option<&str>) -> GameEdit {
+    fn new(key: &str, name: Option<&str>) -> GameEdit {
         GameEdit {
             edit: TextEdit::new(name.unwrap_or("")),
+            key: key.to_string(),
             synced: name.map(str::to_string),
             pending: false,
         }
@@ -99,7 +105,7 @@ impl GameEdit {
 
     /// Ends an edit: the trimmed text (empty clears the override), as an action when it
     /// differs from what the field started with.
-    fn commit(&mut self, exe_path: &str) -> Option<UiAction> {
+    fn commit(&mut self) -> Option<UiAction> {
         self.pending = false;
         let trimmed = self.edit.text.trim();
         let name = (!trimmed.is_empty()).then(|| trimmed.to_string());
@@ -109,7 +115,7 @@ impl GameEdit {
         }
         self.synced = name.clone();
         Some(UiAction::Change(SettingsChange::GameName {
-            exe_path: exe_path.to_string(),
+            exe_path: self.key.clone(),
             name,
         }))
     }
@@ -167,9 +173,9 @@ impl SettingsView {
     /// Ends any game-name edit still in progress, e.g. when the window closes.
     pub fn finish_edits(&mut self) -> Vec<UiAction> {
         self.games
-            .iter_mut()
-            .filter(|(_, g)| g.pending)
-            .filter_map(|(exe, g)| g.commit(exe))
+            .values_mut()
+            .filter(|g| g.pending)
+            .filter_map(GameEdit::commit)
             .collect()
     }
 }

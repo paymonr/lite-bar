@@ -16,6 +16,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use lite_bar_core::game_name::find_override;
 use lite_bar_core::hotkey::Hotkey;
 use lite_bar_core::settings::Settings;
 use lite_bar_core::settings_edit::apply_change;
@@ -145,12 +146,16 @@ impl ActionQueue {
     }
 }
 
-/// `rows` with each game's name override from the settings.
+/// `rows` with each game's name override from the settings, found like `display_name` does.
 fn with_overrides(rows: &[GameRow], settings: &Settings) -> Vec<GameRow> {
     rows.iter()
-        .map(|g| GameRow {
-            override_name: settings.game_names.get(&g.exe_path).cloned(),
-            ..g.clone()
+        .map(|g| {
+            let found = find_override(&settings.game_names, &g.exe_path);
+            GameRow {
+                override_name: found.map(|(_, name)| name.to_string()),
+                override_key: found.map(|(key, _)| key.to_string()),
+                ..g.clone()
+            }
         })
         .collect()
 }
@@ -585,6 +590,7 @@ mod tests {
             exe_path: "javaw.exe".into(),
             stored_name: "Java".into(),
             override_name: None,
+            override_key: None,
         }];
         let mut s = Settings::default();
         assert_eq!(with_overrides(&rows, &s), rows);
@@ -593,6 +599,21 @@ mod tests {
             with_overrides(&rows, &s)[0].override_name.as_deref(),
             Some("Minecraft")
         );
+    }
+
+    #[test]
+    fn file_name_override_shows_in_the_window() {
+        let rows = vec![GameRow {
+            exe_path: r"C:\Java\bin\javaw.exe".into(),
+            stored_name: "Java".into(),
+            override_name: None,
+            override_key: None,
+        }];
+        let mut s = Settings::default();
+        s.game_names.insert("JAVAW.exe".into(), "Minecraft".into());
+        let shown = with_overrides(&rows, &s);
+        assert_eq!(shown[0].override_name.as_deref(), Some("Minecraft"));
+        assert_eq!(shown[0].override_key.as_deref(), Some("JAVAW.exe"));
     }
 
     #[test]

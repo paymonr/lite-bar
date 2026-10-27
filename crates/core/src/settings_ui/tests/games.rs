@@ -122,3 +122,59 @@ fn empty_games_shows_hint() {
     assert!(find_text(p.frame(), GAMES_HINT).is_some());
     assert!(find_text(p.frame(), "Open stats folder").is_none());
 }
+
+/// A page whose only game matches the file-name override `javaw.exe = "Minecraft Mod"`.
+fn file_name_override_page() -> Page {
+    let mut p = Page::new(TALL);
+    p.settings
+        .game_names
+        .insert("javaw.exe".to_string(), "Minecraft Mod".to_string());
+    p.games = vec![GameRow {
+        exe_path: r"C:\Java\bin\javaw.exe".to_string(),
+        stored_name: "Java".to_string(),
+        override_name: Some("Minecraft Mod".to_string()),
+        override_key: Some("javaw.exe".to_string()),
+    }];
+    p.idle();
+    p.idle();
+    p
+}
+
+#[test]
+fn clearing_a_file_name_override_removes_it() {
+    let mut p = file_name_override_page();
+    click_field(&mut p, "Minecraft Mod");
+    p.keys(vec![
+        KeyPress {
+            ctrl: true,
+            ..key(UiKey::A)
+        },
+        key(UiKey::Backspace),
+    ]);
+    let a = p.keys(vec![key(UiKey::Enter)]);
+    assert_eq!(
+        changes(&a),
+        vec![SettingsChange::GameName {
+            exe_path: "javaw.exe".to_string(),
+            name: None,
+        }]
+    );
+    assert!(
+        p.settings.game_names.is_empty(),
+        "{:?}",
+        p.settings.game_names
+    );
+}
+
+#[test]
+fn renaming_a_file_name_override_edits_that_key() {
+    let mut p = file_name_override_page();
+    click_field(&mut p, "Minecraft Mod");
+    p.keys(vec![key(UiKey::End)]);
+    p.typing("s");
+    p.keys(vec![key(UiKey::Enter)]);
+    assert_eq!(
+        p.settings.game_names.iter().collect::<Vec<_>>(),
+        vec![(&"javaw.exe".to_string(), &"Minecraft Mods".to_string())]
+    );
+}

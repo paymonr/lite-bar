@@ -26,7 +26,7 @@ pub(super) fn section(
     for exe in gone {
         if let Some(mut g) = view.games.remove(&exe) {
             if g.pending {
-                out.extend(g.commit(&exe));
+                out.extend(g.commit());
             }
         }
     }
@@ -41,10 +41,11 @@ pub(super) fn section(
             if i > 0 {
                 row_line(ui);
             }
+            let key = game.override_key.as_deref().unwrap_or(&game.exe_path);
             let edit = view
                 .games
                 .entry(game.exe_path.clone())
-                .or_insert_with(|| GameEdit::new(game.override_name.as_deref()));
+                .or_insert_with(|| GameEdit::new(key, game.override_name.as_deref()));
             game_row(ui, game, edit, out);
         }
         row_line(ui);
@@ -68,6 +69,10 @@ fn game_row(ui: &mut Ui, game: &GameRow, e: &mut GameEdit, out: &mut Vec<UiActio
             e.edit = TextEdit::new(shown);
         }
         e.synced = game.override_name.clone();
+        e.key = game
+            .override_key
+            .clone()
+            .unwrap_or_else(|| game.exe_path.clone());
     }
     let exe = file_name(&game.exe_path);
     let field_w = FIELD_W.min(ui.available().w);
@@ -80,7 +85,7 @@ fn game_row(ui: &mut Ui, game: &GameRow, e: &mut GameEdit, out: &mut Vec<UiActio
         |ui| match ui.text_field(field, &mut e.edit, &game.stored_name) {
             TextFieldEvent::None => {}
             TextFieldEvent::Changed => e.pending = true,
-            TextFieldEvent::Committed => out.extend(e.commit(&game.exe_path)),
+            TextFieldEvent::Committed => out.extend(e.commit()),
         },
     );
 }

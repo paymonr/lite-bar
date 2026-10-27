@@ -320,6 +320,7 @@ pub fn list_games(stats_dir: &Path) -> Vec<GameRow> {
             exe_path: g.exe_path,
             stored_name: g.name,
             override_name: None,
+            override_key: None,
         })
         .collect();
     rows.sort_by(|a, b| {
@@ -464,11 +465,13 @@ mod tests {
                     exe_path: r"C:\Games\Minecraft.exe".to_string(),
                     stored_name: "Minecraft".to_string(),
                     override_name: None,
+                    override_key: None,
                 },
                 GameRow {
                     exe_path: r"C:\Games\Zelda.exe".to_string(),
                     stored_name: "Zelda".to_string(),
                     override_name: None,
+                    override_key: None,
                 },
             ]
         );
