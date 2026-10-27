@@ -16,6 +16,15 @@ pub struct TextEdit {
     /// Set by Ctrl+A: the whole text is selected, so the next typed char, paste,
     /// Backspace or Delete replaces or clears it. Any caret move clears it.
     pub all_selected: bool,
+    /// `Input::now_ms` of the last click or keystroke in the field; the caret blink
+    /// restarts from it so the caret shows right after typing.
+    pub last_input_ms: u64,
+}
+
+/// Ctrl without Alt: Windows reports AltGr as Ctrl+Alt, and AltGr combinations type
+/// characters rather than run shortcuts.
+fn shortcut(k: &KeyPress) -> bool {
+    k.ctrl && !k.alt
 }
 
 impl TextEdit {
@@ -25,6 +34,7 @@ impl TextEdit {
             text: text.to_string(),
             caret: text.chars().count(),
             all_selected: false,
+            last_input_ms: 0,
         }
     }
 
@@ -60,17 +70,17 @@ impl TextEdit {
     pub fn apply(&mut self, k: &KeyPress, clipboard: &mut dyn Clipboard) -> bool {
         self.caret = self.caret.min(self.len());
         match k.key {
-            UiKey::A if k.ctrl => {
+            UiKey::A if shortcut(k) => {
                 self.all_selected = true;
                 false
             }
-            UiKey::C if k.ctrl => {
+            UiKey::C if shortcut(k) => {
                 if self.all_selected {
                     clipboard.set(&self.text);
                 }
                 false
             }
-            UiKey::V if k.ctrl => {
+            UiKey::V if shortcut(k) => {
                 let paste: String = clipboard
                     .get()
                     .unwrap_or_default()
@@ -268,6 +278,23 @@ mod tests {
         apply(&mut e, ctrl(UiKey::A));
         assert!(apply(&mut e, key(UiKey::Backspace)));
         assert_eq!((e.text.as_str(), e.caret), ("", 0));
+    }
+
+    #[test]
+    fn ctrl_alt_is_altgr_text_not_shortcuts() {
+        let altgr = |key| KeyPress {
+            alt: true,
+            ..ctrl(key)
+        };
+        let mut e = TextEdit::new("abc");
+        assert!(!apply(&mut e, altgr(UiKey::A)));
+        assert!(!e.all_selected);
+        e.all_selected = true;
+        let mut cb = FakeClipboard(Some("pasted".to_string()));
+        assert!(!e.apply(&altgr(UiKey::C), &mut cb));
+        assert_eq!(cb.0.as_deref(), Some("pasted"));
+        assert!(!e.apply(&altgr(UiKey::V), &mut cb));
+        assert_eq!(e.text, "abc");
     }
 
     #[test]

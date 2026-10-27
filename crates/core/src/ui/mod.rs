@@ -82,6 +82,8 @@ pub struct Ui<'a> {
     focus_start: Option<Id>,
     /// Whether the focused text field was built this frame.
     focus_seen: bool,
+    /// Earliest `now_ms` at which a widget needs a frame without input.
+    redraw_at: Option<u64>,
 }
 
 impl<'a> Ui<'a> {
@@ -110,6 +112,7 @@ impl<'a> Ui<'a> {
             clipboard: None,
             focus_start,
             focus_seen: false,
+            redraw_at: None,
         }
     }
 
@@ -275,6 +278,11 @@ impl<'a> Ui<'a> {
             .is_some_and(|p| rect.contains(p) && self.clips.last().is_none_or(|c| c.contains(p)))
     }
 
+    /// Asks the host for a frame at `now_ms` time `at`, even without input.
+    fn redraw_at(&mut self, at: u64) {
+        self.redraw_at = Some(self.redraw_at.map_or(at, |r| r.min(at)));
+    }
+
     pub fn finish(self) -> Frame {
         self.state.hot = self.state.hot_next.take();
         self.state.scroll_hot = self.state.scroll_hot_next.take();
@@ -290,6 +298,7 @@ impl<'a> Ui<'a> {
             cmds: self.cmds,
             wants_caret_blink: self.state.focused.is_some(),
             cursor: self.cursor,
+            redraw_after_ms: self.redraw_at,
         }
     }
 }

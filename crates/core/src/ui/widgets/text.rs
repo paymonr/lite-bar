@@ -63,6 +63,7 @@ impl Ui<'_> {
             if hot {
                 self.state.focused = Some(id);
                 edit.all_selected = false;
+                edit.last_input_ms = self.input.now_ms;
                 if let Some(p) = self.input.pointer {
                     edit.caret = self.caret_at(&edit.text, p.x - text_x, style);
                 }
@@ -76,6 +77,9 @@ impl Ui<'_> {
         if self.state.focused == Some(id) {
             self.focus_seen = true;
             let before = edit.text.clone();
+            if !self.input.text.is_empty() || !self.input.keys.is_empty() {
+                edit.last_input_ms = self.input.now_ms;
+            }
             let mut none = NoClipboard;
             let cb: &mut dyn Clipboard = match self.clipboard.as_deref_mut() {
                 Some(c) => c,
@@ -146,7 +150,8 @@ impl Ui<'_> {
                     color: theme::TEXT,
                 });
             }
-            let blink_on = (ui.input.now_ms / theme::CARET_BLINK_MS).is_multiple_of(2);
+            let since = ui.input.now_ms.saturating_sub(edit.last_input_ms);
+            let blink_on = (since / theme::CARET_BLINK_MS).is_multiple_of(2);
             if focused && blink_on {
                 let b = edit
                     .text

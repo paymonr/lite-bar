@@ -9,7 +9,9 @@ pub enum HotkeyCapture {
     Idle,
     /// Listening for the next key combination.
     Waiting,
-    /// Shows a message (invalid combination, or refused by the host) until clicked again.
+    /// Still listening after an invalid combination; shows why.
+    Retry(String),
+    /// The host refused the proposed hotkey; shows why, not listening, until clicked again.
     Error(String),
 }
 
@@ -49,13 +51,19 @@ impl HotkeyCapture {
         HotkeyCapture::Error(msg.to_string())
     }
 
+    /// Whether key presses are being captured (`Waiting` or `Retry`).
+    pub fn is_listening(&self) -> bool {
+        matches!(self, HotkeyCapture::Waiting | HotkeyCapture::Retry(_))
+    }
+
     pub fn start(&mut self) {
         *self = HotkeyCapture::Waiting;
     }
 
-    /// Handles one key press. Only does anything while `Waiting`.
+    /// Handles one key press. Only does anything while listening; an invalid
+    /// combination keeps listening and shows why (`Retry`).
     pub fn feed(&mut self, k: &KeyPress) -> HotkeyFieldEvent {
-        if *self != HotkeyCapture::Waiting {
+        if !self.is_listening() {
             return HotkeyFieldEvent::None;
         }
         let ev = match k.key {
@@ -70,7 +78,7 @@ impl HotkeyCapture {
             },
         };
         *self = match &ev {
-            HotkeyFieldEvent::Invalid(msg) => HotkeyCapture::Error(msg.clone()),
+            HotkeyFieldEvent::Invalid(msg) => HotkeyCapture::Retry(msg.clone()),
             _ => HotkeyCapture::Idle,
         };
         ev
@@ -125,7 +133,34 @@ mod tests {
         let mut c = waiting();
         let ev = c.feed(&kp(UiKey::A, false, false, true));
         assert_eq!(ev, HotkeyFieldEvent::Invalid(NEEDS_MODIFIER.to_string()));
-        assert_eq!(c, HotkeyCapture::Error(NEEDS_MODIFIER.to_string()));
+        assert_eq!(c, HotkeyCapture::Retry(NEEDS_MODIFIER.to_string()));
+    }
+
+    #[test]
+    fn invalid_keeps_listening() {
+        let mut c = waiting();
+        c.feed(&kp(UiKey::Other(0x20), true, false, false));
+        assert!(matches!(
+            c.feed(&kp(UiKey::Other(0x4B), true, true, false)),
+            HotkeyFieldEvent::Proposed(_)
+        ));
+        assert_eq!(c, HotkeyCapture::Idle);
+        let mut c = waiting();
+        c.feed(&kp(UiKey::A, false, false, true));
+        assert_eq!(
+            c.feed(&kp(UiKey::Esc, false, false, false)),
+            HotkeyFieldEvent::Cancelled
+        );
+    }
+
+    #[test]
+    fn rejected_does_not_listen() {
+        let mut c = HotkeyCapture::rejected("Already used by another app");
+        assert_eq!(
+            c.feed(&kp(UiKey::Other(0x4B), true, true, false)),
+            HotkeyFieldEvent::None
+        );
+        assert!(matches!(c, HotkeyCapture::Error(_)));
     }
 
     #[test]

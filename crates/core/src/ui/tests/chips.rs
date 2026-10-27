@@ -63,6 +63,19 @@ fn confirm_button_needs_second_click_within_3s() {
 }
 
 #[test]
+fn armed_confirm_button_asks_for_a_redraw_at_its_deadline() {
+    let mut st = UiState::default();
+    frame(&mut st, &hover(10.0, 10.0), |ui| {
+        ui.confirm_button(id("r"), "Restore defaults", "Click again to confirm");
+    });
+    let (_, f) = click_confirm_at(&mut st, 1_000);
+    assert_eq!(f.redraw_after_ms, Some(4_000));
+    let (confirmed, f) = click_confirm_at(&mut st, 2_000);
+    assert!(confirmed);
+    assert_eq!(f.redraw_after_ms, None);
+}
+
+#[test]
 fn confirm_button_disarms_after_3s_without_a_click() {
     let mut st = UiState::default();
     frame(&mut st, &hover(10.0, 10.0), |ui| {

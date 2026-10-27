@@ -30,6 +30,25 @@ fn location_buttons_set_matching_location() {
 }
 
 #[test]
+fn location_hit_targets_are_larger_than_the_buttons() {
+    // Top-left is drawn at 8..22; its target reaches 5 DIPs further, to 3..27.
+    for (x, y) in [(4.0, 4.0), (26.0, 26.0)] {
+        let mut st = UiState::default();
+        let mut loc = Location::BottomRight;
+        assert!(
+            click_at(&mut st, x, y, |ui| ui.location_picker(id("loc"), &mut loc)),
+            "({x}, {y})"
+        );
+        assert_eq!(loc, Location::TopLeft);
+    }
+    // The gap between targets (27..33 in y) selects nothing.
+    let mut st = UiState::default();
+    let mut loc = Location::BottomRight;
+    assert!(!click_at(&mut st, 15.0, 30.0, |ui| ui
+        .location_picker(id("loc"), &mut loc)));
+}
+
+#[test]
 fn clicking_the_selected_location_is_not_a_change() {
     let mut st = UiState::default();
     let mut loc = Location::TopLeft;

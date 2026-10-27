@@ -44,7 +44,9 @@ impl Ui<'_> {
                 b,
                 b,
             );
-            let (hot, clicked) = self.interact(id_with(id, i), rect);
+            // Targets reach past the small drawn squares; they still do not overlap.
+            let target = rect.shrink(-theme::LOC_HIT_PAD);
+            let (hot, clicked) = self.interact(id_with(id, i), target);
             if clicked && *value != *loc {
                 *value = *loc;
                 changed = true;

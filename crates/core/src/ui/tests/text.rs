@@ -159,6 +159,36 @@ fn paste_uses_the_ui_clipboard() {
 }
 
 #[test]
+fn caret_is_visible_right_after_a_keystroke() {
+    let (mut st, mut e) = focused_field("ab");
+    let lines = |f: &Frame| {
+        f.cmds
+            .iter()
+            .filter(|c| matches!(c, Cmd::Line { .. }))
+            .count()
+    };
+    let at = |now_ms: u64, text: &str| Input {
+        now_ms,
+        ..typing(text)
+    };
+    // 1500 would be an "off" phase of a free-running blink.
+    assert_eq!(lines(&field(&mut st, &at(1500, "c"), &mut e).1), 1);
+    assert_eq!(lines(&field(&mut st, &at(2000, ""), &mut e).1), 0);
+    assert_eq!(lines(&field(&mut st, &at(2500, ""), &mut e).1), 1);
+    // A click on the field restarts the blink too.
+    let over = Input {
+        now_ms: 3000,
+        ..hover(100.0, 10.0)
+    };
+    field(&mut st, &over, &mut e);
+    let click = Input {
+        now_ms: 3100,
+        ..press(100.0, 10.0)
+    };
+    assert_eq!(lines(&field(&mut st, &click, &mut e).1), 1);
+}
+
+#[test]
 fn caret_blinks_with_now_ms() {
     let (mut st, mut e) = focused_field("ab");
     let lines = |f: &Frame| {

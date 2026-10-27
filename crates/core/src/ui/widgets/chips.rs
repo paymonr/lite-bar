@@ -75,7 +75,12 @@ impl Ui<'_> {
             }
         }
         // Drawn in the new state so the confirm text shows on the arming click.
-        let armed_now = self.state.armed.contains_key(&id);
+        let armed_at = self.state.armed.get(&id).copied();
+        if let Some(at) = armed_at {
+            // Redraw once at the deadline so it is seen to disarm.
+            self.redraw_at(at + theme::CONFIRM_MS);
+        }
+        let armed_now = armed_at.is_some();
         let (label, style) = look(armed_now);
         let (bg, border, fg) = if armed_now {
             (theme::ACCENT, theme::ACCENT, theme::ON_ACCENT)

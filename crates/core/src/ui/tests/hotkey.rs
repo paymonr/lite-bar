@@ -73,7 +73,43 @@ fn modifiers_alone_keep_waiting_then_shift_a_is_invalid() {
         &mut cap,
     );
     assert!(matches!(ev, HotkeyFieldEvent::Invalid(_)));
-    assert!(matches!(cap, HotkeyCapture::Error(_)));
+    assert!(matches!(cap, HotkeyCapture::Retry(_)));
+}
+
+#[test]
+fn field_keeps_listening_after_invalid_and_shows_why() {
+    let (mut st, mut cap) = waiting();
+    run(
+        &mut st,
+        &with_keys(vec![kp(0x41, false, false, true)]),
+        &mut cap,
+    );
+    let (_, f) = run(&mut st, &Input::default(), &mut cap);
+    assert!(texts(&f)
+        .iter()
+        .any(|t| t == crate::ui::hotkey_capture::NEEDS_MODIFIER));
+    let (ev, _) = run(
+        &mut st,
+        &with_keys(vec![kp(0x4B, true, true, false)]),
+        &mut cap,
+    );
+    assert_eq!(
+        ev,
+        HotkeyFieldEvent::Proposed("Ctrl+Alt+K".parse().unwrap())
+    );
+}
+
+#[test]
+fn pressing_elsewhere_cancels_a_retry() {
+    let (mut st, mut cap) = waiting();
+    run(
+        &mut st,
+        &with_keys(vec![kp(0x41, false, false, true)]),
+        &mut cap,
+    );
+    let (ev, _) = run(&mut st, &press(100.0, 150.0), &mut cap);
+    assert_eq!(ev, HotkeyFieldEvent::Cancelled);
+    assert_eq!(cap, HotkeyCapture::Idle);
 }
 
 #[test]

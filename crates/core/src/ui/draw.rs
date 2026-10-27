@@ -87,4 +87,7 @@ pub struct Frame {
     pub cmds: Vec<Cmd>,
     pub wants_caret_blink: bool,
     pub cursor: CursorKind,
+    /// An `Input::now_ms` time at which the host should run one more frame even
+    /// without input, e.g. to show an armed confirm button disarming.
+    pub redraw_after_ms: Option<u64>,
 }

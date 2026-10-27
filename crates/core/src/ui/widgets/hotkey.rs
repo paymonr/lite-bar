@@ -35,7 +35,8 @@ fn key_names(h: &Hotkey) -> Vec<String> {
 
 impl Ui<'_> {
     /// Shows `current` as key caps. Clicking starts capture; the next combination is
-    /// proposed, Esc or a press elsewhere cancels. `HotkeyCapture::Error` shows its
+    /// proposed, Esc or a press elsewhere cancels. An invalid combination shows why and
+    /// keeps listening; `HotkeyCapture::Error` shows its
     /// message until clicked again.
     pub fn hotkey_field(
         &mut self,
@@ -46,7 +47,9 @@ impl Ui<'_> {
         let content = match &*capture {
             HotkeyCapture::Idle => Content::Keys(key_names(current)),
             HotkeyCapture::Waiting => Content::Message(WAITING_TEXT, theme::MUTED),
-            HotkeyCapture::Error(msg) => Content::Message(msg, theme::ERROR),
+            HotkeyCapture::Error(msg) | HotkeyCapture::Retry(msg) => {
+                Content::Message(msg, theme::ERROR)
+            }
         };
         let inner_w = match &content {
             Content::Keys(parts) => {
@@ -66,13 +69,13 @@ impl Ui<'_> {
         let border = match &*capture {
             HotkeyCapture::Idle => theme::BORDER,
             HotkeyCapture::Waiting => theme::ACCENT,
-            HotkeyCapture::Error(_) => theme::ERROR,
+            HotkeyCapture::Error(_) | HotkeyCapture::Retry(_) => theme::ERROR,
         };
         self.draw_hotkey(rect, &content, border);
 
         let (hot, clicked) = self.interact(id, rect);
         let mut ev = HotkeyFieldEvent::None;
-        if *capture == HotkeyCapture::Waiting {
+        if capture.is_listening() {
             if self.input.pressed && !hot {
                 *capture = HotkeyCapture::Idle;
                 ev = HotkeyFieldEvent::Cancelled;

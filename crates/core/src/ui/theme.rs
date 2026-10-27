@@ -61,6 +61,8 @@ pub const SCREEN_H: f32 = 90.0;
 pub const SCREEN_RADIUS: f32 = 6.0;
 pub const LOC_BUTTON: f32 = 14.0;
 pub const LOC_INSET: f32 = 8.0;
+/// Extra hit area around each location button, on every side.
+pub const LOC_HIT_PAD: f32 = 5.0;
 pub const SCROLL_STEP: f32 = 40.0;
 pub const NAV_H: f32 = 32.0;
 pub const NAV_SUB_H: f32 = 26.0;
