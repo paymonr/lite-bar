@@ -70,7 +70,7 @@ fn status(updates: &UpdatesInput) -> (String, Rgba) {
     };
     let color = match updates.state {
         UpdateState::Available(_) => theme::ACCENT,
-        UpdateState::CheckFailed | UpdateState::Failed(_) => PROBLEM_TEXT,
+        UpdateState::Failed(_) => PROBLEM_TEXT,
         _ => theme::MUTED,
     };
     (text, color)

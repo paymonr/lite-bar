@@ -49,7 +49,8 @@ impl App {
         self.arm_update_timer();
     }
 
-    /// "Check now": runs even with checks off, and shows "Checking…".
+    /// "Check now": runs even with checks off, and shows "Checking…" (except over an
+    /// available update, which keeps its Update now until a check says otherwise).
     pub(super) fn check_for_updates_now(&mut self) {
         if matches!(self.update, UpdateState::Downloading(_)) {
             return;
@@ -57,14 +58,15 @@ impl App {
         if self.update_schedule.check_now() == CheckStart::Started {
             self.start_update_check(self.clock.elapsed());
         }
-        if self.update_schedule.is_running() {
+        if self.update_schedule.is_running() && !matches!(self.update, UpdateState::Available(_)) {
             self.set_update_state(UpdateState::Checking);
         }
         self.arm_update_timer();
     }
 
     fn start_update_check(&mut self, now: Duration) {
-        if !spawn_check(self.hwnd, self.latest_url.clone()) {
+        let (fetch, url) = (self.fetch, self.latest_url.clone());
+        if !spawn_check(self.hwnd, move || fetch(&url)) {
             log::error("could not start the update check thread");
             self.update_schedule.finished(now);
         }

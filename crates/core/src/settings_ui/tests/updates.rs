@@ -76,7 +76,7 @@ fn status_line_shows_each_state_in_its_color() {
             UpdateState::Failed("download was corrupted".into()),
             problem,
         ),
-        (UpdateState::CheckFailed, problem),
+        (UpdateState::CheckFailed, theme::MUTED),
     ];
     for (state, color) in want {
         let p = with_update(state.clone());

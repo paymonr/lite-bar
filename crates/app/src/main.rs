@@ -101,7 +101,7 @@ mod app {
     use crate::single_instance::{acquire_single_instance, InstanceGuard};
     use crate::stats_files::{list_games, local_now, StatsWriter};
     use crate::tray::{MenuItem, Tray, TrayMenuState, WM_TRAY};
-    use crate::updater::{take_result, CheckResult, LATEST_URL, WM_UPDATE_RESULT};
+    use crate::updater::{fetch_latest, take_result, CheckResult, LATEST_URL, WM_UPDATE_RESULT};
     use crate::{log, tray};
 
     const MUTEX_NAME: &str = "Local\\LiteBar.SingleInstance";
@@ -233,6 +233,8 @@ mod app {
         update_schedule: UpdateSchedule,
         /// Where checks ask for the latest release (a local stub in tests).
         latest_url: String,
+        /// Runs on the worker thread for each check (`updater::fetch_latest`).
+        fetch: fn(&str) -> CheckResult,
     }
 
     impl App {
@@ -804,9 +806,11 @@ mod app {
     }
 
     /// Whether the panic hook stops the ETW trace. A panic inside the settings window's frame
-    /// is caught by its host (the window closes, the app carries on), so the trace must stay.
-    fn panic_stops_trace(in_ui_frame: bool) -> bool {
-        !in_ui_frame
+    /// is caught by its host (the window closes, the app carries on), and one on an update
+    /// check thread (`thread` is the panicking thread's name) by that worker, so the trace
+    /// must stay.
+    fn panic_stops_trace(in_ui_frame: bool, thread: Option<&str>) -> bool {
+        !in_ui_frame && thread != Some(crate::updater::WORKER_THREAD)
     }
 
     /// A panic in the window procedure would abort at the FFI boundary: the app would vanish
@@ -816,7 +820,8 @@ mod app {
         std::panic::set_hook(Box::new(|info| {
             let location = info.location().map(|l| (l.file(), l.line(), l.column()));
             log::error(&panic_message(info.payload(), location));
-            if panic_stops_trace(crate::ui_host::in_ui_frame()) {
+            let thread = std::thread::current();
+            if panic_stops_trace(crate::ui_host::in_ui_frame(), thread.name()) {
                 let _ = ferrisetw::trace::stop_trace_by_name(crate::etw::SESSION_NAME);
             }
         }));
@@ -900,6 +905,7 @@ mod app {
             update: UpdateState::Idle,
             update_schedule: UpdateSchedule::new(update_checks, Duration::ZERO),
             latest_url: LATEST_URL.to_string(),
+            fetch: fetch_latest,
         };
         app.arm_update_timer();
         app.register_hotkey();
@@ -989,6 +995,7 @@ mod app {
                 update_schedule: UpdateSchedule::new(checks, Duration::ZERO),
                 // A closed local port: tests never ask GitHub.
                 latest_url: "http://127.0.0.1:1/".to_string(),
+                fetch: fetch_latest,
             };
             (app, owner)
         }
@@ -1332,8 +1339,18 @@ mod app {
 
         #[test]
         fn ui_frame_panics_keep_the_trace() {
-            assert!(panic_stops_trace(false));
-            assert!(!panic_stops_trace(true));
+            assert!(panic_stops_trace(false, Some("main")));
+            assert!(panic_stops_trace(false, None));
+            assert!(!panic_stops_trace(true, Some("main")));
+        }
+
+        #[test]
+        fn update_worker_panics_keep_the_trace() {
+            // Caught by the worker, which posts a failed check instead.
+            assert!(!panic_stops_trace(
+                false,
+                Some(crate::updater::WORKER_THREAD)
+            ));
         }
 
         #[test]
@@ -1835,6 +1852,41 @@ mod app {
                 app.update_schedule.next_due().is_some(),
                 "next one in a day"
             );
+        }
+
+        #[test]
+        fn a_failed_check_now_keeps_an_available_update() {
+            let dir = TempDir::new("update-keep");
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            app.on_update_result(Ok(release("99.0.0")));
+            let avail = UpdateState::Available(release("99.0.0"));
+            app.apply_ui_action(UiAction::CheckForUpdates);
+            assert!(app.update_schedule.is_running());
+            assert_eq!(app.update, avail, "Update now stays while it checks");
+            let r = wait_update_result(app.hwnd, Duration::from_secs(10)).expect("a result");
+            assert!(r.is_err());
+            app.on_update_result(r);
+            assert_eq!(app.update, avail);
+            assert!(app.menu_state().update_available.is_some());
+            assert_eq!(app.settings_ui.as_ref().unwrap().update_state(), avail);
+        }
+
+        #[test]
+        fn a_panicking_check_does_not_stop_later_checks() {
+            let dir = TempDir::new("update-panic");
+            let (mut app, _owner) = test_app(dir.path());
+            app.fetch = |_| panic!("worker bug");
+            app.on_update_timer(Duration::from_secs(31));
+            assert!(app.update_schedule.is_running());
+            let r = wait_update_result(app.hwnd, Duration::from_secs(10)).expect("a result");
+            app.on_update_result(r);
+            assert!(!app.update_schedule.is_running());
+            assert!(
+                app.update_schedule.next_due().is_some(),
+                "the next check is scheduled"
+            );
+            assert_eq!(app.update, UpdateState::CheckFailed);
         }
 
         #[test]

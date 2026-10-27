@@ -239,10 +239,12 @@ impl UpdateSchedule {
         CheckStart::Started
     }
 
-    /// The running check ended (with any result).
+    /// The running check ended (with any result). An automatic check that came due while
+    /// it ran (polled or not) is served by it, so there is no second request right after.
     pub fn finished(&mut self, now: Duration) {
         self.running = false;
-        if std::mem::take(&mut self.served_due) && self.enabled {
+        let missed = self.next_due.is_some_and(|at| now >= at);
+        if (std::mem::take(&mut self.served_due) || missed) && self.enabled {
             self.next_due = Some(now + CHECK_INTERVAL);
         }
     }
@@ -457,7 +459,7 @@ mod tests {
     fn a_check_due_during_check_now_is_served_by_it() {
         let mut s = UpdateSchedule::new(true, secs(0));
         assert_eq!(s.check_now(), CheckStart::Started);
-        assert!(!s.poll(secs(30)), "no second check");
+        // The app polls nothing while a check runs (its timer is off); the due time passes.
         s.finished(secs(33));
         assert_eq!(s.next_due(), Some(secs(33 + DAY)));
     }
@@ -473,7 +475,6 @@ mod tests {
         let mut s = UpdateSchedule::new(false, secs(0));
         assert_eq!(s.check_now(), CheckStart::Started);
         s.set_enabled(true, secs(10));
-        assert!(!s.poll(secs(40)), "busy");
         s.finished(secs(41));
         assert_eq!(s.next_due(), Some(secs(41 + DAY)));
     }

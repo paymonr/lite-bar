@@ -8,6 +8,17 @@ pub enum HttpError {
 }
 
 use std::ffi::c_void;
+use std::fmt;
+
+impl fmt::Display for HttpError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HttpError::Network(msg) => f.write_str(msg),
+            HttpError::Status(code) => write!(f, "HTTP status {code}"),
+            HttpError::TooLarge => f.write_str("response too large"),
+        }
+    }
+}
 
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::GetLastError;
@@ -370,6 +381,16 @@ mod tests {
         assert!(
             head.contains("\r\naccept: application/vnd.github+json\r\n"),
             "{head}"
+        );
+    }
+
+    #[test]
+    fn errors_read_as_text() {
+        assert_eq!(HttpError::Status(403).to_string(), "HTTP status 403");
+        assert_eq!(HttpError::TooLarge.to_string(), "response too large");
+        assert_eq!(
+            HttpError::Network("WinHttpConnect failed".into()).to_string(),
+            "WinHttpConnect failed"
         );
     }
 

@@ -25,6 +25,12 @@ pub const WM_UPDATE_RESULT: u32 = WM_APP + 3;
 /// GitHub's latest-release endpoint for Lite Bar.
 pub const LATEST_URL: &str = "https://api.github.com/repos/paymonr/lite-bar/releases/latest";
 
+/// Name of the check threads; the panic hook leaves the ETW trace alone for them.
+pub const WORKER_THREAD: &str = "update-check";
+
+/// What a check that panicked reports.
+const PANICKED: &str = "update check failed unexpectedly";
+
 /// The release JSON is a few KB; anything over this is refused.
 const MAX_RELEASE_JSON: usize = 1024 * 1024;
 
@@ -43,20 +49,23 @@ pub fn fetch_latest(url: &str) -> CheckResult {
         &user_agent(),
         &[("Accept", "application/vnd.github+json")],
     )
-    .map_err(|e| format!("{e:?}"))?;
+    .map_err(|e| e.to_string())?;
     let text = String::from_utf8(body).map_err(|_| "release JSON is not UTF-8".to_string())?;
     parse_latest_release(&text)
 }
 
-/// Starts a check on a new thread; its result is posted to `owner`. Returns false when the
-/// thread could not be started (nothing will be posted).
-pub fn spawn_check(owner: HWND, url: String) -> bool {
+/// Starts a check on a new thread: `fetch` runs there (normally `fetch_latest`) and its
+/// result, or a failure if it panics, is posted to `owner`. Returns false when the thread
+/// could not be started (nothing will be posted).
+pub fn spawn_check(owner: HWND, fetch: impl FnOnce() -> CheckResult + Send + 'static) -> bool {
     // HWND is not Send; the worker only posts to it.
     let raw = owner.0 as usize;
     std::thread::Builder::new()
-        .name("update-check".into())
+        .name(WORKER_THREAD.into())
         .spawn(move || {
-            let result = fetch_latest(&url);
+            // A panic must still post a result, or the app would wait for this check forever.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(fetch))
+                .unwrap_or_else(|_| Err(PANICKED.to_string()));
             post_result(HWND(raw as *mut c_void), result);
         })
         .is_ok()
@@ -296,9 +305,23 @@ mod tests {
     fn worker_thread_posts_its_result() {
         let win = msg_window();
         let url = serve_release();
-        assert!(spawn_check(win.0, url));
+        assert!(spawn_check(win.0, move || fetch_latest(&url)));
         let got = wait_result(win.0, Duration::from_secs(10)).expect("a result");
         assert_eq!(got.unwrap().version.to_string(), "0.5.0");
+    }
+
+    #[test]
+    fn a_panicking_check_still_posts_a_failure() {
+        let win = msg_window();
+        assert!(spawn_check(win.0, || panic!("boom")));
+        let got = wait_result(win.0, Duration::from_secs(10)).expect("a result");
+        assert_eq!(got, Err("update check failed unexpectedly".to_string()));
+    }
+
+    #[test]
+    fn fetch_errors_are_readable() {
+        let e = fetch_latest("http://127.0.0.1:1/").unwrap_err();
+        assert!(!e.contains("Network("), "{e}");
     }
 
     #[test]
