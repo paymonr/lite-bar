@@ -20,8 +20,13 @@ use lite_bar_core::game_name::find_override;
 use lite_bar_core::hotkey::Hotkey;
 use lite_bar_core::settings::Settings;
 use lite_bar_core::settings_edit::apply_change;
-use lite_bar_core::settings_ui::{settings_frame, GameRow, SettingsView, UiAction, MIN_WINDOW_DIP};
+use lite_bar_core::settings_ui::{
+    settings_frame, GameRow, PageInput, SettingsView, StartupInput, UiAction, UpdatesInput,
+    MIN_WINDOW_DIP,
+};
+use lite_bar_core::startup_task::StartupState;
 use lite_bar_core::ui::{HotkeyCapture, Ui};
+use lite_bar_core::update::{current_version, UpdateState};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
@@ -173,6 +178,12 @@ struct WindowState {
     save_error: Option<String>,
     /// A rejected hotkey proposal, put into the capture field by the next frame.
     reject: Option<String>,
+    /// What the Updates section shows.
+    update: UpdateState,
+    /// What the General section shows: the startup task's state, and whether Lite Bar runs
+    /// as administrator.
+    startup: StartupState,
+    elevated: bool,
     queue: ActionQueue,
 }
 
@@ -208,6 +219,16 @@ impl UiApp for SettingsPage {
             &games,
             st.status.as_deref(),
             st.save_error.as_deref(),
+            PageInput {
+                updates: UpdatesInput {
+                    state: &st.update,
+                    current: current_version(),
+                },
+                startup: StartupInput {
+                    state: &st.startup,
+                    elevated: st.elevated,
+                },
+            },
         );
         // The page shows its own changes right away; the app applies them for real.
         for a in &actions {
@@ -308,6 +329,10 @@ impl SettingsUi {
         self.window.focus();
     }
 
+    pub fn hwnd(&self) -> HWND {
+        self.window.hwnd()
+    }
+
     /// Everything the page queued since the last call.
     pub fn take(&self) -> Drained {
         self.state.borrow_mut().queue.take()
@@ -348,6 +373,44 @@ impl SettingsUi {
         st.save_error = msg.map(str::to_string);
         drop(st);
         self.window.request_redraw();
+    }
+
+    /// Shows the update state in the Updates section.
+    pub fn set_update(&self, state: &UpdateState) {
+        let mut st = self.state.borrow_mut();
+        if st.update == *state {
+            return;
+        }
+        st.update = state.clone();
+        drop(st);
+        self.window.request_redraw();
+    }
+
+    /// Shows the startup task's state in the General section.
+    pub fn set_startup(&self, state: &StartupState, elevated: bool) {
+        let mut st = self.state.borrow_mut();
+        if st.startup == *state && st.elevated == elevated {
+            return;
+        }
+        st.startup = state.clone();
+        st.elevated = elevated;
+        drop(st);
+        self.window.request_redraw();
+    }
+
+    #[cfg(test)]
+    pub fn startup_state(&self) -> StartupState {
+        self.state.borrow().startup.clone()
+    }
+
+    #[cfg(test)]
+    pub fn shows_elevated(&self) -> bool {
+        self.state.borrow().elevated
+    }
+
+    #[cfg(test)]
+    pub fn update_state(&self) -> UpdateState {
+        self.state.borrow().update.clone()
     }
 
     /// Shows a refused hotkey in the capture field and the status line.

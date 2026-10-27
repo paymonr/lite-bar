@@ -1,5 +1,7 @@
 //! Single-instance guard backed by a named mutex.
 
+use std::time::Duration;
+
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{
     CloseHandle, GetLastError, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, HANDLE,
@@ -46,6 +48,32 @@ pub fn acquire_single_instance(name: &str) -> windows::core::Result<Option<Insta
     Ok(Some(InstanceGuard(handle)))
 }
 
+/// How long a just-updated instance waits for the old one to let go of the mutex.
+pub const UPDATED_WAIT: Duration = Duration::from_secs(60);
+/// How often it tries.
+pub const UPDATED_POLL: Duration = Duration::from_millis(200);
+
+/// Tries `try_take` every `interval` until it gives a value or `timeout` has passed since
+/// the first try (`now` reads the clock, `sleep` waits).
+pub fn wait_for<T>(
+    timeout: Duration,
+    interval: Duration,
+    mut now: impl FnMut() -> Duration,
+    mut sleep: impl FnMut(Duration),
+    mut try_take: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    let start = now();
+    loop {
+        if let Some(v) = try_take() {
+            return Some(v);
+        }
+        if now().saturating_sub(start) >= timeout {
+            return None;
+        }
+        sleep(interval);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +85,68 @@ mod tests {
         assert!(acquire_single_instance(&name).unwrap().is_none());
         drop(g);
         assert!(acquire_single_instance(&name).unwrap().is_some());
+    }
+
+    /// A fake clock that `sleep` advances.
+    struct FakeClock(std::cell::Cell<Duration>);
+
+    impl FakeClock {
+        fn wait<T>(&self, try_take: impl FnMut() -> Option<T>) -> Option<T> {
+            wait_for(
+                UPDATED_WAIT,
+                UPDATED_POLL,
+                || self.0.get(),
+                |d| self.0.set(self.0.get() + d),
+                try_take,
+            )
+        }
+    }
+
+    #[test]
+    fn updated_flag_waits_for_mutex() {
+        assert_eq!(UPDATED_WAIT, Duration::from_secs(60));
+        assert_eq!(UPDATED_POLL, Duration::from_millis(200));
+        // The old instance lets go of the mutex on the 4th try.
+        let clock = FakeClock(Default::default());
+        let mut tries = 0;
+        let got = clock.wait(|| {
+            tries += 1;
+            (tries == 4).then_some("guard")
+        });
+        assert_eq!(got, Some("guard"));
+        assert_eq!(clock.0.get(), Duration::from_millis(600));
+
+        // Still held after 10 s: keeps waiting.
+        let clock = FakeClock(Default::default());
+        let got = clock.wait(|| (clock.0.get() >= Duration::from_secs(30)).then_some("guard"));
+        assert_eq!(got, Some("guard"));
+
+        // It never does: gives up after 60 s, trying every 200 ms.
+        let clock = FakeClock(Default::default());
+        let mut tries = 0;
+        let got: Option<()> = clock.wait(|| {
+            tries += 1;
+            None
+        });
+        assert_eq!(got, None);
+        assert_eq!(tries, 301);
+        assert_eq!(clock.0.get(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn updated_wait_takes_the_real_mutex_once_released() {
+        let name = format!("Local\\LiteBar.TestWait.{}", std::process::id());
+        let held = acquire_single_instance(&name).unwrap().expect("first");
+        let clock = FakeClock(Default::default());
+        let mut held = Some(held);
+        let got = clock.wait(|| {
+            // Released after the first try, as the old instance exits.
+            let taken = acquire_single_instance(&name).unwrap();
+            held = None;
+            taken
+        });
+        assert!(got.is_some());
+        assert_eq!(clock.0.get(), UPDATED_POLL);
     }
 
     #[test]

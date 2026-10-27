@@ -12,6 +12,10 @@ mod game_lookup;
 #[cfg(windows)]
 mod hotkeys;
 #[cfg(windows)]
+mod http;
+#[cfg(windows)]
+mod installer;
+#[cfg(windows)]
 mod log;
 #[cfg(windows)]
 mod overlay;
@@ -24,6 +28,8 @@ mod settings_window;
 #[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]
+mod startup;
+#[cfg(windows)]
 mod stats_files;
 #[cfg(all(windows, test))]
 mod test_util;
@@ -33,6 +39,8 @@ mod tray;
 mod ui_host;
 #[cfg(windows)]
 mod ui_paint;
+#[cfg(windows)]
+mod updater;
 
 #[cfg(windows)]
 use app::run;
@@ -51,10 +59,12 @@ mod app {
     use std::any::Any;
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
+    use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use lite_bar_core::fps::{FocusClock, FpsTracker};
     use lite_bar_core::game_name::{display_name, is_known_non_game};
@@ -65,6 +75,10 @@ mod app {
     };
     use lite_bar_core::settings::{Settings, StatsLayout};
     use lite_bar_core::settings_edit::SettingsChange;
+    use lite_bar_core::startup_task::StartupState;
+    use lite_bar_core::update::{
+        current_version, ReleaseInfo, UpdateSchedule, UpdateState, Version,
+    };
     use windows::core::{w, HSTRING};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -81,19 +95,29 @@ mod app {
     };
 
     mod settings;
+    mod startup;
+    mod updates;
 
     use crate::elevation::{is_elevated, relaunch_as_admin};
     use crate::etw::{anchored_focus_clock, offers_admin, CaptureError, PresentCapture};
     use crate::foreground::{foreground_window, window_title};
     use crate::game_lookup::resolve_name;
     use crate::hotkeys::{self, HotkeyId, Registration};
+    use crate::installer::{
+        download_release, relaunch, shell_execute_result, spawn_cleanup, updated_launch,
+        updated_log_line, InstallResult, WM_INSTALL_RESULT,
+    };
     use crate::overlay::Overlay;
     use crate::paths::{app_dir, load_or_create_settings};
     use crate::process_info::{process_info, process_state, ProcessInfo, ProcessState};
     use crate::settings_window::{SaveDebounce, SettingsUi, WM_SETTINGS_ACTIONS};
-    use crate::single_instance::{acquire_single_instance, InstanceGuard};
+    use crate::single_instance::{
+        acquire_single_instance, wait_for, InstanceGuard, UPDATED_POLL, UPDATED_WAIT,
+    };
+    use crate::startup::{StartupResult, WM_STARTUP_RESULT};
     use crate::stats_files::{list_games, local_now, StatsWriter};
     use crate::tray::{MenuItem, Tray, TrayMenuState, WM_TRAY};
+    use crate::updater::{fetch_latest, take_result, CheckResult, LATEST_URL, WM_UPDATE_RESULT};
     use crate::{log, tray};
 
     const MUTEX_NAME: &str = "Local\\LiteBar.SingleInstance";
@@ -101,6 +125,8 @@ mod app {
     const TIMER_MS: u32 = 250;
     /// Owner-window timer that writes the settings file once the save debounce is due.
     const SAVE_TIMER_ID: usize = 2;
+    /// Owner-window timer for the next automatic update check.
+    const UPDATE_TIMER_ID: usize = 3;
     const SETTINGS_FILE: &str = "settings.toml";
     /// Subfolder of the app dir holding `games.toml`, `games.csv` and `sessions.csv`.
     const STATS_DIR: &str = "stats";
@@ -115,16 +141,27 @@ mod app {
         static MENU_OPEN: Cell<bool> = const { Cell::new(false) };
         /// Id of the registered "TaskbarCreated" broadcast.
         static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
+        /// An update check result taken from its message, until the app can apply it.
+        static PENDING_UPDATE: RefCell<Option<CheckResult>> = const { RefCell::new(None) };
+        /// A finished update download, until the app can apply it.
+        static PENDING_INSTALL: RefCell<Option<InstallResult>> = const { RefCell::new(None) };
+        /// A startup-task job's result, until the app can apply it.
+        static PENDING_STARTUP: RefCell<Option<StartupResult>> = const { RefCell::new(None) };
     }
 
     /// Runs `f` on the app state, if it exists and is not already borrowed (re-entrancy).
-    /// Afterwards applies whatever the settings window queued, so a nudge that arrived while
-    /// the app was busy is never lost.
+    /// Afterwards applies whatever the settings window queued and an update check result
+    /// that is waiting, so a nudge or a result that arrived while the app was busy is never
+    /// lost.
     fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
         APP.with(|app| {
             let mut guard = app.try_borrow_mut().ok()?;
             let app = guard.as_mut()?;
+            // Before `f`, so it sees the latest state, and after, for one that arrived
+            // while `f` pumped messages.
+            app.apply_pending_update();
             let r = f(app);
+            app.apply_pending_update();
             app.drain_settings_actions();
             Some(r)
         })
@@ -210,15 +247,67 @@ mod app {
         hotkey_released: bool,
         /// Why the last settings save failed (shown in the window), until one works.
         save_error: Option<&'static str>,
+        /// What the last update check found (shown in the tray and the window).
+        update: UpdateState,
+        /// When update checks run; times are `clock.elapsed()`.
+        update_schedule: UpdateSchedule,
+        /// Where checks ask for the latest release (a local stub in tests).
+        latest_url: String,
+        /// Runs on the worker thread for each check (`updater::fetch_latest`).
+        fetch: fn(&str) -> CheckResult,
+        /// This process's exe, which an update replaces (a temp file in tests).
+        exe_path: Option<PathBuf>,
+        /// Runs on the worker thread for Update now (`installer::download_release`).
+        download: fn(&ReleaseInfo, &Path) -> InstallResult,
+        /// Starts the updated exe (`installer::relaunch`).
+        relaunch: fn(&Path) -> Result<(), String>,
+        /// The release Update now last started on (its page stays reachable on failure).
+        installing: Option<ReleaseInfo>,
+        /// The version now on disk after a swap, while this older instance still runs.
+        installed_version: Option<Version>,
+        /// The startup task's state, as the Settings window shows it.
+        startup: StartupState,
+        /// The state before the change in progress (restored when UAC is declined).
+        startup_before: StartupState,
+        /// Whether this process runs as administrator.
+        elevated: bool,
+        /// Runs on a worker thread to query the task (`startup::query_now`).
+        startup_query: fn() -> StartupState,
+        /// Runs on a worker thread to change it: (on, elevated, parent window) →
+        /// `startup::change`.
+        startup_change: fn(bool, bool, usize) -> StartupResult,
+        /// Set once the updated exe is being started (cleared if that fails): later Restart
+        /// now and Update now clicks are ignored, and shutdown has nothing left to do.
+        relaunched: bool,
+        /// Starts an elevated copy through UAC (`elevation::relaunch_as_admin`).
+        relaunch_admin: fn() -> windows::core::Result<()>,
     }
 
     impl App {
+        fn apply_pending_update(&mut self) {
+            if let Some(result) = PENDING_UPDATE.take() {
+                self.on_update_result(result);
+            }
+            if let Some(result) = PENDING_INSTALL.take() {
+                if self.on_install_result(result) {
+                    quit();
+                }
+            }
+            if let Some(result) = PENDING_STARTUP.take() {
+                self.on_startup_result(result);
+            }
+        }
+
         fn menu_state(&self) -> TrayMenuState {
             TrayMenuState {
                 overlay_visible: self.overlay_on,
                 toggle_hotkey: self.settings.hotkeys.toggle_overlay.to_string(),
                 toggle_available: self.hotkey_ok,
                 needs_admin: self.needs_admin,
+                update_available: match &self.update {
+                    UpdateState::Available(r) => Some(r.version),
+                    _ => None,
+                },
             }
         }
 
@@ -453,6 +542,7 @@ mod app {
             self.overlay.set_settings(&settings.overlay);
             self.overlay.redraw();
             self.settings = settings;
+            self.sync_update_schedule();
             self.writer.flush(&self.settings.game_names);
             if let Some(ui) = &self.settings_ui {
                 ui.set_games(list_games(self.writer.stats_dir()));
@@ -461,7 +551,7 @@ mod app {
         }
 
         fn open_settings_file(&self) {
-            shell_open(&self.dir.join("settings.toml"), "settings file");
+            shell_open(self.dir.join("settings.toml"), "settings file");
         }
 
         fn open_game_stats(&self) {
@@ -483,8 +573,10 @@ mod app {
             hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
             self.stop_overlay();
             self.tray.remove();
-            match relaunch_as_admin() {
+            match (self.relaunch_admin)() {
                 Ok(()) => {
+                    // The elevated copy may start the capture before this one exits.
+                    set_owns_trace(false);
                     self.close_settings_window_for_exit();
                     true
                 }
@@ -516,6 +608,7 @@ mod app {
                         quit();
                     }
                 }
+                MenuItem::InstallUpdate => self.install_update(),
                 MenuItem::Quit => {
                     self.close_settings_window();
                     quit();
@@ -524,8 +617,13 @@ mod app {
         }
 
         /// Stops capture, removes the tray icon and saves the open sessions (the icon and
-        /// window go with the drop).
+        /// window go with the drop). After a relaunch that was all done already, and the new
+        /// instance owns the stats files: nothing is left to do.
         fn shutdown(&mut self) {
+            if self.relaunched {
+                log::info("shutting down after the update relaunch");
+                return;
+            }
             log::info("shutting down");
             self.close_settings_window();
             hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
@@ -537,6 +635,10 @@ mod app {
         /// The user is signing out or Windows is shutting down: the process may be ended as
         /// soon as this returns.
         fn end_session(&mut self) {
+            if self.relaunched {
+                // All saved before the relaunch; the new instance owns the stats files.
+                return;
+            }
             // Drains the window and ends its edits too, so nothing typed is lost.
             self.close_settings_window();
             self.stop_overlay();
@@ -562,16 +664,13 @@ mod app {
         }
     }
 
-    /// Opens `path` (a file or a folder) in its default program.
-    fn shell_open(path: &Path, what: &str) {
-        let path = HSTRING::from(path.as_os_str());
+    /// Opens `target` (a file, a folder or a web page) in its default program.
+    fn shell_open(target: impl AsRef<OsStr>, what: &str) {
+        let path = HSTRING::from(target.as_ref());
         // SAFETY: valid NUL-terminated strings for the duration of the call.
         let result = unsafe { ShellExecuteW(None, w!("open"), &path, None, None, SW_SHOWNORMAL) };
-        if result.0 as usize <= 32 {
-            log::error(&format!(
-                "could not open {what}: {}",
-                windows::core::Error::from_thread()
-            ));
+        if let Err(e) = shell_execute_result(result.0 as usize) {
+            log::error(&format!("could not open {what}: {e}"));
         }
     }
 
@@ -652,6 +751,59 @@ mod app {
         unsafe { PostQuitMessage(0) };
     }
 
+    /// This process's exe file, or `None` (logged) when Windows can't say.
+    fn own_exe() -> Option<PathBuf> {
+        std::env::current_exe()
+            .inspect_err(|e| log::error(&format!("can't find Lite Bar's exe: {e}")))
+            .ok()
+    }
+
+    /// The single-instance mutex for an instance started by an update: the old one may still
+    /// be exiting, so `acquire` is retried (every 200 ms, up to 60 s) while another instance
+    /// holds it. An unexpected error ends the wait.
+    fn guard_after_update<G>(
+        mut acquire: impl FnMut() -> windows::core::Result<Option<G>>,
+    ) -> windows::core::Result<Option<G>> {
+        let start = Instant::now();
+        wait_for(
+            UPDATED_WAIT,
+            UPDATED_POLL,
+            || start.elapsed(),
+            std::thread::sleep,
+            || match acquire() {
+                Ok(None) => None,
+                other => Some(other),
+            },
+        )
+        .unwrap_or(Ok(None))
+    }
+
+    /// What a start does with the mutex check: `Some(guard)` runs (with it, or without one
+    /// when the check failed), `None` exits because another instance runs. An updated
+    /// instance never exits: if the old one still holds the mutex after the whole wait,
+    /// running without it beats leaving nothing running.
+    fn guard_or_exit<G>(
+        updated: bool,
+        acquired: windows::core::Result<Option<G>>,
+    ) -> Option<Option<G>> {
+        match acquired {
+            Ok(Some(guard)) => Some(Some(guard)),
+            Ok(None) if updated => {
+                log::warn(
+                    "updated, but the previous Lite Bar still holds the lock; running without it",
+                );
+                Some(None)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                log::error(&format!(
+                    "single-instance check failed, running anyway: {e}"
+                ));
+                Some(None)
+            }
+        }
+    }
+
     /// Takes the single-instance mutex. Fails open: an unexpected error is logged and the app
     /// runs without a guard. `None` is also returned if another instance holds it.
     fn acquire_guard() -> Option<InstanceGuard> {
@@ -693,6 +845,32 @@ mod app {
             }
             WM_TIMER if wparam.0 == SAVE_TIMER_ID => {
                 with_app(|app| app.on_save_timer(Instant::now()));
+                return LRESULT(0);
+            }
+            WM_TIMER if wparam.0 == UPDATE_TIMER_ID => {
+                with_app(|app| app.on_update_timer(app.clock.elapsed()));
+                return LRESULT(0);
+            }
+            WM_UPDATE_RESULT => {
+                // SAFETY: posted by `updater::post_result`; each message is taken once.
+                let result = unsafe { take_result(lparam) };
+                // Applied by `with_app`, now or after whatever has the app borrowed.
+                PENDING_UPDATE.set(Some(result));
+                with_app(|_| ());
+                return LRESULT(0);
+            }
+            WM_INSTALL_RESULT => {
+                // SAFETY: posted by `installer::spawn_download`; each message is taken once.
+                let result = unsafe { crate::installer::take_result(lparam) };
+                PENDING_INSTALL.set(Some(result));
+                with_app(|_| ());
+                return LRESULT(0);
+            }
+            WM_STARTUP_RESULT => {
+                // SAFETY: posted by `startup::spawn`; each message is taken once.
+                let result = unsafe { crate::startup::take_result(lparam) };
+                PENDING_STARTUP.set(Some(result));
+                with_app(|_| ());
                 return LRESULT(0);
             }
             WM_SETTINGS_ACTIONS => {
@@ -756,10 +934,32 @@ mod app {
         }
     }
 
-    /// Whether the panic hook stops the ETW trace. A panic inside the settings window's frame
-    /// is caught by its host (the window closes, the app carries on), so the trace must stay.
-    fn panic_stops_trace(in_ui_frame: bool) -> bool {
-        !in_ui_frame
+    /// Whether this process's panic hook may stop the ETW trace: only the tray instance that
+    /// holds the mutex, and only until it has started its updated successor (which may
+    /// already run the capture). Never the `--startup on|off` helper.
+    static OWNS_TRACE: AtomicBool = AtomicBool::new(false);
+
+    fn set_owns_trace(on: bool) {
+        OWNS_TRACE.store(on, Ordering::SeqCst);
+    }
+
+    fn owns_trace() -> bool {
+        OWNS_TRACE.load(Ordering::SeqCst)
+    }
+
+    /// Whether the panic hook stops the ETW trace: only while this process `owns_trace` (see
+    /// `OWNS_TRACE`). A panic inside the settings window's frame is caught by its host (the
+    /// window closes, the app carries on), and one on an update check, download, cleanup or
+    /// startup-task thread (`thread` is the panicking thread's name) by that worker, so the
+    /// trace must stay.
+    fn panic_stops_trace(in_ui_frame: bool, thread: Option<&str>, owns_trace: bool) -> bool {
+        let workers = [
+            crate::updater::WORKER_THREAD,
+            crate::installer::WORKER_THREAD,
+            crate::installer::CLEANUP_THREAD,
+            crate::startup::WORKER_THREAD,
+        ];
+        owns_trace && !in_ui_frame && !thread.is_some_and(|t| workers.contains(&t))
     }
 
     /// A panic in the window procedure would abort at the FFI boundary: the app would vanish
@@ -769,7 +969,8 @@ mod app {
         std::panic::set_hook(Box::new(|info| {
             let location = info.location().map(|l| (l.file(), l.line(), l.column()));
             log::error(&panic_message(info.payload(), location));
-            if panic_stops_trace(crate::ui_host::in_ui_frame()) {
+            let thread = std::thread::current();
+            if panic_stops_trace(crate::ui_host::in_ui_frame(), thread.name(), owns_trace()) {
                 let _ = ferrisetw::trace::stop_trace_by_name(crate::etw::SESSION_NAME);
             }
         }));
@@ -784,16 +985,33 @@ mod app {
         log::init(&dir);
         install_panic_hook();
 
-        let guard = match acquire_single_instance(MUTEX_NAME) {
-            Ok(Some(guard)) => Some(guard),
-            Ok(None) => return, // already running: exit silently
-            Err(e) => {
-                log::error(&format!(
-                    "single-instance check failed, running anyway: {e}"
-                ));
-                None
-            }
+        // The elevated helper a non-elevated Lite Bar starts for "Start with Windows": no
+        // mutex, tray, overlay or capture; it changes the task and exits.
+        if let Some(flag) = crate::startup::parse_flag(std::env::args().skip(1)) {
+            std::process::exit(crate::startup::run_mode(flag));
+        }
+
+        let updated_from = updated_launch(std::env::args().skip(1));
+        let updated = updated_from.is_some();
+        let acquired = if updated {
+            guard_after_update(|| acquire_single_instance(MUTEX_NAME))
+        } else {
+            acquire_single_instance(MUTEX_NAME)
         };
+        let Some(guard) = guard_or_exit(updated, acquired) else {
+            return; // already running: exit silently
+        };
+
+        // This instance runs the capture from here on (also without a guard, when the
+        // check failed).
+        set_owns_trace(true);
+        if let Some(from) = updated_from {
+            log::info(&updated_log_line(from, current_version()));
+        }
+        // Also after a run that crashed or was killed between the swap and the cleanup.
+        if let Some(exe) = own_exe() {
+            spawn_cleanup(exe);
+        }
 
         let (settings, warnings) = load_or_create_settings(&dir);
         for w in &warnings {
@@ -821,6 +1039,7 @@ mod app {
         let overlay = Overlay::new(&settings.overlay)?;
 
         let start_visible = settings.overlay.visible;
+        let update_checks = settings.updates.check;
         let mut writer = StatsWriter::new(dir.join(STATS_DIR));
         // Writes what an earlier run saved in pending.toml.
         writer.flush(&settings.game_names);
@@ -849,7 +1068,24 @@ mod app {
             unsaved: Vec::new(),
             hotkey_released: false,
             save_error: None,
+            update: UpdateState::Idle,
+            update_schedule: UpdateSchedule::new(update_checks, Duration::ZERO),
+            latest_url: LATEST_URL.to_string(),
+            fetch: fetch_latest,
+            exe_path: own_exe(),
+            download: download_release,
+            relaunch,
+            installing: None,
+            installed_version: None,
+            startup: StartupState::Unknown,
+            startup_before: StartupState::Unknown,
+            elevated: is_elevated(),
+            startup_query: crate::startup::query_now,
+            startup_change: crate::startup::change,
+            relaunched: false,
+            relaunch_admin: relaunch_as_admin,
         };
+        app.arm_update_timer();
         app.register_hotkey();
         if start_visible {
             app.start_overlay();
@@ -870,10 +1106,15 @@ mod app {
             }
         }
 
-        if let Some(mut app) = APP.with(|slot| slot.borrow_mut().take()) {
-            app.shutdown();
-        }
+        // The mutex goes last: an updated instance waits for it.
+        let guard = APP
+            .with(|slot| slot.borrow_mut().take())
+            .and_then(|mut app| {
+                app.shutdown();
+                app.guard.take()
+            });
         drop(owner);
+        drop(guard);
         Ok(())
     }
 
@@ -881,9 +1122,9 @@ mod app {
     mod tests {
         use super::*;
         use crate::test_util::TempDir;
+        use crate::updater::post_result;
         use lite_bar_core::hotkey::Hotkey;
         use lite_bar_core::settings_ui::UiAction;
-        use std::time::Duration;
 
         #[test]
         fn panic_message_formats_str_payload_and_location() {
@@ -905,6 +1146,7 @@ mod app {
             let owner = create_owner_window().unwrap();
             let (settings, _) = load_or_create_settings(dir);
             let overlay = Overlay::new(&settings.overlay).unwrap();
+            let checks = settings.updates.check;
             let app = App {
                 hwnd: owner.0,
                 dir: dir.to_path_buf(),
@@ -930,6 +1172,35 @@ mod app {
                 unsaved: Vec::new(),
                 hotkey_released: false,
                 save_error: None,
+                update: UpdateState::Idle,
+                update_schedule: UpdateSchedule::new(checks, Duration::ZERO),
+                // A closed local port: tests never ask GitHub.
+                latest_url: "http://127.0.0.1:1/".to_string(),
+                fetch: fetch_latest,
+                // Tests never touch the real exe, GitHub or the shell.
+                exe_path: None,
+                download: |_, _| {
+                    Err(crate::installer::InstallError::Io(
+                        "tests never download".into(),
+                    ))
+                },
+                relaunch: |_| Err("tests never relaunch".into()),
+                installing: None,
+                installed_version: None,
+                startup: StartupState::Unknown,
+                startup_before: StartupState::Unknown,
+                elevated: true,
+                // Tests never touch the real scheduled task.
+                startup_query: || StartupState::Off,
+                startup_change: |_, _, _| {
+                    StartupResult::Changed(StartupState::Error {
+                        msg: "tests never change it".into(),
+                        actual: None,
+                    })
+                },
+                relaunched: false,
+                // Tests never start an elevated copy.
+                relaunch_admin: || Err(windows::core::Error::empty()),
             };
             (app, owner)
         }
@@ -1273,8 +1544,19 @@ mod app {
 
         #[test]
         fn ui_frame_panics_keep_the_trace() {
-            assert!(panic_stops_trace(false));
-            assert!(!panic_stops_trace(true));
+            assert!(panic_stops_trace(false, Some("main"), true));
+            assert!(panic_stops_trace(false, None, true));
+            assert!(!panic_stops_trace(true, Some("main"), true));
+        }
+
+        #[test]
+        fn update_worker_panics_keep_the_trace() {
+            // Caught by the worker, which posts a failed check instead.
+            assert!(!panic_stops_trace(
+                false,
+                Some(crate::updater::WORKER_THREAD),
+                true
+            ));
         }
 
         #[test]
@@ -1648,6 +1930,583 @@ mod app {
             assert!(hotkey_is_free(hk), "the new instance can register it");
         }
 
+        fn release(version: &str) -> ReleaseInfo {
+            ReleaseInfo {
+                version: version.parse().unwrap(),
+                page_url: format!("https://github.com/paymonr/lite-bar/releases/tag/v{version}"),
+                exe_url: "e".into(),
+                sha_url: "s".into(),
+            }
+        }
+
+        /// Waits up to `timeout` for a `WM_UPDATE_RESULT` posted to `hwnd` and removes it.
+        fn wait_update_msg(hwnd: HWND, timeout: Duration) -> Option<MSG> {
+            use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_REMOVE};
+            let end = Instant::now() + timeout;
+            let mut msg = MSG::default();
+            while Instant::now() < end {
+                let got = unsafe {
+                    PeekMessageW(
+                        &mut msg,
+                        Some(hwnd),
+                        WM_UPDATE_RESULT,
+                        WM_UPDATE_RESULT,
+                        PM_REMOVE,
+                    )
+                };
+                if got.as_bool() {
+                    return Some(msg);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None
+        }
+
+        fn wait_update_result(hwnd: HWND, timeout: Duration) -> Option<CheckResult> {
+            wait_update_msg(hwnd, timeout).map(|m| unsafe { take_result(m.lParam) })
+        }
+
+        #[test]
+        fn fake_update_result_message_moves_the_state() {
+            let dir = TempDir::new("update-msg");
+            let (app, _owner) = test_app(dir.path());
+            let hwnd = app.hwnd;
+            APP.with(|slot| *slot.borrow_mut() = Some(app));
+            assert!(post_result(hwnd, Ok(release("99.0.0"))));
+            let msg = wait_update_msg(hwnd, Duration::from_secs(1)).unwrap();
+            unsafe { window_proc(hwnd, msg.message, msg.wParam, msg.lParam) };
+            let state = with_app(|app| app.update.clone()).unwrap();
+            assert_eq!(state, UpdateState::Available(release("99.0.0")));
+
+            // Arriving while the app is busy, it waits for the next `with_app`.
+            assert!(post_result(hwnd, Ok(release("0.0.1"))));
+            let msg = wait_update_msg(hwnd, Duration::from_secs(1)).unwrap();
+            APP.with(|slot| {
+                let _busy = slot.borrow_mut();
+                unsafe { window_proc(hwnd, msg.message, msg.wParam, msg.lParam) };
+            });
+            let state = with_app(|app| app.update.clone()).unwrap();
+            assert_eq!(state, UpdateState::UpToDate);
+            APP.with(|slot| slot.borrow_mut().take());
+        }
+
+        #[test]
+        fn update_state_shows_in_the_tray_and_the_window() {
+            let dir = TempDir::new("update-shown");
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            app.on_update_result(Ok(release("99.0.0")));
+            let avail = UpdateState::Available(release("99.0.0"));
+            assert_eq!(app.update, avail);
+            assert_eq!(
+                app.menu_state().update_available,
+                Some("99.0.0".parse().unwrap())
+            );
+            assert_eq!(app.settings_ui.as_ref().unwrap().update_state(), avail);
+            // A failed check keeps the note.
+            app.on_update_result(Err("offline".into()));
+            assert_eq!(app.update, avail);
+            app.on_update_result(Ok(release("0.0.1")));
+            assert_eq!(app.update, UpdateState::UpToDate);
+            assert_eq!(app.menu_state().update_available, None);
+            assert_eq!(
+                app.settings_ui.as_ref().unwrap().update_state(),
+                UpdateState::UpToDate
+            );
+            // A window opened later shows the state too.
+            app.close_settings_window();
+            app.on_update_result(Ok(release("99.0.0")));
+            app.open_settings_hidden();
+            assert_eq!(app.settings_ui.as_ref().unwrap().update_state(), avail);
+        }
+
+        #[test]
+        fn check_now_runs_with_checks_off_and_shows_checking() {
+            let dir = TempDir::new("update-check-now");
+            let (mut app, _owner) = test_app(dir.path());
+            app.apply_settings_change(SettingsChange::CheckUpdates(false));
+            app.apply_ui_action(UiAction::CheckForUpdates);
+            assert_eq!(app.update, UpdateState::Checking);
+            assert!(app.update_schedule.is_running());
+            // A second click starts no second check.
+            app.apply_ui_action(UiAction::CheckForUpdates);
+            // The worker asks a closed local port, so it fails.
+            let r = wait_update_result(app.hwnd, Duration::from_secs(10)).expect("a result");
+            assert!(r.is_err());
+            assert!(wait_update_result(app.hwnd, Duration::from_secs(3)).is_none());
+            app.on_update_result(r);
+            assert_eq!(app.update, UpdateState::CheckFailed);
+            assert!(!app.update_schedule.is_running());
+            assert_eq!(app.update_schedule.next_due(), None, "still off");
+        }
+
+        #[test]
+        fn background_check_keeps_the_shown_state() {
+            let dir = TempDir::new("update-background");
+            let (mut app, _owner) = test_app(dir.path());
+            let avail = UpdateState::Available(release("99.0.0"));
+            app.update = avail.clone();
+            app.on_update_timer(Duration::from_secs(29));
+            assert!(!app.update_schedule.is_running(), "not due yet");
+            app.on_update_timer(Duration::from_secs(31));
+            assert!(app.update_schedule.is_running());
+            assert_eq!(app.update, avail, "no Checking for a background check");
+            let r = wait_update_result(app.hwnd, Duration::from_secs(10)).expect("a result");
+            app.on_update_result(r);
+            assert_eq!(app.update, avail);
+            assert!(
+                app.update_schedule.next_due().is_some(),
+                "next one in a day"
+            );
+        }
+
+        #[test]
+        fn a_failed_check_now_keeps_an_available_update() {
+            let dir = TempDir::new("update-keep");
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            app.on_update_result(Ok(release("99.0.0")));
+            let avail = UpdateState::Available(release("99.0.0"));
+            app.apply_ui_action(UiAction::CheckForUpdates);
+            assert!(app.update_schedule.is_running());
+            assert_eq!(app.update, avail, "Update now stays while it checks");
+            let r = wait_update_result(app.hwnd, Duration::from_secs(10)).expect("a result");
+            assert!(r.is_err());
+            app.on_update_result(r);
+            assert_eq!(app.update, avail);
+            assert!(app.menu_state().update_available.is_some());
+            assert_eq!(app.settings_ui.as_ref().unwrap().update_state(), avail);
+        }
+
+        #[test]
+        fn a_panicking_check_does_not_stop_later_checks() {
+            let dir = TempDir::new("update-panic");
+            let (mut app, _owner) = test_app(dir.path());
+            app.fetch = |_| panic!("worker bug");
+            app.on_update_timer(Duration::from_secs(31));
+            assert!(app.update_schedule.is_running());
+            let r = wait_update_result(app.hwnd, Duration::from_secs(10)).expect("a result");
+            app.on_update_result(r);
+            assert!(!app.update_schedule.is_running());
+            assert!(
+                app.update_schedule.next_due().is_some(),
+                "the next check is scheduled"
+            );
+            assert_eq!(app.update, UpdateState::CheckFailed);
+        }
+
+        #[test]
+        fn toggling_checks_schedules_and_cancels() {
+            let dir = TempDir::new("update-toggle");
+            let (mut app, _owner) = test_app(dir.path());
+            assert!(app.settings.updates.check);
+            assert!(app.update_schedule.next_due().is_some());
+            app.apply_settings_change(SettingsChange::CheckUpdates(false));
+            assert_eq!(app.update_schedule.next_due(), None);
+            app.apply_settings_change(SettingsChange::CheckUpdates(true));
+            let due = app.update_schedule.next_due().expect("scheduled");
+            let now = app.clock.elapsed();
+            assert!(due > now + Duration::from_secs(29) && due <= now + Duration::from_secs(30));
+        }
+
+        /// Waits up to `timeout` for a `WM_INSTALL_RESULT` posted to `hwnd` and takes it.
+        fn wait_install_result(hwnd: HWND, timeout: Duration) -> Option<InstallResult> {
+            use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_REMOVE};
+            let end = Instant::now() + timeout;
+            let mut msg = MSG::default();
+            while Instant::now() < end {
+                let got = unsafe {
+                    PeekMessageW(
+                        &mut msg,
+                        Some(hwnd),
+                        WM_INSTALL_RESULT,
+                        WM_INSTALL_RESULT,
+                        PM_REMOVE,
+                    )
+                };
+                if got.as_bool() {
+                    return Some(unsafe { crate::installer::take_result(msg.lParam) });
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None
+        }
+
+        const OLD_EXE: &[u8] = b"MZ running lite bar";
+        const NEW_EXE: &[u8] = b"MZ lite bar v99";
+
+        /// The app's exe is `lite-bar.exe` in the temp `dir`, never the real one.
+        fn with_temp_exe(app: &mut App, dir: &Path) -> PathBuf {
+            let exe = dir.join("lite-bar.exe");
+            std::fs::write(&exe, OLD_EXE).unwrap();
+            app.exe_path = Some(exe.clone());
+            exe
+        }
+
+        /// The real download pipeline, minus the GitHub-only URL check (the stub is local).
+        fn download_from_stub(r: &ReleaseInfo, exe: &Path) -> InstallResult {
+            crate::installer::fetch_and_stage(r, exe, |_| true)
+        }
+
+        #[test]
+        fn install_update_shows_downloading_then_failed_on_a_bad_checksum() {
+            use crate::test_util::{http_ok, serve_paths};
+            let dir = TempDir::new("install-app-bad-sha");
+            let (mut app, _owner) = test_app(dir.path());
+            let exe = with_temp_exe(&mut app, dir.path());
+            app.download = download_from_stub;
+            let wrong = format!("{}  lite-bar.exe\n", "00".repeat(32));
+            let base = serve_paths(vec![
+                ("/sha", http_ok(wrong.as_bytes())),
+                ("/exe", http_ok(NEW_EXE)),
+            ]);
+            let r = ReleaseInfo {
+                exe_url: format!("{base}/exe"),
+                sha_url: format!("{base}/sha"),
+                ..release("99.0.0")
+            };
+            app.on_update_result(Ok(r.clone()));
+            app.open_settings_hidden();
+
+            app.install_update();
+            assert_eq!(app.update, UpdateState::Downloading(r.clone()));
+            assert_eq!(
+                app.settings_ui.as_ref().unwrap().update_state(),
+                UpdateState::Downloading(r.clone())
+            );
+            app.install_update(); // a second click while downloading is ignored
+            let result = wait_install_result(app.hwnd, Duration::from_secs(10)).expect("result");
+            assert!(
+                wait_install_result(app.hwnd, Duration::from_secs(2)).is_none(),
+                "one download"
+            );
+            assert!(!app.on_install_result(result), "keeps running");
+            let UpdateState::Failed { why, .. } = &app.update else {
+                panic!("{:?}", app.update);
+            };
+            assert!(why.contains("checksum"), "{why}");
+            assert_eq!(app.settings_ui.as_ref().unwrap().update_state(), app.update);
+            assert_eq!(std::fs::read(&exe).unwrap(), OLD_EXE);
+            assert!(!crate::installer::new_path(&exe).exists());
+            // The release page stays reachable for a manual download.
+            assert_eq!(app.release_page(), Some(r.page_url.as_str()));
+
+            // A corrupted download may be a one-off: Try again downloads the same release.
+            assert!(matches!(
+                app.update,
+                UpdateState::Failed { retry: true, .. }
+            ));
+            app.install_update();
+            assert_eq!(app.update, UpdateState::Downloading(r.clone()));
+            let result = wait_install_result(app.hwnd, Duration::from_secs(10)).expect("result");
+            app.on_install_result(result);
+            assert!(matches!(
+                app.update,
+                UpdateState::Failed { retry: true, .. }
+            ));
+        }
+
+        #[test]
+        fn an_unwritable_folder_offers_no_retry() {
+            let dir = TempDir::new("install-app-unwritable");
+            let (mut app, _owner) = test_app(dir.path());
+            with_temp_exe(&mut app, dir.path());
+            app.update = UpdateState::Downloading(release("99.0.0"));
+            app.installing = Some(release("99.0.0"));
+            app.on_install_result(Err(crate::installer::InstallError::Unwritable));
+            let failed = UpdateState::Failed {
+                why: crate::installer::UNWRITABLE.into(),
+                retry: false,
+            };
+            assert_eq!(app.update, failed);
+            app.download = |_, _| panic!("must not download");
+            app.install_update();
+            assert_eq!(app.update, failed);
+            assert!(app.release_page().is_some());
+        }
+
+        #[test]
+        fn without_its_exe_path_the_release_page_still_opens() {
+            let dir = TempDir::new("install-app-no-exe");
+            let (mut app, _owner) = test_app(dir.path());
+            app.download = |_, _| panic!("must not download");
+            app.update = UpdateState::Available(release("99.0.0"));
+            app.install_update();
+            assert!(
+                matches!(app.update, UpdateState::Failed { retry: false, .. }),
+                "{:?}",
+                app.update
+            );
+            assert_eq!(
+                app.release_page(),
+                Some(release("99.0.0").page_url.as_str())
+            );
+        }
+
+        #[test]
+        fn an_installed_version_is_not_offered_again() {
+            let dir = TempDir::new("install-app-installed");
+            let (mut app, _owner) = test_app(dir.path());
+            app.installed_version = Some("99.0.0".parse().unwrap());
+            app.on_update_result(Ok(release("99.0.0")));
+            assert_eq!(app.update, UpdateState::UpToDate);
+            app.on_update_result(Ok(release("99.0.1")));
+            assert_eq!(app.update, UpdateState::Available(release("99.0.1")));
+        }
+
+        #[test]
+        fn install_needs_an_available_newer_release() {
+            let dir = TempDir::new("install-app-guard");
+            let (mut app, _owner) = test_app(dir.path());
+            with_temp_exe(&mut app, dir.path());
+            app.download = |_, _| panic!("must not download");
+            app.install_update();
+            assert_eq!(app.update, UpdateState::Idle);
+            // Not newer than this build (a stale state): ignored too.
+            let stale = UpdateState::Available(release("0.0.1"));
+            app.update = stale.clone();
+            app.install_update();
+            assert_eq!(app.update, stale);
+            assert!(wait_install_result(app.hwnd, Duration::from_millis(300)).is_none());
+        }
+
+        thread_local! {
+            static RELAUNCHED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        }
+
+        fn fake_relaunch(exe: &Path) -> Result<(), String> {
+            RELAUNCHED.with(|r| r.borrow_mut().push(exe.to_path_buf()));
+            Ok(())
+        }
+
+        /// The app mid-download of v99, with the verified exe staged as `.new`.
+        fn staged_app(dir: &Path) -> (App, OwnerWindow, PathBuf, PathBuf) {
+            let (mut app, owner) = test_app(dir);
+            let exe = with_temp_exe(&mut app, dir);
+            let new = crate::installer::stage_update(
+                &exe,
+                NEW_EXE,
+                &lite_bar_core::update::sha256(NEW_EXE),
+            )
+            .unwrap();
+            app.update = UpdateState::Downloading(release("99.0.0"));
+            app.installing = Some(release("99.0.0"));
+            (app, owner, exe, new)
+        }
+
+        #[test]
+        fn verified_download_is_swapped_in_and_relaunched() {
+            let dir = TempDir::new("install-app-swap");
+            let (mut app, _owner, exe, new) = staged_app(dir.path());
+            app.relaunch = fake_relaunch;
+            app.open_settings_hidden();
+            app.settings_ui.as_ref().unwrap().queue(counter(37));
+            assert!(app.on_install_result(Ok(new)), "quits");
+            assert_eq!(std::fs::read(&exe).unwrap(), NEW_EXE);
+            assert_eq!(
+                std::fs::read(crate::installer::old_path(&exe)).unwrap(),
+                OLD_EXE
+            );
+            assert_eq!(RELAUNCHED.with(|r| r.borrow().clone()), vec![exe]);
+            // The Quit path ran first: the window's edits are saved.
+            assert!(app.settings_ui.is_none());
+            assert!(settings_file(dir.path()).contains("counter_size = 37"));
+        }
+
+        #[test]
+        fn relaunch_failure_keeps_running_and_asks_for_a_restart() {
+            let dir = TempDir::new("install-app-relaunch-fails");
+            let (mut app, _owner, exe, new) = staged_app(dir.path());
+            app.relaunch = |_| Err("no shell".into());
+            assert!(!app.on_install_result(Ok(new)), "keeps running");
+            assert_eq!(app.update, UpdateState::RestartRequired);
+            assert_eq!(std::fs::read(&exe).unwrap(), NEW_EXE, "installed");
+            assert_eq!(app.installed_version, Some("99.0.0".parse().unwrap()));
+
+            // The installed release is never offered again, by a check or Check now.
+            app.on_update_result(Ok(release("99.0.0")));
+            assert_eq!(app.update, UpdateState::RestartRequired);
+            app.check_for_updates_now();
+            assert_eq!(app.update, UpdateState::RestartRequired);
+            assert_eq!(app.menu_state().update_available, None);
+
+            // Restart now tries again: failing, it still waits for a restart...
+            assert!(!app.restart_to_update());
+            assert_eq!(app.update, UpdateState::RestartRequired);
+            // ...and once the new exe starts, this one quits.
+            app.relaunch = fake_relaunch;
+            assert!(app.restart_to_update());
+            assert_eq!(RELAUNCHED.with(|r| r.borrow().clone()), vec![exe]);
+        }
+
+        #[test]
+        fn restart_now_does_nothing_without_an_installed_update() {
+            let dir = TempDir::new("install-app-restart-idle");
+            let (mut app, _owner) = test_app(dir.path());
+            with_temp_exe(&mut app, dir.path());
+            app.relaunch = |_| panic!("must not relaunch");
+            assert!(!app.restart_to_update());
+            assert_eq!(app.update, UpdateState::Idle);
+        }
+
+        #[test]
+        fn failed_swap_keeps_the_running_exe() {
+            let dir = TempDir::new("install-app-swap-fails");
+            let (mut app, _owner, exe, new) = staged_app(dir.path());
+            app.relaunch = |_| panic!("must not relaunch");
+            std::fs::remove_file(&new).unwrap(); // the second rename has nothing to move
+            assert!(!app.on_install_result(Ok(new)));
+            assert!(
+                matches!(app.update, UpdateState::Failed { .. }),
+                "{:?}",
+                app.update
+            );
+            assert_eq!(std::fs::read(&exe).unwrap(), OLD_EXE);
+        }
+
+        #[test]
+        fn relaunch_keeps_the_guard_until_exit() {
+            const NAME: &str = "Local\\LiteBar.Test.RelaunchKeepsGuard";
+            let dir = TempDir::new("install-app-keeps-guard");
+            let (mut app, _owner, _exe, new) = staged_app(dir.path());
+            app.relaunch = fake_relaunch;
+            app.guard = acquire_single_instance(NAME).unwrap();
+            assert!(app.guard.is_some());
+            assert!(app.on_install_result(Ok(new)), "quits");
+            // The new instance waits for it: this one holds it until it exits.
+            assert!(app.guard.is_some());
+            assert!(acquire_single_instance(NAME).unwrap().is_none());
+        }
+
+        #[test]
+        fn shutdown_after_relaunch_does_not_flush_twice() {
+            let dir = TempDir::new("install-app-shutdown-once");
+            write_one_game(dir.path());
+            let (mut app, _owner, _exe, new) = staged_app(dir.path());
+            app.relaunch = fake_relaunch;
+            assert!(app.on_install_result(Ok(new)), "quits");
+            // The new instance owns the stats files now: the old one writes nothing more.
+            app.writer.mark_games_csv_dirty();
+            app.shutdown();
+            assert!(!dir.path().join(STATS_DIR).join("games.csv").exists());
+        }
+
+        #[test]
+        fn second_restart_now_is_ignored() {
+            let dir = TempDir::new("install-app-restart-twice");
+            let (mut app, _owner) = test_app(dir.path());
+            let exe = with_temp_exe(&mut app, dir.path());
+            app.update = UpdateState::RestartRequired;
+            app.relaunch = fake_relaunch;
+            app.open_settings_hidden();
+            let ui = app.settings_ui.as_ref().unwrap();
+            ui.queue(UiAction::RestartToUpdate);
+            ui.queue(UiAction::RestartToUpdate);
+            ui.queue(UiAction::InstallUpdate);
+            app.drain_settings_actions();
+            assert_eq!(RELAUNCHED.with(|r| r.borrow().clone()), vec![exe]);
+        }
+
+        #[test]
+        fn panics_keep_the_trace_unless_this_instance_owns_it() {
+            // The `--startup on|off` helper never owns it, and after a relaunch the new
+            // instance may already run the capture.
+            assert!(!panic_stops_trace(false, Some("main"), false));
+            assert!(!panic_stops_trace(false, None, false));
+            assert!(panic_stops_trace(false, Some("main"), true));
+        }
+
+        #[test]
+        fn a_successful_relaunch_gives_up_the_trace() {
+            let _lock = TRACE_FLAG.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = TempDir::new("install-app-gives-up-trace");
+            let (mut app, _owner, _exe, new) = staged_app(dir.path());
+            app.relaunch = fake_relaunch;
+            set_owns_trace(true);
+            assert!(app.on_install_result(Ok(new)), "quits");
+            assert!(!owns_trace());
+        }
+
+        /// Serialises the tests that set `OWNS_TRACE` and then read it.
+        static TRACE_FLAG: Mutex<()> = Mutex::new(());
+
+        #[test]
+        fn a_successful_admin_restart_gives_up_the_trace() {
+            let _lock = TRACE_FLAG.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = TempDir::new("admin-restart-gives-up-trace");
+            let (mut app, _owner) = test_app(dir.path());
+            app.relaunch_admin = || Ok(());
+            set_owns_trace(true);
+            assert!(app.restart_as_admin(), "quits");
+            assert!(!owns_trace());
+        }
+
+        #[test]
+        fn a_declined_admin_restart_keeps_the_trace() {
+            let _lock = TRACE_FLAG.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = TempDir::new("admin-restart-declined");
+            let (mut app, _owner) = test_app(dir.path());
+            set_owns_trace(true);
+            assert!(!app.restart_as_admin(), "keeps running");
+            assert!(owns_trace());
+        }
+
+        #[test]
+        fn sign_out_after_relaunch_does_not_flush_again() {
+            let dir = TempDir::new("install-app-endsession-once");
+            write_one_game(dir.path());
+            let (mut app, _owner, _exe, new) = staged_app(dir.path());
+            app.relaunch = fake_relaunch;
+            assert!(app.on_install_result(Ok(new)), "quits");
+            app.writer.mark_games_csv_dirty();
+            app.end_session();
+            assert!(!dir.path().join(STATS_DIR).join("games.csv").exists());
+        }
+
+        #[test]
+        fn an_updated_instance_runs_without_the_guard_rather_than_exit() {
+            // Still held after the whole wait: fail open, so something runs.
+            assert_eq!(guard_or_exit(true, Ok(None::<()>)), Some(None));
+            // A normal start with another instance running exits.
+            assert_eq!(guard_or_exit(false, Ok(None::<()>)), None);
+            assert_eq!(guard_or_exit(true, Ok(Some(1))), Some(Some(1)));
+            assert_eq!(guard_or_exit(false, Ok(Some(1))), Some(Some(1)));
+            // An unexpected error runs without a guard, as before.
+            assert_eq!(
+                guard_or_exit::<()>(false, Err(windows::core::Error::empty())),
+                Some(None)
+            );
+        }
+
+        #[test]
+        fn after_an_update_the_guard_is_taken_once_the_old_instance_lets_go() {
+            let mut tries = 0;
+            let got = guard_after_update(|| {
+                tries += 1;
+                Ok((tries == 3).then_some("guard"))
+            });
+            assert_eq!(got.ok(), Some(Some("guard")));
+            assert_eq!(tries, 3);
+            // An unexpected error stops the wait (the caller runs without a guard).
+            let mut tries = 0;
+            let got: windows::core::Result<Option<()>> = guard_after_update(|| {
+                tries += 1;
+                Err(windows::core::Error::empty())
+            });
+            assert!(got.is_err());
+            assert_eq!(tries, 1);
+        }
+
+        #[test]
+        fn install_threads_panics_keep_the_trace() {
+            for t in [
+                crate::installer::WORKER_THREAD,
+                crate::installer::CLEANUP_THREAD,
+            ] {
+                assert!(!panic_stops_trace(false, Some(t), true), "{t}");
+            }
+        }
+
         #[test]
         fn hotkey_taken_during_capture_is_reported_in_the_window() {
             let dir = TempDir::new("settings-capture-taken");
@@ -1676,6 +2535,170 @@ mod app {
                 Some("Couldn't restore Ctrl+Alt+Shift+F20 — another app took it")
             );
             hotkeys::unregister(thief.0, HotkeyId::ToggleOverlay);
+        }
+
+        /// Waits up to `timeout` for a `WM_STARTUP_RESULT` posted to `hwnd` and removes it.
+        fn wait_startup_msg(hwnd: HWND, timeout: Duration) -> Option<MSG> {
+            use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_REMOVE};
+            let end = Instant::now() + timeout;
+            let mut msg = MSG::default();
+            while Instant::now() < end {
+                let got = unsafe {
+                    PeekMessageW(
+                        &mut msg,
+                        Some(hwnd),
+                        WM_STARTUP_RESULT,
+                        WM_STARTUP_RESULT,
+                        PM_REMOVE,
+                    )
+                };
+                if got.as_bool() {
+                    return Some(msg);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None
+        }
+
+        /// Applies the next startup result posted to the app's window.
+        fn apply_startup_result(app: &mut App) {
+            let msg = wait_startup_msg(app.hwnd, Duration::from_secs(5)).expect("a result");
+            app.on_startup_result(unsafe { crate::startup::take_result(msg.lParam) });
+        }
+
+        fn shown_startup(app: &App) -> StartupState {
+            app.settings_ui.as_ref().unwrap().startup_state()
+        }
+
+        #[test]
+        fn opening_settings_queries_the_startup_task_off_the_ui_thread() {
+            let dir = TempDir::new("startup-open");
+            let (mut app, _owner) = test_app(dir.path());
+            app.startup_query = || {
+                assert_eq!(
+                    std::thread::current().name(),
+                    Some(crate::startup::WORKER_THREAD)
+                );
+                StartupState::On
+            };
+            app.open_settings_hidden();
+            assert_eq!(shown_startup(&app), StartupState::Unknown);
+            let hwnd = app.hwnd;
+            APP.with(|slot| *slot.borrow_mut() = Some(app));
+            let msg = wait_startup_msg(hwnd, Duration::from_secs(5)).unwrap();
+            unsafe { window_proc(hwnd, msg.message, msg.wParam, msg.lParam) };
+            let shown = with_app(|app| (app.startup.clone(), shown_startup(app))).unwrap();
+            assert_eq!(shown, (StartupState::On, StartupState::On));
+            APP.with(|slot| slot.borrow_mut().take());
+        }
+
+        static ELEVATED_CALLS: Mutex<Vec<(bool, bool)>> = Mutex::new(Vec::new());
+
+        #[test]
+        fn elevated_switch_changes_the_task_on_a_worker_then_shows_it() {
+            let dir = TempDir::new("startup-elevated");
+            let (mut app, _owner) = test_app(dir.path());
+            app.elevated = true;
+            app.startup_change = |on, elevated, _| {
+                ELEVATED_CALLS.lock().unwrap().push((on, elevated));
+                StartupResult::Changed(if on {
+                    StartupState::On
+                } else {
+                    StartupState::Off
+                })
+            };
+            app.open_settings_hidden();
+            apply_startup_result(&mut app);
+            assert_eq!(shown_startup(&app), StartupState::Off);
+
+            app.apply_ui_action(UiAction::SetStartup(true));
+            assert_eq!(app.startup, StartupState::Busy);
+            assert_eq!(shown_startup(&app), StartupState::Busy);
+            // Ignored while the first change runs.
+            app.apply_ui_action(UiAction::SetStartup(false));
+            apply_startup_result(&mut app);
+            assert_eq!(shown_startup(&app), StartupState::On);
+            assert_eq!(*ELEVATED_CALLS.lock().unwrap(), vec![(true, true)]);
+            assert!(wait_startup_msg(app.hwnd, Duration::from_millis(200)).is_none());
+        }
+
+        #[test]
+        fn a_stale_query_result_does_not_end_a_change() {
+            let dir = TempDir::new("startup-stale-query");
+            let (mut app, _owner) = test_app(dir.path());
+            app.startup_change = |_, _, _| StartupResult::Declined;
+            app.open_settings_hidden();
+            apply_startup_result(&mut app);
+            assert_eq!(app.startup, StartupState::Off);
+            // Reopened: a query is under way when the switch is clicked.
+            app.apply_ui_action(UiAction::SetStartup(true));
+            assert_eq!(app.startup, StartupState::Busy);
+            app.on_startup_result(StartupResult::Query(StartupState::Off));
+            assert_eq!(app.startup, StartupState::Busy);
+            assert_eq!(shown_startup(&app), StartupState::Busy);
+            // Still busy: a second click is ignored.
+            app.startup_before = StartupState::Unknown;
+            app.apply_ui_action(UiAction::SetStartup(false));
+            assert_eq!(app.startup_before, StartupState::Unknown);
+            app.on_startup_result(StartupResult::Changed(StartupState::On));
+            assert_eq!(app.startup, StartupState::On);
+            assert_eq!(shown_startup(&app), StartupState::On);
+            // Drain what the fake change posted.
+            let _ = wait_startup_msg(app.hwnd, Duration::from_secs(5));
+        }
+
+        #[test]
+        fn a_failed_change_shows_the_checked_state() {
+            let dir = TempDir::new("startup-failed-change");
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            apply_startup_result(&mut app);
+            let failed = StartupState::Error {
+                msg: "Couldn't change the startup task: see lite-bar.log".into(),
+                actual: Some(false),
+            };
+            app.on_startup_result(StartupResult::Changed(failed.clone()));
+            assert_eq!(shown_startup(&app), failed);
+        }
+
+        static UAC_CALLS: Mutex<Vec<(bool, bool)>> = Mutex::new(Vec::new());
+
+        #[test]
+        fn declining_uac_puts_the_switch_back_without_an_error() {
+            let dir = TempDir::new("startup-declined");
+            let (mut app, _owner) = test_app(dir.path());
+            app.elevated = false;
+            app.startup_query = || StartupState::On;
+            app.startup_change = |on, elevated, _| {
+                UAC_CALLS.lock().unwrap().push((on, elevated));
+                StartupResult::Declined
+            };
+            app.open_settings_hidden();
+            apply_startup_result(&mut app);
+            app.apply_ui_action(UiAction::SetStartup(false));
+            assert_eq!(app.startup, StartupState::Busy);
+            apply_startup_result(&mut app);
+            assert_eq!(app.startup, StartupState::On);
+            assert_eq!(shown_startup(&app), StartupState::On);
+            assert_eq!(*UAC_CALLS.lock().unwrap(), vec![(false, false)]);
+        }
+
+        #[test]
+        fn the_window_learns_whether_lite_bar_is_elevated() {
+            let dir = TempDir::new("startup-elevated-flag");
+            let (mut app, _owner) = test_app(dir.path());
+            app.elevated = true;
+            app.open_settings_hidden();
+            assert!(app.settings_ui.as_ref().unwrap().shows_elevated());
+        }
+
+        #[test]
+        fn startup_worker_panics_keep_the_trace() {
+            assert!(!panic_stops_trace(
+                false,
+                Some(crate::startup::WORKER_THREAD),
+                true
+            ));
         }
     }
 }

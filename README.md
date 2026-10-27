@@ -32,6 +32,16 @@ scripts/xwin.sh build --release -p lite-bar
 
 FPS capture needs an elevated (administrator) run in M1.
 
+CI builds natively on a Windows runner with a plain `cargo build --release -p lite-bar`; the cross-compile setup above is only for local development in WSL2. Pull requests are checked by `.github/workflows/ci.yml` (`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`).
+
+## Releases
+
+For maintainers. Releases are published automatically:
+
+1. In a pull request, bump `version` in the root `Cargo.toml` under `[workspace.package]`.
+2. Merge it to `master`. `.github/workflows/release.yml` runs the checks, builds `lite-bar.exe` and, if release `v<version>` doesn't exist yet, publishes it with two assets: `lite-bar.exe` and `lite-bar.exe.sha256` (`<hex>  lite-bar.exe`). The updater downloads exactly these names from the latest release.
+3. A merge to `master` without a version bump publishes nothing, because the tag already exists.
+
 ## Using Lite Bar
 
 Lite Bar lives in the system tray and shows an FPS overlay for the foreground application. It shows `—` while the foreground application is not presenting frames. Quit it from the tray icon: right-click, then **Quit**.
@@ -44,6 +54,7 @@ The tray menu, top to bottom:
 - **Open game stats** (see [Stats and history](#stats-and-history)).
 - **Reload settings** re-reads the settings file (and refreshes the settings window if it is open), keeping the current on/off state of the overlay.
 - **Restart as administrator to show FPS**, only when capture needs it.
+- **Update to v…**, only while a newer release is available (see [Updates](#updates)).
 - **Quit** (closes the settings window first, which saves its last changes).
 
 The overlay toggles with `Ctrl+Alt+Shift+L` by default.
@@ -54,11 +65,43 @@ The overlay toggles with `Ctrl+Alt+Shift+L` by default.
 
 - **Overlay**: show or hide the counter, its location on screen, and the statistics layout.
 - **Appearance**: number, text and background colors (hex fields, a color wheel, default chips and up to 16 saved colors; right-click a saved color to remove it), background opacity, counter size and text size.
+- **General**: the **Start with Windows** switch (see [Start with Windows](#start-with-windows)).
 - **Hotkeys**: click the field and press the new combination; Esc cancels. A combination another app already holds is refused with "Already used by another app" and the old hotkey stays.
+- **Updates**: the **Check for updates** switch, **Check now** and the update status (see [Updates](#updates)).
 - **Game names**: rename any game you've played. The name is saved under `[game_names]` and `games.csv` is regenerated; **Open stats folder** opens the stats folder.
 - **Restore defaults** (click twice) puts every overlay setting and the hotkey back to how Lite Bar ships. Game names and saved colors are kept.
 
 The window takes about 10–20 MB while open; closing it frees all of it.
+
+### Updates
+
+Lite Bar asks GitHub whether a newer release exists. That request to `api.github.com` (the latest release of `paymonr/lite-bar`) is its only network traffic, apart from the download you start with **Update now**. It runs on a background thread about 30 s after Lite Bar starts and then every 24 h while it runs, only while **Check for updates** is on (`[updates] check`). Turning the switch on checks 30 s later; turning it off cancels the next check. **Check now** checks right away, even with the switch off.
+
+When a newer release is out, Settings shows "Update available: v…" with an **Update now** button and an **Open release page** link, and the tray menu gets **Update to v…** above **Quit**. Nothing pops up and nothing is downloaded or installed until you click **Update now**. A failed check is only logged; Settings shows "Couldn't check for updates" and the next scheduled check tries again.
+
+**Update now** (in Settings or the tray) installs the release in place:
+
+1. Settings shows "Downloading v…". A background thread downloads `lite-bar.exe.sha256` and `lite-bar.exe` from GitHub. Only https links on `github.com`, `api.github.com`, `objects.githubusercontent.com` and `github-releases.githubusercontent.com` are used, and the download must finish within 5 minutes. The checksum file may be at most 64 KB and the exe at most 50 MB.
+2. The exe's SHA-256 must match the checksum file. Only then is it written next to the running exe as `lite-bar.exe.new`. Until this point, nothing touches the running `lite-bar.exe`.
+3. The running exe is renamed to `lite-bar.exe.old`, and `lite-bar.exe.new` is renamed to `lite-bar.exe`. If the second rename fails, the first is undone, so the current version stays in place and keeps running. If even that undo fails, the error names where the previous exe is (`lite-bar.exe.old`) and the log has the details. Rename it back by hand.
+4. Lite Bar quits the same way as **Quit**: the open settings are saved and the play sessions are written. It then starts the new `lite-bar.exe --updated <old version>`, and the new instance logs "updated from v… to v…". If Lite Bar was running as administrator, the new instance is too. The old instance keeps its single-instance lock until it has exited, and the new instance waits up to 60 s for it. If the lock is still held after that, the new instance logs it and runs anyway, so Lite Bar never ends up not running. Every start of Lite Bar also deletes a leftover `lite-bar.exe.old`, and a `lite-bar.exe.new` or `lite-bar.exe.new.tmp` that an interrupted update left, in the background.
+
+Any failure shows "Update failed: …" in red in Settings, with **Open release page**, and leaves the running version untouched. When trying again may help, Settings also shows **Try again**, which downloads the same release again. For example, the checksum may not match, or the download may be cut off or time out. If Lite Bar's folder can't be written to (for example, under Program Files without administrator rights), Settings says "Can't update in this folder — download it from GitHub". In that case, download `lite-bar.exe` from the release page and replace the file yourself. If the new exe is in place but couldn't be started, Settings says "Update installed — restart Lite Bar to finish" and offers **Restart now** to try again. Until then, the old version keeps running, and Lite Bar doesn't offer the installed version again. If only `lite-bar.exe.old` is left in Lite Bar's folder (for example, after a crash mid-update), rename it back to `lite-bar.exe`.
+
+### Start with Windows
+
+FPS capture needs administrator rights, so Lite Bar starts at sign-in through a Windows scheduled task rather than the Startup folder. The task runs Lite Bar elevated with no UAC prompt at each boot. It is off by default. Turn it on with **Settings → General → Start with Windows**.
+
+- The task is named `Lite Bar`, in the root folder of Task Scheduler. It runs at sign-in of the current user with highest privileges, has no time limit and also runs on battery. It is created with `schtasks /Create /XML` and removed with `schtasks /Delete`.
+- The switch shows whether the task really exists. Lite Bar checks it when the window opens and after each change.
+- If Lite Bar is already running as administrator, the switch changes the task directly. If not, Lite Bar starts `lite-bar.exe --startup on` (or `off`) as administrator, so you see one UAC prompt. That process changes the task and exits. Declining the prompt leaves everything as it was. After that, every sign-in starts Lite Bar elevated with no prompt.
+- The task starts the `lite-bar.exe` it was created from. **Update now** replaces that file in place, so the task keeps working after updates. If you move `lite-bar.exe`, the switch shows "On (points to another copy)". Turn it on again to point the task at the copy you're running.
+- Until Lite Bar has checked the task, the switch sits in the middle and ignores clicks. If a change fails, the switch shows what the task looks like after the failed attempt.
+- If Windows refuses a non-elevated Lite Bar's check, the switch may show off even though the task exists. Turning it on is still safe: it re-creates the same task.
+- The task runs at normal priority.
+- Security: the elevated task runs whatever `lite-bar.exe` is at its path, with administrator rights, at every sign-in. Anyone who can replace that file can run code as administrator. On a shared PC, or when other accounts or programs you don't trust can write to Lite Bar's folder, keep Lite Bar in a folder only administrators can change, such as `C:\Program Files\Lite Bar`. **Update now** still works there when Lite Bar runs elevated, which it does when the task starts it.
+- On an account that isn't an administrator, the UAC prompt asks for an administrator's password ("over the shoulder"). The task then belongs to that administrator account and starts Lite Bar at *their* sign-in, not yours. Turn the switch on from your own administrator account instead.
+- To remove the task by hand, run this from an administrator prompt: `schtasks /Delete /TN "Lite Bar" /F`.
 
 ### Files
 
@@ -101,6 +144,12 @@ Hotkey syntax: zero or more modifiers (`Ctrl`, `Alt`, `Shift`, `Win`) and exactl
 | Key | Type and values | Default |
 | --- | --- | --- |
 | `saved` | list of `"#RRGGBB"` colors saved in the settings window's color picker, at most 16 (extra and invalid entries are ignored with a warning) | `[]` |
+
+`[updates]`
+
+| Key | Type and values | Default |
+| --- | --- | --- |
+| `check` | bool; check GitHub for a newer release about 30 s after start and then every 24 h. Nothing is downloaded or installed until you click **Update now** | `true` |
 
 `[game_names]`
 

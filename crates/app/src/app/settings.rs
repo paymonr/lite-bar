@@ -10,7 +10,7 @@ use lite_bar_core::settings_ui::{GameRow, UiAction};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
-use super::{shell_open, App, SAVE_TIMER_ID, SETTINGS_FILE};
+use super::{quit, shell_open, App, SAVE_TIMER_ID, SETTINGS_FILE};
 use crate::hotkeys::{self, HotkeyId, Registration};
 use crate::log;
 use crate::settings_window::{switch_hotkey, Drained, HotkeyDecision, SettingsUi, SAVE_DELAY};
@@ -68,7 +68,10 @@ impl App {
         match open(self.hwnd, self.shown_settings(), games) {
             Ok(ui) => {
                 ui.set_save_error(self.save_error);
+                ui.set_update(&self.update);
+                ui.set_startup(&self.startup, self.elevated);
                 self.settings_ui = Some(ui);
+                self.refresh_startup();
             }
             Err(e) => log::error(&format!("could not open the settings window: {e}")),
         }
@@ -136,6 +139,15 @@ impl App {
                 }
             }
             UiAction::OpenStatsFolder => self.open_stats_folder(),
+            UiAction::CheckForUpdates => self.check_for_updates_now(),
+            UiAction::InstallUpdate => self.install_update(),
+            UiAction::OpenReleasePage => self.open_release_page(),
+            UiAction::RestartToUpdate => {
+                if self.restart_to_update() {
+                    quit();
+                }
+            }
+            UiAction::SetStartup(on) => self.set_startup(on),
             UiAction::StartHotkeyCapture => self.start_hotkey_capture(),
             UiAction::CancelHotkeyCapture => {
                 if self.end_hotkey_capture() {
@@ -188,6 +200,9 @@ impl App {
             SettingsChange::GameName { .. } => {
                 self.writer.mark_games_csv_dirty();
                 self.writer.flush(&self.settings.game_names);
+            }
+            SettingsChange::CheckUpdates(_) | SettingsChange::RestoreDefaults => {
+                self.sync_update_schedule()
             }
             _ => {}
         }

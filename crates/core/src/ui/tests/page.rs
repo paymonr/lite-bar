@@ -221,3 +221,44 @@ fn frames_list_their_hit_targets_for_tests() {
         ]
     );
 }
+
+#[test]
+fn link_is_accent_text_that_clicks() {
+    let mut st = UiState::default();
+    let run = |st: &mut UiState, input: &Input| {
+        let mut clicked = false;
+        let f = frame(st, input, |ui| clicked = ui.link(id("l"), "Open"));
+        (clicked, f)
+    };
+    let (_, f) = run(&mut st, &Input::default());
+    // No button box: just the text, in the accent color, centred in a control-high hit area.
+    assert!(!f
+        .cmds
+        .iter()
+        .any(|c| matches!(c, Cmd::Fill { .. } | Cmd::Stroke { .. })));
+    assert_eq!(
+        f.cmds[0],
+        Cmd::Text {
+            pos: Pt {
+                x: 0.0,
+                y: (theme::CONTROL_HEIGHT - 13.0) / 2.0
+            },
+            text: "Open".into(),
+            style: TextStyle::BODY,
+            color: theme::ACCENT,
+        }
+    );
+    run(&mut st, &hover(5.0, 5.0));
+    let (_, f) = run(&mut st, &hover(5.0, 5.0));
+    // Hovered: the hot accent and an underline.
+    assert!(f
+        .cmds
+        .iter()
+        .any(|c| matches!(c, Cmd::Text { color, .. } if *color == theme::ACCENT_HOT)));
+    assert!(f
+        .cmds
+        .iter()
+        .any(|c| matches!(c, Cmd::Fill { rect, .. } if rect.h == 1.0 && rect.w == 28.0)));
+    run(&mut st, &press(5.0, 5.0));
+    assert!(run(&mut st, &release(5.0, 5.0)).0);
+}

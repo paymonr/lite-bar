@@ -50,11 +50,12 @@ fn check(f: &Frame, w: f32, h: f32, scroll: f32) {
         if r.w * r.h <= 0.0 {
             continue;
         }
-        // Text inside a field is clipped by it, so only its start must be inside.
+        // Text inside a field is clipped by it, so only its start must be inside (probed
+        // within the visible part, which can be a sliver at the viewport's edge).
         let in_field = |h: &Rect| {
             h.contains(Pt {
                 x: r.x,
-                y: r.y + 0.5,
+                y: r.y + (r.h / 2.0).min(0.5),
             })
         };
         if r.x >= SIDEBAR_W && !hits.iter().any(in_field) {
@@ -80,7 +81,21 @@ fn check(f: &Frame, w: f32, h: f32, scroll: f32) {
 
 /// Scrolls through the whole page, checking every frame.
 fn check_size(w: f32, h: f32) {
+    for state in all_update_states() {
+        check_size_with(w, h, state, StartupState::Off, true);
+    }
+    for state in all_startup_states() {
+        for elevated in [true, false] {
+            check_size_with(w, h, UpdateState::Idle, state.clone(), elevated);
+        }
+    }
+}
+
+fn check_size_with(w: f32, h: f32, update: UpdateState, startup: StartupState, elevated: bool) {
     let mut p = Page::with_measure(Rect::new(0.0, 0.0, w, h), &CONSERVATIVE);
+    p.update = update;
+    p.startup = startup;
+    p.elevated = elevated;
     p.games.push(game(
         "C:\\Games\\Some Very Long Game Folder\\a-game-with-a-really-long-name.exe",
         "A Game With A Really Quite Long Name",
@@ -91,6 +106,8 @@ fn check_size(w: f32, h: f32) {
     let max = (p.view.content_h - (h - 150.0)).max(0.0) + 200.0;
     let mut scroll = 0.0;
     let mut seen_restore = false;
+    let mut seen_updates = false;
+    let mut seen_startup = false;
     while scroll <= max {
         p.st.scroll.insert(id("settings.scroll"), scroll);
         p.idle();
@@ -98,9 +115,13 @@ fn check_size(w: f32, h: f32) {
         assert!(!f.hits.is_empty());
         check(f, w, h, scroll);
         seen_restore |= find_text(f, "Restore defaults").is_some();
+        seen_updates |= find_text(f, "Check now").is_some();
+        seen_startup |= find_text(f, "Start with Windows").is_some();
         scroll += 60.0;
     }
     assert!(seen_restore);
+    assert!(seen_updates);
+    assert!(seen_startup);
 }
 
 #[test]

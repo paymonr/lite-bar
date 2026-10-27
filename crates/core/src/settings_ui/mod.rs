@@ -4,9 +4,11 @@
 
 mod appearance;
 mod games;
+mod general;
 mod hotkeys;
 mod overlay;
 mod preview;
+mod updates;
 
 #[cfg(test)]
 mod tests;
@@ -17,15 +19,20 @@ use std::rc::Rc;
 use crate::hotkey::Hotkey;
 use crate::settings::Settings;
 use crate::settings_edit::SettingsChange;
+use crate::startup_task::StartupState;
 use crate::ui::{
     id, theme, Cmd, HotkeyCapture, Hsv, Id, Pt, Rect, Rgba, SidebarItem, TextEdit, TextStyle, Ui,
 };
+use crate::update::{UpdateState, Version};
 
 /// Sidebar sections under the static "Settings" header, in page order.
 pub const NAV_OVERLAY: usize = 0;
 pub const NAV_APPEARANCE: usize = 1;
-pub const NAV_HOTKEYS: usize = 2;
-pub const NAV_GAMES: usize = 3;
+pub const NAV_GENERAL: usize = 2;
+pub const NAV_HOTKEYS: usize = 3;
+pub const NAV_UPDATES: usize = 4;
+pub const NAV_GAMES: usize = 5;
+const SECTIONS: usize = 6;
 
 /// Smallest window (width, height) in DIPs the page is laid out for.
 pub const MIN_WINDOW_DIP: (f32, f32) = (720.0, 520.0);
@@ -83,6 +90,38 @@ pub enum UiAction {
     /// (`ProposeHotkey`, `CancelHotkeyCapture` or the window closing).
     StartHotkeyCapture,
     CancelHotkeyCapture,
+    /// "Check now": check for an update right away, even with checks turned off.
+    CheckForUpdates,
+    /// "Update now" (Settings or the tray): download and install the available release.
+    InstallUpdate,
+    /// Open the available release's page on GitHub.
+    OpenReleasePage,
+    /// "Restart now": start the already installed new version and quit this one.
+    RestartToUpdate,
+    /// The "Start with Windows" switch: create (true) or delete the logon task.
+    SetStartup(bool),
+}
+
+/// What the Updates section shows: the app's update state and this build's version.
+#[derive(Clone, Copy, Debug)]
+pub struct UpdatesInput<'a> {
+    pub state: &'a UpdateState,
+    pub current: Version,
+}
+
+/// What the General section shows: the startup task's state and whether Lite Bar runs as
+/// administrator (if not, changing it asks for admin once).
+#[derive(Clone, Copy, Debug)]
+pub struct StartupInput<'a> {
+    pub state: &'a StartupState,
+    pub elevated: bool,
+}
+
+/// What the app feeds the page besides the settings.
+#[derive(Clone, Copy, Debug)]
+pub struct PageInput<'a> {
+    pub updates: UpdatesInput<'a>,
+    pub startup: StartupInput<'a>,
 }
 
 /// A game's name field. The text stays here while it is edited and is only emitted
@@ -140,7 +179,7 @@ pub struct SettingsView {
     /// Name fields by exe path.
     games: BTreeMap<String, GameEdit>,
     /// Scroll offsets that bring each section heading to the top, from the last frame.
-    headings: [f32; 4],
+    headings: [f32; SECTIONS],
     /// Height of the scrolling content in the last frame.
     content_h: f32,
     /// Scroll offset right after a sidebar click; while the page stays there the clicked
@@ -150,6 +189,8 @@ pub struct SettingsView {
     restored: bool,
     /// The preview stage's background, generated once.
     stage_bg: Option<Rc<Vec<u8>>>,
+    /// The value a click asked for, shown while the change runs.
+    startup_target: Option<bool>,
 }
 
 impl Default for SettingsView {
@@ -165,11 +206,12 @@ impl Default for SettingsView {
             },
             mixer_hex: TextEdit::default(),
             games: BTreeMap::new(),
-            headings: [0.0; 4],
+            headings: [0.0; SECTIONS],
             content_h: 0.0,
             nav_scroll: None,
             restored: false,
             stage_bg: None,
+            startup_target: None,
         }
     }
 }
@@ -187,6 +229,7 @@ impl SettingsView {
 
 /// Builds the whole window: sidebar, pinned header with the preview, scrolling sections.
 /// `save_error` (lines split by `\n`) shows pinned above the sections while saving fails.
+/// `input` feeds the Updates and General sections.
 pub fn settings_frame(
     ui: &mut Ui,
     view: &mut SettingsView,
@@ -194,6 +237,7 @@ pub fn settings_frame(
     games: &[GameRow],
     hotkey_status: Option<&str>,
     save_error: Option<&str>,
+    input: PageInput,
 ) -> Vec<UiAction> {
     let mut out = Vec::new();
     let area = ui.available();
@@ -219,7 +263,7 @@ pub fn settings_frame(
     let mut new_h = content_h;
     ui.region(body, |ui| {
         ui.scroll_area(scroll_id(), body.h, content_h, |ui| {
-            new_h = content(ui, view, settings, games, hotkey_status, &mut out);
+            new_h = content(ui, view, settings, games, hotkey_status, input, &mut out);
         });
     });
     let scroll = ui.scroll_offset(scroll_id());
@@ -318,7 +362,9 @@ fn sidebar(ui: &mut Ui, view: &mut SettingsView, side: Rect) -> bool {
         let items = [
             item("Overlay"),
             item("Appearance"),
+            item("General"),
             item("Hotkeys"),
+            item("Updates"),
             item("Game names"),
         ];
         if let Some(i) = ui.sidebar(id("settings.nav"), &items, &mut view.selected) {
@@ -378,6 +424,7 @@ fn content(
     settings: &Settings,
     games: &[GameRow],
     hotkey_status: Option<&str>,
+    input: PageInput,
     out: &mut Vec<UiAction>,
 ) -> f32 {
     let top = ui.available();
@@ -392,11 +439,15 @@ fn content(
         ui.space(SCROLL_PAD_TOP);
         let first = heading(ui, "OVERLAY", 2.0);
         overlay::section(ui, &settings.overlay, out);
-        view.headings[1] = heading(ui, "APPEARANCE", 16.0) - first;
+        view.headings[NAV_APPEARANCE] = heading(ui, "APPEARANCE", 16.0) - first;
         appearance::section(ui, view, settings, out);
-        view.headings[2] = heading(ui, "HOTKEYS", 16.0) - first;
+        view.headings[NAV_GENERAL] = heading(ui, "GENERAL", 16.0) - first;
+        general::section(ui, view, input.startup, out);
+        view.headings[NAV_HOTKEYS] = heading(ui, "HOTKEYS", 16.0) - first;
         hotkeys::section(ui, view, settings, hotkey_status, out);
-        view.headings[3] = heading(ui, "GAME NAMES", 16.0) - first;
+        view.headings[NAV_UPDATES] = heading(ui, "UPDATES", 16.0) - first;
+        updates::section(ui, settings, input.updates, out);
+        view.headings[NAV_GAMES] = heading(ui, "GAME NAMES", 16.0) - first;
         games::section(ui, view, games, out);
         restore_row(ui, view, out);
         bottom = ui.available().y;
@@ -482,6 +533,18 @@ fn text_size(ui: &Ui, title: Option<&str>, lines: &[&str]) -> (f32, f32) {
 /// An optional bold title over muted lines, each cut to `max_w`, vertically centred in
 /// `h` of the current column.
 fn text_block(ui: &mut Ui, h: f32, title: Option<&str>, lines: &[&str], max_w: f32) {
+    text_block_colored(ui, h, title, lines, theme::MUTED, max_w);
+}
+
+/// `text_block` with the lines in `color`.
+fn text_block_colored(
+    ui: &mut Ui,
+    h: f32,
+    title: Option<&str>,
+    lines: &[&str],
+    color: Rgba,
+    max_w: f32,
+) {
     let (_, text_h) = text_size(ui, title, lines);
     ui.space(((h - text_h) / 2.0).max(0.0));
     if let Some(t) = title {
@@ -493,7 +556,7 @@ fn text_block(ui: &mut Ui, h: f32, title: Option<&str>, lines: &[&str], max_w: f
             ui.space(2.0);
         }
         let l = ellipsize(ui, l, HINT, max_w);
-        ui.label(&l, HINT, theme::MUTED);
+        ui.label(&l, HINT, color);
     }
 }
 
@@ -509,17 +572,40 @@ fn setting_row<'a>(
     control_w: f32,
     control: impl FnOnce(&mut Ui<'a>),
 ) -> bool {
+    setting_row_colored(
+        ui,
+        control_h,
+        title,
+        lines,
+        theme::MUTED,
+        control_w,
+        control,
+    )
+}
+
+/// `setting_row` with the lines in `color`.
+fn setting_row_colored<'a>(
+    ui: &mut Ui<'a>,
+    control_h: f32,
+    title: Option<&str>,
+    lines: &[&str],
+    color: Rgba,
+    control_w: f32,
+    control: impl FnOnce(&mut Ui<'a>),
+) -> bool {
     let row_w = ui.available().w;
     let (text_w, text_h) = text_size(ui, title, lines);
     if text_w + 2.0 * theme::GAP + control_w <= row_w {
         let h = control_h.max(text_h).max(ROW_H);
         ui.row(h, |ui| {
             ui.right_aligned(control_w, control);
-            ui.column(|ui| text_block(ui, h, title, lines, row_w - control_w - theme::GAP));
+            ui.column(|ui| {
+                text_block_colored(ui, h, title, lines, color, row_w - control_w - theme::GAP)
+            });
         });
         false
     } else {
-        text_block(ui, text_h, title, lines, row_w);
+        text_block_colored(ui, text_h, title, lines, color, row_w);
         ui.space(6.0);
         ui.row(control_h, |ui| {
             ui.next_width(control_w.min(row_w));
