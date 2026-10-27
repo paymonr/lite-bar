@@ -12,7 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use lite_bar_core::update::{parse_sha256_file, sha256, ReleaseInfo};
+use lite_bar_core::update::{current_version, parse_sha256_file, sha256, ReleaseInfo, Version};
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::Storage::FileSystem::{
@@ -288,12 +288,38 @@ fn cleanup_old_with(
     Err(format!("could not remove {}: {last}", old.display()))
 }
 
-/// At every start: removes a `<exe>.old` an update left (the old process may still be
-/// exiting) on its own thread, with retries, so the tray is never held up.
+/// What staging can leave when a run ends before the swap (a crash, a kill, a failed swap):
+/// `<exe>.new` and `write_atomic`'s `<exe>.new.tmp`.
+pub fn leftover_paths(exe: &Path) -> [PathBuf; 2] {
+    [new_path(exe), with_suffix(exe, ".new.tmp")]
+}
+
+/// Removes those leftovers (one try each: nothing else has them open once this instance
+/// holds the mutex). Returns the ones removed; a failure is logged.
+pub fn cleanup_leftovers(exe: &Path) -> Vec<PathBuf> {
+    let mut removed = Vec::new();
+    for path in leftover_paths(exe) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed.push(path),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => log::warn(&format!("could not remove {}: {e}", path.display())),
+        }
+    }
+    removed
+}
+
+/// At every start: removes what staging left and a `<exe>.old` an update left (the old
+/// process may still be exiting) on its own thread, with retries, so the tray is never
+/// held up.
 pub fn spawn_cleanup(exe: PathBuf) -> Option<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name(CLEANUP_THREAD.into())
         .spawn(move || {
+            if let Ok(removed) = std::panic::catch_unwind(|| cleanup_leftovers(&exe)) {
+                for path in removed {
+                    log::info(&format!("removed {}", path.display()));
+                }
+            }
             let result = std::panic::catch_unwind(|| cleanup_old(&exe))
                 .unwrap_or_else(|_| Err("cleanup failed unexpectedly".into()));
             match result {
@@ -306,9 +332,25 @@ pub fn spawn_cleanup(exe: PathBuf) -> Option<std::thread::JoinHandle<()>> {
         .ok()
 }
 
-/// Whether the command line (without the program name) asks for the post-update start.
-pub fn is_updated_launch(mut args: impl Iterator<Item = String>) -> bool {
-    args.any(|a| a == UPDATED_FLAG)
+/// Whether the command line (without the program name) asks for the post-update start,
+/// and the version it was updated from: `None` without the flag, `Some(None)` for a bare
+/// `--updated` (from a release that did not pass the version).
+pub fn updated_launch(mut args: impl Iterator<Item = String>) -> Option<Option<Version>> {
+    args.find(|a| a == UPDATED_FLAG)?;
+    Some(args.next().and_then(|v| v.parse().ok()))
+}
+
+/// The arguments `relaunch` gives the updated exe: the flag and the version updated from.
+pub fn relaunch_args(from: Version) -> String {
+    format!("{UPDATED_FLAG} {from}")
+}
+
+/// The updated instance's first log line.
+pub fn updated_log_line(from: Option<Version>, to: Version) -> String {
+    match from {
+        Some(from) => format!("updated from v{from} to v{to}"),
+        None => format!("updated to v{to}"),
+    }
 }
 
 /// `ShellExecuteW`'s result: its return value is above 32 on success, else an error code.
@@ -319,11 +361,11 @@ pub fn shell_execute_result(code: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Starts `exe --updated`. An elevated caller's child is elevated too.
+/// Starts `exe --updated <this version>`. An elevated caller's child is elevated too.
 pub fn relaunch(exe: &Path) -> Result<(), String> {
     let file = HSTRING::from(exe.as_os_str());
     let dir = HSTRING::from(exe.parent().unwrap_or(Path::new("")).as_os_str());
-    let args = HSTRING::from(UPDATED_FLAG);
+    let args = HSTRING::from(relaunch_args(current_version()));
     // SAFETY: valid NUL-terminated strings for the duration of the call.
     let result = unsafe {
         ShellExecuteW(
@@ -752,9 +794,60 @@ mod tests {
                 .collect::<Vec<_>>()
                 .into_iter()
         };
-        assert!(is_updated_launch(args(&["--updated"])));
-        assert!(!is_updated_launch(args(&[])));
-        assert!(!is_updated_launch(args(&["--update"])));
+        assert!(updated_launch(args(&["--updated"])).is_some());
+        assert!(updated_launch(args(&[])).is_none());
+        assert!(updated_launch(args(&["--update"])).is_none());
+    }
+
+    #[test]
+    fn updated_launch_carries_the_old_version() {
+        let args = |a: &[&str]| {
+            a.iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+        let v = |s: &str| s.parse::<Version>().unwrap();
+        assert_eq!(updated_launch(args(&[])), None);
+        assert_eq!(updated_launch(args(&["--update", "0.4.0"])), None);
+        // A bare flag, from a release before the version was passed.
+        assert_eq!(updated_launch(args(&["--updated"])), Some(None));
+        assert_eq!(
+            updated_launch(args(&["--updated", "0.4.0"])),
+            Some(Some(v("0.4.0")))
+        );
+        // Something that is not a version is ignored.
+        assert_eq!(updated_launch(args(&["--updated", "--x"])), Some(None));
+    }
+
+    #[test]
+    fn relaunch_passes_the_running_version() {
+        let from: Version = "0.4.0".parse().unwrap();
+        assert_eq!(relaunch_args(from), "--updated 0.4.0");
+    }
+
+    #[test]
+    fn updated_log_line_names_both_versions() {
+        let v = |s: &str| s.parse::<Version>().unwrap();
+        assert_eq!(
+            updated_log_line(Some(v("0.4.0")), v("0.4.1")),
+            "updated from v0.4.0 to v0.4.1"
+        );
+        assert_eq!(updated_log_line(None, v("0.4.1")), "updated to v0.4.1");
+    }
+
+    #[test]
+    fn startup_cleanup_removes_stale_new() {
+        let (_dir, exe) = exe_dir("install-cleanup-new");
+        let tmp = PathBuf::from(format!("{}.tmp", new_path(&exe).display()));
+        std::fs::write(new_path(&exe), NEW_EXE).unwrap();
+        std::fs::write(&tmp, NEW_EXE).unwrap();
+        std::fs::write(old_path(&exe), OLD_EXE).unwrap();
+        spawn_cleanup(exe.clone()).expect("thread").join().unwrap();
+        assert!(!new_path(&exe).exists());
+        assert!(!tmp.exists());
+        assert!(!old_path(&exe).exists());
+        assert!(exe.exists());
     }
 
     #[test]

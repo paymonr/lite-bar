@@ -62,6 +62,7 @@ mod app {
     use std::ffi::OsStr;
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
@@ -103,8 +104,8 @@ mod app {
     use crate::game_lookup::resolve_name;
     use crate::hotkeys::{self, HotkeyId, Registration};
     use crate::installer::{
-        download_release, is_updated_launch, relaunch, shell_execute_result, spawn_cleanup,
-        InstallResult, WM_INSTALL_RESULT,
+        download_release, relaunch, shell_execute_result, spawn_cleanup, updated_launch,
+        updated_log_line, InstallResult, WM_INSTALL_RESULT,
     };
     use crate::overlay::Overlay;
     use crate::paths::{app_dir, load_or_create_settings};
@@ -275,6 +276,9 @@ mod app {
         /// Runs on a worker thread to change it: (on, elevated, parent window) →
         /// `startup::change`.
         startup_change: fn(bool, bool, usize) -> StartupResult,
+        /// Set once the updated exe is being started (cleared if that fails): later Restart
+        /// now and Update now clicks are ignored, and shutdown has nothing left to do.
+        relaunched: bool,
     }
 
     impl App {
@@ -609,8 +613,13 @@ mod app {
         }
 
         /// Stops capture, removes the tray icon and saves the open sessions (the icon and
-        /// window go with the drop).
+        /// window go with the drop). After a relaunch that was all done already, and the new
+        /// instance owns the stats files: nothing is left to do.
         fn shutdown(&mut self) {
+            if self.relaunched {
+                log::info("shutting down after the update relaunch");
+                return;
+            }
             log::info("shutting down");
             self.close_settings_window();
             hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
@@ -891,18 +900,32 @@ mod app {
         }
     }
 
-    /// Whether the panic hook stops the ETW trace. A panic inside the settings window's frame
-    /// is caught by its host (the window closes, the app carries on), and one on an update
-    /// check, download, cleanup or startup-task thread (`thread` is the panicking thread's name) by that
-    /// worker, so the trace must stay.
-    fn panic_stops_trace(in_ui_frame: bool, thread: Option<&str>) -> bool {
+    /// Whether this process's panic hook may stop the ETW trace: only the tray instance that
+    /// holds the mutex, and only until it has started its updated successor (which may
+    /// already run the capture). Never the `--startup on|off` helper.
+    static OWNS_TRACE: AtomicBool = AtomicBool::new(false);
+
+    fn set_owns_trace(on: bool) {
+        OWNS_TRACE.store(on, Ordering::SeqCst);
+    }
+
+    fn owns_trace() -> bool {
+        OWNS_TRACE.load(Ordering::SeqCst)
+    }
+
+    /// Whether the panic hook stops the ETW trace: only while this process `owns_trace` (see
+    /// `OWNS_TRACE`). A panic inside the settings window's frame is caught by its host (the
+    /// window closes, the app carries on), and one on an update check, download, cleanup or
+    /// startup-task thread (`thread` is the panicking thread's name) by that worker, so the
+    /// trace must stay.
+    fn panic_stops_trace(in_ui_frame: bool, thread: Option<&str>, owns_trace: bool) -> bool {
         let workers = [
             crate::updater::WORKER_THREAD,
             crate::installer::WORKER_THREAD,
             crate::installer::CLEANUP_THREAD,
             crate::startup::WORKER_THREAD,
         ];
-        !in_ui_frame && !thread.is_some_and(|t| workers.contains(&t))
+        owns_trace && !in_ui_frame && !thread.is_some_and(|t| workers.contains(&t))
     }
 
     /// A panic in the window procedure would abort at the FFI boundary: the app would vanish
@@ -913,7 +936,7 @@ mod app {
             let location = info.location().map(|l| (l.file(), l.line(), l.column()));
             log::error(&panic_message(info.payload(), location));
             let thread = std::thread::current();
-            if panic_stops_trace(crate::ui_host::in_ui_frame(), thread.name()) {
+            if panic_stops_trace(crate::ui_host::in_ui_frame(), thread.name(), owns_trace()) {
                 let _ = ferrisetw::trace::stop_trace_by_name(crate::etw::SESSION_NAME);
             }
         }));
@@ -934,7 +957,8 @@ mod app {
             std::process::exit(crate::startup::run_mode(flag));
         }
 
-        let updated = is_updated_launch(std::env::args().skip(1));
+        let updated_from = updated_launch(std::env::args().skip(1));
+        let updated = updated_from.is_some();
         let acquired = if updated {
             guard_after_update(|| acquire_single_instance(MUTEX_NAME))
         } else {
@@ -956,8 +980,11 @@ mod app {
             }
         };
 
-        if updated {
-            log::info(&format!("updated to v{}", current_version()));
+        // This instance runs the capture from here on (also without a guard, when the
+        // check failed).
+        set_owns_trace(true);
+        if let Some(from) = updated_from {
+            log::info(&updated_log_line(from, current_version()));
         }
         // Also after a run that crashed or was killed between the swap and the cleanup.
         if let Some(exe) = own_exe() {
@@ -1033,6 +1060,7 @@ mod app {
             elevated: is_elevated(),
             startup_query: crate::startup::query_now,
             startup_change: crate::startup::change,
+            relaunched: false,
         };
         app.arm_update_timer();
         app.register_hotkey();
@@ -1055,10 +1083,15 @@ mod app {
             }
         }
 
-        if let Some(mut app) = APP.with(|slot| slot.borrow_mut().take()) {
-            app.shutdown();
-        }
+        // The mutex goes last: an updated instance waits for it.
+        let guard = APP
+            .with(|slot| slot.borrow_mut().take())
+            .and_then(|mut app| {
+                app.shutdown();
+                app.guard.take()
+            });
         drop(owner);
+        drop(guard);
         Ok(())
     }
 
@@ -1142,6 +1175,7 @@ mod app {
                         actual: None,
                     })
                 },
+                relaunched: false,
             };
             (app, owner)
         }
@@ -1485,9 +1519,9 @@ mod app {
 
         #[test]
         fn ui_frame_panics_keep_the_trace() {
-            assert!(panic_stops_trace(false, Some("main")));
-            assert!(panic_stops_trace(false, None));
-            assert!(!panic_stops_trace(true, Some("main")));
+            assert!(panic_stops_trace(false, Some("main"), true));
+            assert!(panic_stops_trace(false, None, true));
+            assert!(!panic_stops_trace(true, Some("main"), true));
         }
 
         #[test]
@@ -1495,7 +1529,8 @@ mod app {
             // Caught by the worker, which posts a failed check instead.
             assert!(!panic_stops_trace(
                 false,
-                Some(crate::updater::WORKER_THREAD)
+                Some(crate::updater::WORKER_THREAD),
+                true
             ));
         }
 
@@ -2305,6 +2340,68 @@ mod app {
         }
 
         #[test]
+        fn relaunch_keeps_the_guard_until_exit() {
+            const NAME: &str = "Local\\LiteBar.Test.RelaunchKeepsGuard";
+            let dir = TempDir::new("install-app-keeps-guard");
+            let (mut app, _owner, _exe, new) = staged_app(dir.path());
+            app.relaunch = fake_relaunch;
+            app.guard = acquire_single_instance(NAME).unwrap();
+            assert!(app.guard.is_some());
+            assert!(app.on_install_result(Ok(new)), "quits");
+            // The new instance waits for it: this one holds it until it exits.
+            assert!(app.guard.is_some());
+            assert!(acquire_single_instance(NAME).unwrap().is_none());
+        }
+
+        #[test]
+        fn shutdown_after_relaunch_does_not_flush_twice() {
+            let dir = TempDir::new("install-app-shutdown-once");
+            write_one_game(dir.path());
+            let (mut app, _owner, _exe, new) = staged_app(dir.path());
+            app.relaunch = fake_relaunch;
+            assert!(app.on_install_result(Ok(new)), "quits");
+            // The new instance owns the stats files now: the old one writes nothing more.
+            app.writer.mark_games_csv_dirty();
+            app.shutdown();
+            assert!(!dir.path().join(STATS_DIR).join("games.csv").exists());
+        }
+
+        #[test]
+        fn second_restart_now_is_ignored() {
+            let dir = TempDir::new("install-app-restart-twice");
+            let (mut app, _owner) = test_app(dir.path());
+            let exe = with_temp_exe(&mut app, dir.path());
+            app.update = UpdateState::RestartRequired;
+            app.relaunch = fake_relaunch;
+            app.open_settings_hidden();
+            let ui = app.settings_ui.as_ref().unwrap();
+            ui.queue(UiAction::RestartToUpdate);
+            ui.queue(UiAction::RestartToUpdate);
+            ui.queue(UiAction::InstallUpdate);
+            app.drain_settings_actions();
+            assert_eq!(RELAUNCHED.with(|r| r.borrow().clone()), vec![exe]);
+        }
+
+        #[test]
+        fn panics_keep_the_trace_unless_this_instance_owns_it() {
+            // The `--startup on|off` helper never owns it, and after a relaunch the new
+            // instance may already run the capture.
+            assert!(!panic_stops_trace(false, Some("main"), false));
+            assert!(!panic_stops_trace(false, None, false));
+            assert!(panic_stops_trace(false, Some("main"), true));
+        }
+
+        #[test]
+        fn a_successful_relaunch_gives_up_the_trace() {
+            let dir = TempDir::new("install-app-gives-up-trace");
+            let (mut app, _owner, _exe, new) = staged_app(dir.path());
+            app.relaunch = fake_relaunch;
+            set_owns_trace(true);
+            assert!(app.on_install_result(Ok(new)), "quits");
+            assert!(!owns_trace());
+        }
+
+        #[test]
         fn after_an_update_the_guard_is_taken_once_the_old_instance_lets_go() {
             let mut tries = 0;
             let got = guard_after_update(|| {
@@ -2329,7 +2426,7 @@ mod app {
                 crate::installer::WORKER_THREAD,
                 crate::installer::CLEANUP_THREAD,
             ] {
-                assert!(!panic_stops_trace(false, Some(t)), "{t}");
+                assert!(!panic_stops_trace(false, Some(t), true), "{t}");
             }
         }
 
@@ -2522,7 +2619,8 @@ mod app {
         fn startup_worker_panics_keep_the_trace() {
             assert!(!panic_stops_trace(
                 false,
-                Some(crate::startup::WORKER_THREAD)
+                Some(crate::startup::WORKER_THREAD),
+                true
             ));
         }
     }

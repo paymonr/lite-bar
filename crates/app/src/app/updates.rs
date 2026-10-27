@@ -7,7 +7,7 @@ use std::time::Duration;
 use lite_bar_core::update::{current_version, newer_release, CheckStart, UpdateState, Version};
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
-use super::{acquire_guard, shell_open, App, UPDATE_TIMER_ID};
+use super::{set_owns_trace, shell_open, App, UPDATE_TIMER_ID};
 use crate::hotkeys::{self, HotkeyId};
 use crate::installer::{spawn_download, swap, InstallError, InstallResult};
 use crate::log;
@@ -119,6 +119,9 @@ impl App {
     /// release newer than the exe on disk is installed, and only from its own URLs; a click
     /// while downloading is ignored.
     pub(super) fn install_update(&mut self) {
+        if self.relaunched {
+            return;
+        }
         let r = match (&self.update, &self.installing) {
             (UpdateState::Available(r), _) => r.clone(),
             (UpdateState::Failed { retry: true, .. }, Some(r)) => r.clone(),
@@ -196,27 +199,30 @@ impl App {
     }
 
     /// Runs Quit's close path (the window's edits, sessions and stats are saved; capture,
-    /// hotkey and tray icon go; the mutex is released), then starts `exe --updated`.
-    /// Returns true when it started. Otherwise this instance carries on as before and asks
-    /// for a manual restart: the new exe is already in place.
+    /// hotkey and tray icon go), then starts `exe --updated <this version>`. Returns true
+    /// when it started: the mutex is kept until this process exits (the new instance waits
+    /// for it) and the panic hook no longer stops the trace. Otherwise this instance carries
+    /// on as before and asks for a manual restart: the new exe is already in place.
     fn relaunch_updated(&mut self, exe: &Path) -> bool {
         let was_on = self.overlay_on;
-        let had_guard = self.guard.is_some();
+        // Before the window closes: a queued second Restart now (or Update now) applied
+        // while it drains is ignored.
+        self.relaunched = true;
         self.close_settings_window_for_exit();
         hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
         self.stop_overlay();
         self.tray.remove();
         self.finish_all_sessions();
-        self.guard = None;
         match (self.relaunch)(exe) {
-            Ok(()) => true,
+            Ok(()) => {
+                set_owns_trace(false);
+                true
+            }
             Err(e) => {
                 log::error(&format!("could not start the updated Lite Bar: {e}"));
+                self.relaunched = false;
                 if let Err(e) = self.tray.add() {
                     log::error(&format!("could not re-add tray icon: {e}"));
-                }
-                if had_guard {
-                    self.guard = acquire_guard();
                 }
                 self.register_hotkey();
                 if was_on {
@@ -231,7 +237,7 @@ impl App {
     /// Restart now: starts the installed update again (after an earlier relaunch failed).
     /// Returns true when it started and this instance should quit.
     pub(super) fn restart_to_update(&mut self) -> bool {
-        if self.update != UpdateState::RestartRequired {
+        if self.relaunched || self.update != UpdateState::RestartRequired {
             return false;
         }
         let Some(exe) = self.exe_path.clone() else {
