@@ -397,6 +397,13 @@ fn all_startup_states() -> Vec<StartupState> {
         StartupState::Off,
         StartupState::OnOtherCopy,
         StartupState::Busy,
-        StartupState::Error("Couldn't change the startup task: schtasks exited with code 1".into()),
+        StartupState::Error {
+            msg: "Couldn't change the startup task: schtasks exited with code 1".into(),
+            actual: Some(true),
+        },
+        StartupState::Error {
+            msg: "Couldn't check the startup task: couldn't run schtasks".into(),
+            actual: None,
+        },
     ]
 }

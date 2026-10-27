@@ -189,9 +189,6 @@ pub struct SettingsView {
     restored: bool,
     /// The preview stage's background, generated once.
     stage_bg: Option<Rc<Vec<u8>>>,
-    /// The Start with Windows switch's last real state (On or Off), kept for while the
-    /// state is busy or a change failed.
-    startup_shown: bool,
     /// The value a click asked for, shown while the change runs.
     startup_target: Option<bool>,
 }
@@ -214,7 +211,6 @@ impl Default for SettingsView {
             nav_scroll: None,
             restored: false,
             stage_bg: None,
-            startup_shown: false,
             startup_target: None,
         }
     }

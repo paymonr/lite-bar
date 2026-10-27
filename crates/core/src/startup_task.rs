@@ -19,8 +19,22 @@ pub enum StartupState {
     OnOtherCopy,
     /// A change or a query is running.
     Busy,
-    /// The last change failed; shown in the error color.
-    Error(String),
+    /// A check or change failed (`msg`, shown in the error color). `actual` is the switch
+    /// value checked afterwards, `None` when it couldn't be checked.
+    Error { msg: String, actual: Option<bool> },
+}
+
+impl StartupState {
+    /// The switch value this state verifies: on for `On`, off for `Off` and `OnOtherCopy`
+    /// (this copy doesn't start), an error's checked value, and `None` while unknown or busy.
+    pub fn actual(&self) -> Option<bool> {
+        match self {
+            StartupState::On => Some(true),
+            StartupState::Off | StartupState::OnOtherCopy => Some(false),
+            StartupState::Error { actual, .. } => *actual,
+            StartupState::Unknown | StartupState::Busy => None,
+        }
+    }
 }
 
 /// `s` with `& < > " '` escaped for XML text and attribute values.
@@ -90,6 +104,18 @@ fn entity(name: &str) -> Option<char> {
 pub fn task_xml(exe_path: &str, user: &str) -> String {
     let user = xml_escape(user);
     let exe = xml_escape(exe_path);
+    // The exe's folder, so relative paths resolve as when it is started by hand.
+    let dir = exe_path
+        .rfind(['\\', '/'])
+        .map(|at| &exe_path[..at])
+        .filter(|d| !d.is_empty())
+        .map(|d| {
+            format!(
+                "\n      <WorkingDirectory>{}</WorkingDirectory>",
+                xml_escape(d)
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -123,7 +149,7 @@ pub fn task_xml(exe_path: &str, user: &str) -> String {
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>{exe}</Command>
+      <Command>{exe}</Command>{dir}
     </Exec>
   </Actions>
 </Task>
@@ -261,6 +287,34 @@ mod tests {
         );
         assert!(!x.contains("Games & Tools"));
         assert_eq!(task_command(&x).as_deref(), Some(EXE));
+    }
+
+    #[test]
+    fn starts_in_the_exe_folder() {
+        let x = task_xml(EXE, USER);
+        assert_eq!(
+            element(element(&x, "Exec"), "WorkingDirectory"),
+            r"C:\Games &amp; Tools\Lite Bar"
+        );
+        let x = task_xml("C:/x/lite-bar.exe", USER);
+        assert_eq!(element(element(&x, "Exec"), "WorkingDirectory"), "C:/x");
+        // No folder in the path: none in the task either.
+        assert!(!task_xml("lite-bar.exe", USER).contains("WorkingDirectory"));
+    }
+
+    #[test]
+    fn actual_is_the_verified_switch_value() {
+        let err = |actual| StartupState::Error {
+            msg: "failed".into(),
+            actual,
+        };
+        assert_eq!(StartupState::On.actual(), Some(true));
+        assert_eq!(StartupState::Off.actual(), Some(false));
+        assert_eq!(StartupState::OnOtherCopy.actual(), Some(false));
+        assert_eq!(StartupState::Unknown.actual(), None);
+        assert_eq!(StartupState::Busy.actual(), None);
+        assert_eq!(err(Some(true)).actual(), Some(true));
+        assert_eq!(err(None).actual(), None);
     }
 
     #[test]

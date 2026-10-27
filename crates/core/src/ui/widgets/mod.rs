@@ -176,6 +176,23 @@ impl Ui<'_> {
         clicked
     }
 
+    /// A switch whose value isn't known: the knob in the middle, dimmed. Takes no clicks.
+    pub fn toggle_mixed(&mut self) {
+        let rect = self.alloc(Some(theme::TOGGLE_W), theme::TOGGLE_H);
+        self.cmds.push(Cmd::Fill {
+            rect,
+            color: theme::BORDER,
+            radius: theme::TOGGLE_H / 2.0,
+        });
+        let knob = theme::TOGGLE_KNOB;
+        let inset = (theme::TOGGLE_H - knob) / 2.0;
+        self.cmds.push(Cmd::Fill {
+            rect: Rect::new(rect.x + (rect.w - knob) / 2.0, rect.y + inset, knob, knob),
+            color: theme::MUTED,
+            radius: knob / 2.0,
+        });
+    }
+
     /// Click or drag to set the value. While active it follows `pointer.x` clamped to
     /// the track, even outside the widget, until the button is released anywhere.
     /// Precision: the value is interpolated in `f32`, so ranges wider than about 2^24

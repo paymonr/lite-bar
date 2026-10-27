@@ -29,6 +29,24 @@ fn toggle_on(p: &Page) -> bool {
         .any(|(r, c, _)| *r == t && *c == theme::ACCENT)
 }
 
+/// Neither on nor off: the knob sits in the middle of the track.
+fn toggle_mixed(p: &Page) -> bool {
+    let t = toggle(p);
+    let knob = fills(p.frame())
+        .into_iter()
+        .find(|(r, _, _)| r.w == theme::TOGGLE_KNOB && t.contains(center(*r)))
+        .expect("the knob")
+        .0;
+    (center(knob).x - center(t).x).abs() < 0.5 && !toggle_on(p)
+}
+
+fn err(msg: &str, actual: Option<bool>) -> StartupState {
+    StartupState::Error {
+        msg: msg.into(),
+        actual,
+    }
+}
+
 fn click_toggle(p: &mut Page) -> Vec<UiAction> {
     let t = toggle(p);
     p.click(center(t))
@@ -94,10 +112,29 @@ fn busy_shows_the_value_being_set() {
     p.startup = StartupState::Busy;
     p.idle();
     assert!(toggle_on(&p));
-    // A failed change goes back to the last real state.
-    p.startup = StartupState::Error("Couldn't change it".into());
+    // A failed change shows the state checked afterwards.
+    p.startup = err("Couldn't change it", Some(false));
     p.idle();
-    assert!(!toggle_on(&p));
+    assert!(!toggle_on(&p) && !toggle_mixed(&p));
+}
+
+#[test]
+fn an_unverified_state_is_neither_on_nor_off() {
+    for state in [
+        StartupState::Unknown,
+        StartupState::Busy,
+        err("Couldn't check the startup task", None),
+    ] {
+        // A fresh window: nothing was verified or clicked yet.
+        let mut p = with_startup(state.clone(), true);
+        assert!(toggle_mixed(&p), "{state:?}");
+        assert!(click_toggle(&mut p).is_empty(), "{state:?}");
+    }
+    // Shown as soon as it is verified.
+    let mut p = with_startup(StartupState::Unknown, true);
+    p.startup = StartupState::On;
+    p.idle();
+    assert!(toggle_on(&p) && !toggle_mixed(&p));
 }
 
 #[test]
@@ -107,6 +144,7 @@ fn hint_and_admin_note() {
         StartupState::Off,
         StartupState::OnOtherCopy,
         StartupState::Unknown,
+        err("failed", None),
     ] {
         for elevated in [true, false] {
             let p = with_startup(state.clone(), elevated);
@@ -124,17 +162,18 @@ fn hint_and_admin_note() {
 
 #[test]
 fn errors_show_in_the_problem_color() {
-    let p = with_startup(StartupState::Error("Couldn't create the task".into()), true);
+    let p = with_startup(err("Couldn't create the task", Some(false)), true);
     let (_, _, color) = find_text(p.frame(), "Couldn't create the task").unwrap();
     assert_eq!(color, Rgba(0xFF, 0x8A, 0x80, 255));
     assert!(find_text(p.frame(), HINT_TEXT).is_some());
 }
 
 #[test]
-fn an_error_still_takes_clicks() {
-    let mut p = with_startup(StartupState::On, true);
-    p.startup = StartupState::Error("failed".into());
-    p.idle();
+fn an_error_with_a_verified_state_shows_it_and_takes_clicks() {
+    let mut p = with_startup(err("failed", Some(true)), true);
     assert!(toggle_on(&p));
     assert_eq!(click_toggle(&mut p), vec![UiAction::SetStartup(false)]);
+    let mut p = with_startup(err("failed", Some(false)), true);
+    assert!(!toggle_on(&p) && !toggle_mixed(&p));
+    assert_eq!(click_toggle(&mut p), vec![UiAction::SetStartup(true)]);
 }

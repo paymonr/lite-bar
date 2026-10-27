@@ -1,5 +1,6 @@
 //! General section: the "Start with Windows" switch, showing whether the logon task really
-//! exists. The host queries and changes the task; while it does, clicks are ignored.
+//! exists. The host queries and changes the task; until a state is verified, and while a
+//! change runs, clicks are ignored.
 
 use super::{
     ellipsize, end_card, setting_row, SettingsView, StartupInput, UiAction, HINT, PROBLEM_TEXT,
@@ -21,21 +22,17 @@ pub(super) fn section(
     out: &mut Vec<UiAction>,
 ) {
     let state = startup.state;
-    // The switch shows the task's real state; while busy the value being set, after a
-    // failure the last real state.
-    match state {
-        StartupState::On => view.startup_shown = true,
-        StartupState::Off | StartupState::OnOtherCopy => view.startup_shown = false,
-        _ => {}
-    }
+    // The switch shows only a verified value: the task's state, an error's checked state,
+    // or while busy the value the click asked for. Anything else is neither on nor off and
+    // takes no clicks.
     if *state != StartupState::Busy {
         view.startup_target = None;
     }
     let shown = match state {
-        StartupState::Busy => view.startup_target.unwrap_or(view.startup_shown),
-        StartupState::Unknown => false,
-        _ => view.startup_shown,
+        StartupState::Busy => view.startup_target,
+        s => s.actual(),
     };
+    let ready = state.actual().is_some();
     let mut lines = vec![STARTUP_HINT];
     match state {
         StartupState::Unknown => lines.push(CHECKING),
@@ -44,7 +41,6 @@ pub(super) fn section(
         StartupState::Off if !startup.elevated => lines.push(STARTUP_ASKS_ADMIN),
         _ => {}
     }
-    let ready = !matches!(state, StartupState::Unknown | StartupState::Busy);
     ui.card(|ui| {
         let stacked = setting_row(
             ui,
@@ -52,15 +48,17 @@ pub(super) fn section(
             Some("Start with Windows"),
             &lines,
             theme::TOGGLE_W,
-            |ui| {
-                let mut v = shown;
-                if ui.toggle(id("settings.startup"), &mut v) && ready {
-                    view.startup_target = Some(v);
-                    out.push(UiAction::SetStartup(v));
+            |ui| match shown {
+                Some(mut v) => {
+                    if ui.toggle(id("settings.startup"), &mut v) && ready {
+                        view.startup_target = Some(v);
+                        out.push(UiAction::SetStartup(v));
+                    }
                 }
+                None => ui.toggle_mixed(),
             },
         );
-        if let StartupState::Error(msg) = state {
+        if let StartupState::Error { msg, .. } = state {
             let text = ellipsize(ui, msg, HINT, ui.available().w);
             let th = ui.text_measure().measure(&text, HINT).1;
             if !stacked {

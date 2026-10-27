@@ -51,14 +51,17 @@ const SHARE_READ: u32 = 0x0000_0001;
 /// How long a non-elevated Lite Bar waits for its elevated helper.
 const HELPER_WAIT_MS: u32 = 60_000;
 
-/// What a job that panicked reports.
-const PANICKED: &str = "Couldn't change the startup task (unexpected error)";
+/// Why a job that panicked failed.
+pub const PANICKED: &str = "unexpected error";
 
 /// What a startup-task job reports.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StartupResult {
-    /// The task's state now (or why a change failed).
-    State(StartupState),
+    /// A plain query's answer. It may be older than a change that started meanwhile, so it
+    /// is dropped while one runs.
+    Query(StartupState),
+    /// The state after a change (or why it failed, with the state checked afterwards).
+    Changed(StartupState),
     /// The user declined the UAC prompt: nothing changed.
     Declined,
 }
@@ -117,8 +120,9 @@ pub fn parse_flag(mut args: impl Iterator<Item = String>) -> Option<Result<bool,
 }
 
 /// schtasks output as text: UTF-16 (with a BOM, or ASCII-looking with zero high bytes)
-/// or UTF-8. `None` when it is neither.
-pub fn decode_output(bytes: &[u8]) -> Option<String> {
+/// or UTF-8. Anything else (the console code page) keeps its ASCII and replaces the rest,
+/// so a path that differs only in non-ASCII letters still differs.
+pub fn decode_output(bytes: &[u8]) -> String {
     let utf16 = |b: &[u8]| {
         let units: Vec<u16> = b
             .as_chunks::<2>()
@@ -126,7 +130,7 @@ pub fn decode_output(bytes: &[u8]) -> Option<String> {
             .iter()
             .map(|c| u16::from_le_bytes(*c))
             .collect();
-        String::from_utf16(&units).ok()
+        String::from_utf16_lossy(&units)
     };
     if let Some(rest) = bytes.strip_prefix(&[0xFF, 0xFE]) {
         return utf16(rest);
@@ -134,7 +138,7 @@ pub fn decode_output(bytes: &[u8]) -> Option<String> {
     if bytes.len() >= 2 && bytes.len().is_multiple_of(2) && bytes[1] == 0 && bytes[0] != 0 {
         return utf16(bytes);
     }
-    String::from_utf8(bytes.to_vec()).ok()
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// Whether the task exists (`schtasks /Query` exits 0).
@@ -145,10 +149,10 @@ pub fn is_enabled(runner: &dyn CommandRunner, schtasks: &str) -> bool {
 /// The task's state for `own_exe`: Off, On, OnOtherCopy, or Error when schtasks can't run.
 pub fn query(runner: &dyn CommandRunner, schtasks: &str, own_exe: &str) -> StartupState {
     match runner.run(schtasks, &query_args()) {
-        Err(e) => StartupState::Error(format!("Couldn't check the startup task: {e}")),
+        Err(e) => check_failed(&e),
         Ok(0) => {
             let xml = match runner.output(schtasks, &query_xml_args()) {
-                Ok((0, out)) => decode_output(&out),
+                Ok((0, out)) => Some(decode_output(&out)),
                 _ => None,
             };
             state_from_query(true, xml.as_deref(), own_exe)
@@ -296,7 +300,7 @@ fn own_exe() -> Result<String, String> {
 pub fn query_now() -> StartupState {
     match own_exe() {
         Ok(exe) => query(&SystemRunner, &schtasks_path(), &exe),
-        Err(e) => StartupState::Error(format!("Couldn't check the startup task: {e}")),
+        Err(e) => check_failed(&e),
     }
 }
 
@@ -340,9 +344,20 @@ pub fn run_mode(flag: Result<bool, String>) -> i32 {
     }
 }
 
-/// The text shown when a change failed.
-fn change_failed(e: &str) -> StartupState {
-    StartupState::Error(format!("Couldn't change the startup task: {e}"))
+/// A query that failed: nothing is verified.
+pub fn check_failed(e: &str) -> StartupState {
+    StartupState::Error {
+        msg: format!("Couldn't check the startup task: {e}"),
+        actual: None,
+    }
+}
+
+/// A change that failed, with the switch value `after` (checked afterwards) verifies.
+pub fn failed_change(e: &str, after: &StartupState) -> StartupState {
+    StartupState::Error {
+        msg: format!("Couldn't change the startup task: {e}"),
+        actual: after.actual(),
+    }
 }
 
 /// Turns the task on or off for this exe and reports the state after. An elevated Lite Bar
@@ -359,10 +374,10 @@ pub fn change(enabled: bool, elevated: bool, parent: usize) -> StartupResult {
 /// An elevated Lite Bar's change: makes it, then reports the state. Blocks.
 fn change_elevated(enabled: bool) -> StartupResult {
     match set_now(enabled) {
-        Ok(()) => StartupResult::State(query_now()),
+        Ok(()) => StartupResult::Changed(query_now()),
         Err(e) => {
             log::warn(&format!("startup task not changed: {e}"));
-            StartupResult::State(change_failed(&e))
+            StartupResult::Changed(failed_change(&e, &query_now()))
         }
     }
 }
@@ -373,7 +388,7 @@ fn change_elevated(enabled: bool) -> StartupResult {
 fn change_via_uac(enabled: bool, parent: usize) -> StartupResult {
     let exe = match own_exe() {
         Ok(exe) => exe,
-        Err(e) => return StartupResult::State(change_failed(&e)),
+        Err(e) => return StartupResult::Changed(failed_change(&e, &query_now())),
     };
     let file = HSTRING::from(exe.as_str());
     let params = HSTRING::from(format!(
@@ -409,7 +424,7 @@ fn change_via_uac(enabled: bool, parent: usize) -> StartupResult {
         log::warn(&format!(
             "startup task: couldn't start the elevated helper: {e}"
         ));
-        return StartupResult::State(change_failed(&e.message()));
+        return StartupResult::Changed(failed_change(&e.message(), &query_now()));
     }
     let mut code = 1u32;
     if !info.hProcess.is_invalid() {
@@ -421,26 +436,32 @@ fn change_via_uac(enabled: bool, parent: usize) -> StartupResult {
             let _ = CloseHandle(info.hProcess);
         }
     }
+    // Checked after the helper, also when it failed or is still running (timed out), so
+    // the switch shows what is really there.
     let state = query_now();
-    if code != 0 && !matches!(state, StartupState::Error(_)) {
+    if code != 0 {
         log::warn(&format!(
-            "startup task: the elevated helper exited with {code}"
+            "startup task: the elevated helper exited with {code} (or didn't finish)"
         ));
-        return StartupResult::State(change_failed("see lite-bar.log"));
+        return StartupResult::Changed(failed_change("see lite-bar.log", &state));
     }
-    StartupResult::State(state)
+    StartupResult::Changed(state)
 }
 
-/// Starts `job` on a new thread and posts its result (a failure if it panics) to `owner`.
-/// Returns false when the thread could not be started.
-pub fn spawn(owner: HWND, job: impl FnOnce() -> StartupResult + Send + 'static) -> bool {
+/// Starts `job` on a new thread and posts its result, or `if_panics` if it panics, to
+/// `owner`. Returns false when the thread could not be started.
+pub fn spawn(
+    owner: HWND,
+    job: impl FnOnce() -> StartupResult + Send + 'static,
+    if_panics: StartupResult,
+) -> bool {
     // HWND is not Send; the worker only posts to it.
     let raw = owner.0 as usize;
     std::thread::Builder::new()
         .name(WORKER_THREAD.into())
         .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
-                .unwrap_or_else(|_| StartupResult::State(StartupState::Error(PANICKED.into())));
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).unwrap_or(if_panics);
             post_boxed(HWND(raw as *mut c_void), WM_STARTUP_RESULT, result);
         })
         .is_ok()
@@ -576,7 +597,10 @@ mod tests {
         assert_eq!(query(&r, SCHTASKS, EXE), StartupState::On);
 
         let r = FakeRunner::new(vec![Err("cannot start".into())]);
-        assert!(matches!(query(&r, SCHTASKS, EXE), StartupState::Error(_)));
+        assert!(matches!(
+            query(&r, SCHTASKS, EXE),
+            StartupState::Error { actual: None, .. }
+        ));
     }
 
     #[test]
@@ -647,12 +671,50 @@ mod tests {
 
     #[test]
     fn decodes_schtasks_output() {
-        assert_eq!(decode_output(b"<Task/>").as_deref(), Some("<Task/>"));
-        assert_eq!(decode_output(&utf16_bom("<Ü/>")).as_deref(), Some("<Ü/>"));
+        assert_eq!(decode_output(b"<Task/>"), "<Task/>");
+        assert_eq!(decode_output(&utf16_bom("<Ü/>")), "<Ü/>");
         let no_bom: Vec<u8> = "<T/>".encode_utf16().flat_map(u16::to_le_bytes).collect();
-        assert_eq!(decode_output(&no_bom).as_deref(), Some("<T/>"));
-        // Console code page bytes that are not UTF-8.
-        assert_eq!(decode_output(&[b'<', 0xDC, b'>']), None);
+        assert_eq!(decode_output(&no_bom), "<T/>");
+        // Console code page bytes that are not UTF-8: replaced, the rest kept.
+        assert_eq!(decode_output(&[b'<', 0xDC, b'>']), "<\u{FFFD}>");
+    }
+
+    #[test]
+    fn a_task_for_a_non_ascii_copy_is_still_another_copy() {
+        // schtasks prints "C:\Spiele\Ü\lite-bar.exe" in code page 850 (Ü = 0x9A).
+        let mut out = b"<Task><Actions><Exec><Command>C:\\Spiele\\".to_vec();
+        out.push(0x9A);
+        out.extend_from_slice(b"\\lite-bar.exe</Command></Exec></Actions></Task>");
+        let r = FakeRunner::new(vec![exit(0), Ok((0, out.clone()))]);
+        assert_eq!(query(&r, SCHTASKS, EXE), StartupState::OnOtherCopy);
+        // Our own non-ASCII path can't be compared: on.
+        let r = FakeRunner::new(vec![exit(0), Ok((0, out))]);
+        assert_eq!(
+            query(&r, SCHTASKS, r"C:\Spiele\Ü\lite-bar.exe"),
+            StartupState::On
+        );
+    }
+
+    #[test]
+    fn a_failed_change_carries_the_state_checked_after() {
+        assert_eq!(
+            failed_change("boom", &StartupState::On),
+            StartupState::Error {
+                msg: "Couldn't change the startup task: boom".into(),
+                actual: Some(true),
+            }
+        );
+        let unknown = StartupState::Error {
+            msg: "Couldn't check the startup task: x".into(),
+            actual: None,
+        };
+        assert_eq!(
+            failed_change("boom", &unknown),
+            StartupState::Error {
+                msg: "Couldn't change the startup task: boom".into(),
+                actual: None,
+            }
+        );
     }
 
     #[test]
@@ -718,12 +780,11 @@ mod tests {
             }
             None
         };
-        assert!(spawn(w.0, || StartupResult::Declined));
+        let failed = || StartupResult::Query(StartupState::Unknown);
+        assert!(spawn(w.0, || StartupResult::Declined, failed()));
         assert_eq!(wait(), Some(StartupResult::Declined));
-        assert!(spawn(w.0, || panic!("boom")));
-        assert!(matches!(
-            wait(),
-            Some(StartupResult::State(StartupState::Error(_)))
-        ));
+        // A panic posts what the caller said it should.
+        assert!(spawn(w.0, || panic!("boom"), failed()));
+        assert_eq!(wait(), Some(failed()));
     }
 }

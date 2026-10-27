@@ -1137,7 +1137,10 @@ mod app {
                 // Tests never touch the real scheduled task.
                 startup_query: || StartupState::Off,
                 startup_change: |_, _, _| {
-                    StartupResult::State(StartupState::Error("tests never change it".into()))
+                    StartupResult::Changed(StartupState::Error {
+                        msg: "tests never change it".into(),
+                        actual: None,
+                    })
                 },
             };
             (app, owner)
@@ -2424,7 +2427,7 @@ mod app {
             app.elevated = true;
             app.startup_change = |on, elevated, _| {
                 ELEVATED_CALLS.lock().unwrap().push((on, elevated));
-                StartupResult::State(if on {
+                StartupResult::Changed(if on {
                     StartupState::On
                 } else {
                     StartupState::Off
@@ -2443,6 +2446,45 @@ mod app {
             assert_eq!(shown_startup(&app), StartupState::On);
             assert_eq!(*ELEVATED_CALLS.lock().unwrap(), vec![(true, true)]);
             assert!(wait_startup_msg(app.hwnd, Duration::from_millis(200)).is_none());
+        }
+
+        #[test]
+        fn a_stale_query_result_does_not_end_a_change() {
+            let dir = TempDir::new("startup-stale-query");
+            let (mut app, _owner) = test_app(dir.path());
+            app.startup_change = |_, _, _| StartupResult::Declined;
+            app.open_settings_hidden();
+            apply_startup_result(&mut app);
+            assert_eq!(app.startup, StartupState::Off);
+            // Reopened: a query is under way when the switch is clicked.
+            app.apply_ui_action(UiAction::SetStartup(true));
+            assert_eq!(app.startup, StartupState::Busy);
+            app.on_startup_result(StartupResult::Query(StartupState::Off));
+            assert_eq!(app.startup, StartupState::Busy);
+            assert_eq!(shown_startup(&app), StartupState::Busy);
+            // Still busy: a second click is ignored.
+            app.startup_before = StartupState::Unknown;
+            app.apply_ui_action(UiAction::SetStartup(false));
+            assert_eq!(app.startup_before, StartupState::Unknown);
+            app.on_startup_result(StartupResult::Changed(StartupState::On));
+            assert_eq!(app.startup, StartupState::On);
+            assert_eq!(shown_startup(&app), StartupState::On);
+            // Drain what the fake change posted.
+            let _ = wait_startup_msg(app.hwnd, Duration::from_secs(5));
+        }
+
+        #[test]
+        fn a_failed_change_shows_the_checked_state() {
+            let dir = TempDir::new("startup-failed-change");
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            apply_startup_result(&mut app);
+            let failed = StartupState::Error {
+                msg: "Couldn't change the startup task: see lite-bar.log".into(),
+                actual: Some(false),
+            };
+            app.on_startup_result(StartupResult::Changed(failed.clone()));
+            assert_eq!(shown_startup(&app), failed);
         }
 
         static UAC_CALLS: Mutex<Vec<(bool, bool)>> = Mutex::new(Vec::new());

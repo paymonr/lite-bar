@@ -86,6 +86,9 @@ FPS capture needs administrator rights, so Lite Bar starts at sign-in through a 
 - The switch shows whether the task really exists. Lite Bar checks it when the window opens and after each change.
 - If Lite Bar is already running as administrator, the switch changes the task directly. If not, Lite Bar starts `lite-bar.exe --startup on` (or `off`) as administrator, so you see one UAC prompt. That process changes the task and exits. Declining the prompt leaves everything as it was. After that, every sign-in starts Lite Bar elevated with no prompt.
 - The task starts the `lite-bar.exe` it was created from. **Update now** replaces that file in place, so the task keeps working after updates. If you move `lite-bar.exe`, the switch shows "On (points to another copy)". Turn it on again to point the task at the copy you're running.
+- Until Lite Bar has checked the task, the switch sits in the middle and ignores clicks. If a change fails, the switch shows what the task looks like after the failed attempt.
+- If Windows refuses a non-elevated Lite Bar's check, the switch may show off even though the task exists. Turning it on is still safe: it re-creates the same task.
+- On an account that isn't an administrator, the UAC prompt asks for an administrator's password ("over the shoulder"). The task then belongs to that administrator account and starts Lite Bar at *their* sign-in, not yours. Turn the switch on from your own administrator account instead.
 - To remove the task by hand, run this from an administrator prompt: `schtasks /Delete /TN "Lite Bar" /F`.
 
 ### Files
