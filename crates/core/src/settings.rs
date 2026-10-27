@@ -89,6 +89,18 @@ impl Default for HotkeySettings {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+pub struct UpdateSettings {
+    /// Check GitHub for a newer release shortly after start and then daily.
+    pub check: bool,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        UpdateSettings { check: true }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Default, Serialize)]
 pub struct Settings {
     pub overlay: OverlaySettings,
@@ -98,6 +110,7 @@ pub struct Settings {
     pub game_names: BTreeMap<String, String>,
     /// Colors saved in the settings window's picker, oldest first, at most `MAX_SAVED_COLORS`.
     pub saved_colors: Vec<Rgb>,
+    pub updates: UpdateSettings,
 }
 
 /// Most colors kept in `[colors] saved`.
@@ -214,6 +227,11 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
         settings.hotkeys.toggle_overlay = v;
     }
 
+    let updates = read_section(&root, "updates", &mut warnings);
+    if let Some(v) = read_field(&updates, "updates", "check", &mut warnings) {
+        settings.updates.check = v;
+    }
+
     let colors = read_section(&root, "colors", &mut warnings);
     if let Some(entries) = read_field::<Vec<toml::Value>>(&colors, "colors", "saved", &mut warnings)
     {
@@ -289,6 +307,11 @@ toggle_overlay = "Ctrl+Alt+Shift+L"
 [colors]
 # Colors saved in the settings window's color picker, as "#RRGGBB" (at most 16).
 saved = []
+
+[updates]
+# Check GitHub for a newer Lite Bar shortly after start and then once a day: true or false.
+# Nothing is downloaded or installed until you click "Update now".
+check = true
 
 [game_names]
 # Display names used in the game stats files (games.csv, sessions.csv). The key is an exe
@@ -509,5 +532,30 @@ mod tests {
     fn unknown_keys_are_ignored() {
         let (_, w) = parse_settings("[mixer]\nfoo = 1\n[overlay]\nmode = \"stacked\"\n");
         assert!(w.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod updates_tests {
+    use super::*;
+
+    #[test]
+    fn updates_check_defaults_true_and_parses() {
+        assert!(Settings::default().updates.check);
+        let (s, w) = parse_settings("[updates]\ncheck = false\n");
+        assert!(!s.updates.check);
+        assert!(w.is_empty(), "{w:?}");
+        let (s, w) = parse_settings("[updates]\ncheck = \"yes\"\n");
+        assert!(s.updates.check);
+        assert!(w[0].contains("updates.check"));
+    }
+
+    #[test]
+    fn template_documents_updates_check() {
+        let t = default_settings_toml();
+        let lines: Vec<&str> = t.lines().collect();
+        assert!(lines.contains(&"[updates]"));
+        let at = lines.iter().position(|l| *l == "check = true").unwrap();
+        assert!(lines[at - 1].starts_with('#'));
     }
 }

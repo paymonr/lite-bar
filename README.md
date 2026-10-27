@@ -102,6 +102,12 @@ Hotkey syntax: zero or more modifiers (`Ctrl`, `Alt`, `Shift`, `Win`) and exactl
 | --- | --- | --- |
 | `saved` | list of `"#RRGGBB"` colors saved in the settings window's color picker, at most 16 (extra and invalid entries are ignored with a warning) | `[]` |
 
+`[updates]`
+
+| Key | Type and values | Default |
+| --- | --- | --- |
+| `check` | bool; check GitHub for a newer release about 30 s after start and then every 24 h. Nothing is downloaded or installed until you click **Update now** | `true` |
+
 `[game_names]`
 
 Optional display names for games, used in the game stats files (`games.csv` and `sessions.csv`). Each key is an exe file name or a full path (a full path wins over a file name), and each value is the name to use. Use a single-quoted string for a path so backslashes need no escaping. There are no entries by default. A value that is not a string is ignored with a warning.

@@ -23,7 +23,8 @@ pub enum SettingsChange {
     CounterSize(u16),
     TextSize(u16),
     SavedColors(Vec<Rgb>),
-    /// Resets `overlay` and `hotkeys`; keeps `game_names` and `saved_colors`.
+    CheckUpdates(bool),
+    /// Resets `overlay`, `hotkeys` and `updates`; keeps `game_names` and `saved_colors`.
     RestoreDefaults,
     ToggleHotkey(Hotkey),
     /// `None` removes the override.
@@ -54,10 +55,12 @@ pub fn apply_change(settings: &mut Settings, change: &SettingsChange) {
         SettingsChange::SavedColors(v) => {
             settings.saved_colors = last_saved(v).to_vec();
         }
+        SettingsChange::CheckUpdates(v) => settings.updates.check = *v,
         SettingsChange::RestoreDefaults => {
             let d = Settings::default();
             settings.overlay = d.overlay;
             settings.hotkeys = d.hotkeys;
+            settings.updates = d.updates;
         }
         SettingsChange::ToggleHotkey(v) => settings.hotkeys.toggle_overlay = *v,
         SettingsChange::GameName { exe_path, name } => match name {
@@ -132,6 +135,7 @@ fn edit_doc(doc: &mut DocumentMut, change: &SettingsChange) -> Result<(), String
             let array: Array = last_saved(v).iter().map(|c| c.to_hex()).collect();
             set(doc, "colors", "saved", array.into())
         }
+        SettingsChange::CheckUpdates(v) => set(doc, "updates", "check", (*v).into()),
         SettingsChange::RestoreDefaults => {
             let d = OverlaySettings::default();
             edit_doc(doc, &SettingsChange::Visible(d.visible))?;
@@ -147,7 +151,11 @@ fn edit_doc(doc: &mut DocumentMut, change: &SettingsChange) -> Result<(), String
             edit_doc(doc, &SettingsChange::CounterSize(d.counter_size))?;
             edit_doc(doc, &SettingsChange::TextSize(d.text_size))?;
             let hotkey = Settings::default().hotkeys.toggle_overlay;
-            edit_doc(doc, &SettingsChange::ToggleHotkey(hotkey))
+            edit_doc(doc, &SettingsChange::ToggleHotkey(hotkey))?;
+            edit_doc(
+                doc,
+                &SettingsChange::CheckUpdates(Settings::default().updates.check),
+            )
         }
         SettingsChange::ToggleHotkey(v) => {
             set(doc, "hotkeys", "toggle_overlay", v.to_string().into())
@@ -440,6 +448,17 @@ mod tests {
     }
 
     #[test]
+    fn check_updates_edit_and_restore() {
+        let out = edit_settings_text("", &[SettingsChange::CheckUpdates(false)]).unwrap();
+        assert!(!parse_settings(&out).0.updates.check);
+        let out = edit_settings_text(&out, &[SettingsChange::RestoreDefaults]).unwrap();
+        assert!(parse_settings(&out).0.updates.check);
+        let mut s = parse_settings("[updates]\ncheck = false\n").0;
+        apply_change(&mut s, &SettingsChange::RestoreDefaults);
+        assert!(s.updates.check);
+    }
+
+    #[test]
     fn invalid_toml_is_err() {
         assert!(edit_settings_text("this = = [", &[SettingsChange::Visible(true)]).is_err());
     }
@@ -497,6 +516,8 @@ mod tests {
             SettingsChange::BackgroundOpacity(77),
             SettingsChange::CounterSize(72),
             SettingsChange::TextSize(6),
+            SettingsChange::CheckUpdates(false),
+            SettingsChange::CheckUpdates(true),
             SettingsChange::SavedColors(vec![rgb("#ABCDEF"), rgb("#123456")]),
             SettingsChange::SavedColors(vec![]),
             SettingsChange::SavedColors((0..20).map(|i| Rgb { r: 0, g: 0, b: i }).collect()),

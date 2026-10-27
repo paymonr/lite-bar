@@ -13,3 +13,4 @@ pub mod settings;
 pub mod settings_edit;
 pub mod settings_ui;
 pub mod ui;
+pub mod update;
