@@ -145,7 +145,7 @@ pub fn task_xml(exe_path: &str, user: &str) -> String {
     <Enabled>true</Enabled>
     <Hidden>false</Hidden>
     <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
+    <Priority>5</Priority>
   </Settings>
   <Actions Context="Author">
     <Exec>
@@ -271,11 +271,18 @@ mod tests {
         assert_eq!(element(settings, "DisallowStartIfOnBatteries"), "false");
         assert_eq!(element(settings, "StopIfGoingOnBatteries"), "false");
         assert_eq!(element(settings, "ExecutionTimeLimit"), "PT0S");
-        assert_eq!(element(settings, "Priority"), "7");
         assert_eq!(element(settings, "StartWhenAvailable"), "false");
         assert_eq!(element(settings, "AllowHardTerminate"), "true");
         assert!(x.contains(r#"<Actions Context="Author">"#));
         assert!(x.contains(r#"<Principal id="Author">"#));
+    }
+
+    #[test]
+    fn task_runs_at_normal_priority() {
+        // 7 is below normal (CPU, I/O and memory) and would be inherited
+        // by the `--updated` relaunch; 5 is normal.
+        let x = task_xml(EXE, USER);
+        assert_eq!(element(element(&x, "Settings"), "Priority"), "5");
     }
 
     #[test]
