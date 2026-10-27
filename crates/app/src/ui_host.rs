@@ -18,7 +18,8 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, EndPaint, InvalidateRect, HDC, PAINTSTRUCT, SRCCOPY,
+    BeginPaint, BitBlt, EndPaint, GetMonitorInfoW, InvalidateRect, MonitorFromPoint, HDC,
+    MONITORINFO, MONITOR_DEFAULTTOPRIMARY, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, SetClipboardData,
@@ -27,20 +28,22 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, GMEM_MOVEABLE,
 };
-use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
+use windows::Win32::UI::HiDpi::{
+    AdjustWindowRectExForDpi, GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
     VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, IsIconic,
-    KillTimer, LoadCursorW, RegisterClassExW, SetCursor, SetForegroundWindow, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, CW_USEDEFAULT, GWLP_USERDATA, HCURSOR, HTCLIENT,
-    IDC_ARROW, IDC_HAND, IDC_IBEAM, MINMAXINFO, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER,
-    SW_RESTORE, SW_SHOW, WINDOW_EX_STYLE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE,
-    WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
-    WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetWindowLongPtrW,
+    IsIconic, KillTimer, LoadCursorW, RegisterClassExW, SetCursor, SetForegroundWindow, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA, HCURSOR, HTCLIENT, IDC_ARROW,
+    IDC_HAND, IDC_IBEAM, MINMAXINFO, SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, SW_SHOW,
+    WINDOW_EX_STYLE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE,
+    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::log;
@@ -101,6 +104,36 @@ fn to_utf16z(s: &str) -> Vec<u16> {
 fn from_utf16z(w: &[u16]) -> String {
     let end = w.iter().position(|&u| u == 0).unwrap_or(w.len());
     String::from_utf16_lossy(&w[..end])
+}
+
+thread_local! {
+    /// True while `UiApp::frame` or `UiApp::closed` runs on this thread (a panic there is
+    /// caught by the host and must not end the app).
+    static IN_UI_FRAME: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether a `UiApp` callback is running on this thread (read by the panic hook).
+pub fn in_ui_frame() -> bool {
+    IN_UI_FRAME.get()
+}
+
+/// Runs `f` with `in_ui_frame()` true; resets the flag even when `f` unwinds.
+fn as_ui_frame<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            IN_UI_FRAME.set(self.0);
+        }
+    }
+    let _reset = Reset(IN_UI_FRAME.replace(true));
+    f()
+}
+
+/// Top-left corner that centres a `size` window in `work`, kept inside it when too big.
+fn centered_in(work: RECT, size: (i32, i32)) -> (i32, i32) {
+    let x = work.left + ((work.right - work.left - size.0) / 2).max(0);
+    let y = work.top + ((work.bottom - work.top - size.1) / 2).max(0);
+    (x, y)
 }
 
 /// One Win32 input message, already converted to DIPs.
@@ -216,8 +249,6 @@ const WM_MOUSELEAVE: u32 = 0x02A3;
 const CF_UNICODETEXT: u32 = 13;
 const BLINK_TIMER: usize = 1;
 const REDRAW_TIMER: usize = 2;
-/// The window never gets smaller than this client size (or the size it opened at, if smaller).
-const MIN_CLIENT_DIP: (f32, f32) = (480.0, 320.0);
 
 /// `Clipboard` over the Win32 clipboard, as `CF_UNICODETEXT`.
 struct WinClipboard {
@@ -345,11 +376,13 @@ impl Host {
         } = self;
         let measure = painter.measurer(scale);
         let frame = catch_unwind(AssertUnwindSafe(|| {
-            let mut ui = Ui::new(&measure, input, state, area);
-            ui.scale = scale;
-            ui.clipboard = Some(clipboard);
-            app.frame(&mut ui);
-            ui.finish()
+            as_ui_frame(|| {
+                let mut ui = Ui::new(&measure, input, state, area);
+                ui.scale = scale;
+                ui.clipboard = Some(clipboard);
+                app.frame(&mut ui);
+                ui.finish()
+            })
         }));
         let Ok(frame) = frame else {
             log::error("settings window: a frame panicked; closing the window");
@@ -471,7 +504,7 @@ impl Shared {
         self.open.set(false);
         if let Some(mut host) = host {
             host.kill_timers();
-            if catch_unwind(AssertUnwindSafe(|| host.app.closed())).is_err() {
+            if catch_unwind(AssertUnwindSafe(|| as_ui_frame(|| host.app.closed()))).is_err() {
                 log::error("settings window: closed() panicked");
             }
             drop(host);
@@ -508,6 +541,35 @@ fn register_window_class() {
             RegisterClassExW(&class);
         }
     });
+}
+
+/// Work area and effective DPI of the monitor under the cursor.
+fn cursor_monitor() -> (RECT, u32) {
+    // SAFETY: plain FFI with valid, initialised out-parameters.
+    unsafe {
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let work = if GetMonitorInfoW(monitor, &mut info).as_bool() {
+            info.rcWork
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1024,
+                bottom: 768,
+            }
+        };
+        let (mut dpi, mut dpi_y) = (0u32, 0u32);
+        if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi, &mut dpi_y).is_err() || dpi == 0 {
+            dpi = 96;
+        }
+        (work, dpi)
+    }
 }
 
 /// Window size in pixels for a client size in DIPs at `dpi`.
@@ -761,33 +823,50 @@ pub struct UiWindow {
 }
 
 impl UiWindow {
+    /// Opens a window with a `size_dip` client area, centred on the monitor under the cursor;
+    /// it can't be resized below `min_dip`.
     pub fn open(
         title: &str,
         size_dip: (f32, f32),
+        min_dip: (f32, f32),
         app: Box<dyn UiApp>,
     ) -> windows::core::Result<UiWindow> {
-        UiWindow::create(title, size_dip, app, true)
+        UiWindow::create(title, size_dip, min_dip, app, true)
+    }
+
+    /// `open`, but never shown (tests drive it with messages).
+    #[cfg(test)]
+    pub fn open_hidden(
+        title: &str,
+        size_dip: (f32, f32),
+        min_dip: (f32, f32),
+        app: Box<dyn UiApp>,
+    ) -> windows::core::Result<UiWindow> {
+        UiWindow::create(title, size_dip, min_dip, app, false)
     }
 
     fn create(
         title: &str,
         size_dip: (f32, f32),
+        min_dip: (f32, f32),
         app: Box<dyn UiApp>,
         show: bool,
     ) -> windows::core::Result<UiWindow> {
         register_window_class();
         let title = HSTRING::from(title);
+        let (work, monitor_dpi) = cursor_monitor();
         // SAFETY: plain FFI; the window is destroyed by PendingWindow on every error path.
         unsafe {
+            // Created on the cursor's monitor so it gets that monitor's DPI.
             let hwnd = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
                 CLASS_NAME,
                 &title,
                 WS_OVERLAPPEDWINDOW,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
+                work.left,
+                work.top,
+                window_size_for_client(size_dip, monitor_dpi).0,
+                window_size_for_client(size_dip, monitor_dpi).1,
                 None,
                 None,
                 Some(GetModuleHandleW(None)?.into()),
@@ -796,15 +875,8 @@ impl UiWindow {
             let pending = PendingWindow(hwnd);
             let dpi = GetDpiForWindow(hwnd);
             let (w, h) = window_size_for_client(size_dip, dpi);
-            SetWindowPos(
-                hwnd,
-                None,
-                0,
-                0,
-                w,
-                h,
-                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
-            )?;
+            let (x, y) = centered_in(work, (w, h));
+            SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE)?;
             let dark = BOOL(1);
             if let Err(e) = DwmSetWindowAttribute(
                 hwnd,
@@ -839,10 +911,7 @@ impl UiWindow {
                 failed: Cell::new(false),
                 close_pending: Cell::new(false),
                 destroyed: Cell::new(false),
-                min_client_dip: (
-                    MIN_CLIENT_DIP.0.min(size_dip.0),
-                    MIN_CLIENT_DIP.1.min(size_dip.1),
-                ),
+                min_client_dip: (min_dip.0.min(size_dip.0), min_dip.1.min(size_dip.1)),
             });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::into_raw(shared.clone()) as isize);
             std::mem::forget(pending);
@@ -890,7 +959,7 @@ impl UiWindow {
     }
 
     #[cfg(test)]
-    fn hwnd(&self) -> HWND {
+    pub fn hwnd(&self) -> HWND {
         self.hwnd
     }
 
@@ -943,6 +1012,28 @@ mod tests {
         assert_eq!(dip_to_px(13.0, 1.25), 16); // 16.25 rounds down
         assert_eq!(dip_to_px(10.0, 1.25), 13); // 12.5 rounds up
         assert_eq!(px_to_dip(150, 1.5), 100.0);
+    }
+
+    #[test]
+    fn window_is_centred_in_the_work_area() {
+        let work = RECT {
+            left: 1920,
+            top: 0,
+            right: 3840,
+            bottom: 1040,
+        };
+        assert_eq!(centered_in(work, (900, 660)), (1920 + 510, 190));
+        // Bigger than the work area: pinned to its top-left corner.
+        assert_eq!(centered_in(work, (2000, 1200)), (1920, 0));
+    }
+
+    #[test]
+    fn ui_frame_flag_resets_after_a_panic() {
+        assert!(!in_ui_frame());
+        assert!(as_ui_frame(in_ui_frame));
+        let r = catch_unwind(|| as_ui_frame(|| panic!("frame bug")));
+        assert!(r.is_err());
+        assert!(!in_ui_frame());
     }
 
     #[test]
@@ -1114,11 +1205,13 @@ mod win_tests {
 
     impl UiApp for TestApp {
         fn frame(&mut self, ui: &mut Ui) {
+            assert!(in_ui_frame(), "frame runs flagged");
             self.frames.set(self.frames.get() + 1);
             ui.label("x", TextStyle::BODY, self.color);
             ui.button(id("ok"), "OK");
         }
         fn closed(&mut self) {
+            assert!(in_ui_frame(), "closed runs flagged");
             self.closed.set(self.closed.get() + 1);
         }
     }
@@ -1131,7 +1224,14 @@ mod win_tests {
             closed: closed.clone(),
             color,
         };
-        let w = UiWindow::create("Lite Bar test", (300.0, 200.0), Box::new(app), false).unwrap();
+        let w = UiWindow::create(
+            "Lite Bar test",
+            (300.0, 200.0),
+            (480.0, 320.0),
+            Box::new(app),
+            false,
+        )
+        .unwrap();
         (w, frames, closed)
     }
 
@@ -1145,16 +1245,47 @@ mod win_tests {
 
     #[test]
     fn window_opens_paints_and_closes() {
-        let (w, frames, _) = open_test(RED);
+        let (w, frames, closed) = open_test(RED);
         assert!(w.is_open());
         send(&w, WM_PAINT, 0, 0);
         assert!(frames.get() >= 1);
+        assert!(!in_ui_frame(), "flag cleared after the frame");
         // The window is cleared to the theme background.
         assert_eq!(w.pixel(250, 150), Some(colorref(theme::BG)));
         let hwnd = w.hwnd();
         w.close();
         assert!(!w.is_open());
         assert!(!unsafe { IsWindow(Some(hwnd)) }.as_bool());
+        assert_eq!(closed.get(), 1);
+        assert!(!in_ui_frame());
+    }
+
+    #[test]
+    fn minimum_track_size_is_the_given_minimum() {
+        let frames = Rc::new(Cell::new(0));
+        let closed = Rc::new(Cell::new(0));
+        let app = TestApp {
+            frames,
+            closed,
+            color: RED,
+        };
+        let w =
+            UiWindow::create("t", (900.0, 660.0), (720.0, 520.0), Box::new(app), false).unwrap();
+        let mut info = MINMAXINFO::default();
+        send(
+            &w,
+            WM_GETMINMAXINFO,
+            0,
+            &mut info as *mut MINMAXINFO as isize,
+        );
+        let dpi = unsafe { GetDpiForWindow(w.hwnd()) };
+        let (mw, mh) = window_size_for_client((720.0, 520.0), dpi);
+        assert_eq!((info.ptMinTrackSize.x, info.ptMinTrackSize.y), (mw, mh));
+        // Opened at its default size, which is at least the minimum.
+        let mut r = RECT::default();
+        unsafe { GetClientRect(w.hwnd(), &mut r) }.unwrap();
+        let s = scale_for_dpi(dpi);
+        assert_eq!(r.right - r.left, dip_to_px(900.0, s));
     }
 
     #[test]
@@ -1234,6 +1365,7 @@ mod win_tests {
         let w = UiWindow::create(
             "t",
             (300.0, 200.0),
+            (480.0, 320.0),
             Box::new(ButtonApp {
                 clicks: clicks.clone(),
             }),
@@ -1265,6 +1397,7 @@ mod win_tests {
         let w = UiWindow::create(
             "t",
             (300.0, 200.0),
+            (480.0, 320.0),
             Box::new(FieldApp { edit: edit.clone() }),
             false,
         )
@@ -1319,6 +1452,7 @@ mod win_tests {
         let w = UiWindow::create(
             "t",
             (300.0, 200.0),
+            (480.0, 320.0),
             Box::new(SelfClosingApp {
                 hwnd: hwnd.clone(),
                 closed: closed.clone(),
@@ -1352,6 +1486,7 @@ mod win_tests {
         let w = UiWindow::create(
             "t",
             (300.0, 200.0),
+            (480.0, 320.0),
             Box::new(PanicApp {
                 closed: closed.clone(),
             }),

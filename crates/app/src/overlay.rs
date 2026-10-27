@@ -154,6 +154,19 @@ impl Overlay {
         }
     }
 
+    /// Redraws now with the current text (e.g. right after `set_settings`). Hidden: nothing
+    /// to do, the next `show` draws.
+    pub fn redraw(&mut self) {
+        if self.visible {
+            self.refresh();
+        }
+    }
+
+    #[cfg(test)]
+    pub fn settings(&self) -> &OverlaySettings {
+        &self.settings
+    }
+
     /// Sets the FPS text and the stats line (`None`, or a settings layout of `Off`, draws the
     /// plain counter) and re-runs placement. Only redraws when the FPS text, the stats text,
     /// the settings or the DPI changed.

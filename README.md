@@ -36,9 +36,29 @@ FPS capture needs an elevated (administrator) run in M1.
 
 Lite Bar lives in the system tray and shows an FPS overlay for the foreground application. It shows `—` while the foreground application is not presenting frames. Quit it from the tray icon: right-click, then **Quit**.
 
-The tray menu also has **Open settings file**, **Open game stats** (see [Stats and history](#stats-and-history)), and **Reload settings**, which re-reads the settings file and keeps the current on/off state of the overlay.
+The tray menu, top to bottom:
+
+- **Settings…** (bold; double-clicking the tray icon does the same) opens the [settings window](#settings-window).
+- **Show FPS overlay** / **Hide FPS overlay**, with the toggle hotkey beside it (marked unavailable if another app holds it).
+- **Open settings file** opens `settings.toml` in its default program.
+- **Open game stats** (see [Stats and history](#stats-and-history)).
+- **Reload settings** re-reads the settings file (and refreshes the settings window if it is open), keeping the current on/off state of the overlay.
+- **Restart as administrator to show FPS**, only when capture needs it.
+- **Quit** (closes the settings window first, which saves its last changes).
 
 The overlay toggles with `Ctrl+Alt+Shift+L` by default.
+
+### Settings window
+
+**Settings…** opens a window with every setting and a live preview of the counter. A second **Settings…** brings the open window to the front. Every change shows on the overlay straight away and is written to `settings.toml` 300 ms after the last change. Only the changed values are rewritten: your comments, blank lines and key order stay as they are. If the file has become invalid TOML, the change stays in effect until Lite Bar quits but is not written, and a warning goes to the log.
+
+- **Overlay**: show or hide the counter, its location on screen, and the statistics layout.
+- **Appearance**: number, text and background colors (hex fields, a color wheel, default chips and up to 16 saved colors; right-click a saved color to remove it), background opacity, counter size and text size.
+- **Hotkeys**: click the field and press the new combination; Esc cancels. A combination another app already holds is refused with "Already used by another app" and the old hotkey stays.
+- **Game names**: rename any game you've played. The name is saved under `[game_names]` and `games.csv` is regenerated; **Open stats folder** opens the stats folder.
+- **Restore defaults** (click twice) puts every overlay setting and the hotkey back to how Lite Bar ships. Game names and saved colors are kept.
+
+The window takes about 10–20 MB while open; closing it frees all of it.
 
 ### Files
 
@@ -48,7 +68,7 @@ The overlay toggles with `Ctrl+Alt+Shift+L` by default.
 | Log | `%APPDATA%\LiteBar\lite-bar.log` |
 | Game stats | `%APPDATA%\LiteBar\stats\` (see [Stats and history](#stats-and-history)) |
 
-The settings file is created with the default values and a comment for every key on first run and is never overwritten afterwards. An invalid value falls back to its default and a warning is written to the log. Unknown keys are ignored.
+The settings file is created with the default values and a comment for every key on first run. Afterwards Lite Bar only rewrites the values you change in the settings window. An invalid value falls back to its default and a warning is written to the log. Unknown keys are ignored.
 
 ### Settings
 
@@ -65,6 +85,8 @@ The settings file is created with the default values and a comment for every key
 | `background_opacity` | integer percent, 0-100 | `55` |
 | `counter_size` | height of the FPS number, integer pixels, 8-72 | `18` |
 | `text_size` | height of the "FPS" label and the statistics, integer pixels, 6-48 | `11` |
+
+`text_size` used to set the size of the FPS number. That is now `counter_size`, and `text_size` sizes only the "FPS" label and the statistics, so an old `text_size = 18` makes them as big as the number. Use **Restore defaults** in the settings window, or set `text_size = 11`.
 
 `[hotkeys]`
 
@@ -132,7 +154,7 @@ Games are kept apart by the exe's full path. For Microsoft Store and Game Pass a
 3. the window title, without version numbers and `- ...` suffixes;
 4. the exe file name without `.exe`.
 
-To rename a game, add it to `[game_names]` in the settings file and choose **Reload settings**: `games.csv` is regenerated with the new name, and new `sessions.csv` rows use it (existing rows keep the old name).
+To rename a game, type a name in the settings window's **Game names** section, or add it to `[game_names]` in the settings file and choose **Reload settings**. Either way `games.csv` is regenerated with the new name, and new `sessions.csv` rows use it (existing rows keep the old name).
 
 Anti-cheat: Lite Bar never injects into, hooks or reads the memory of a game. Its only contact with a game's process is `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` to read the exe path, the start time and whether the process has exited, and the handle is closed straight away. Lite Bar queries a recorded game's process when its session starts and then about once a second only while the game has stopped presenting frames; while it presents, that alone shows it is running, and it is queried at most every 30 s. The window title comes from `GetWindowTextW`, once, when the session starts. Everything else reads files and the registry, with no network lookups. If a game's process refuses even that limited query, its live stats still show on the overlay, but it isn't recorded in the history (a warning goes to the log). Lite Bar asks such a process at most once each time it gets the focus.
 

@@ -20,6 +20,8 @@ mod paths;
 #[cfg(windows)]
 mod process_info;
 #[cfg(windows)]
+mod settings_window;
+#[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]
 mod stats_files;
@@ -28,7 +30,6 @@ mod test_util;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
-#[allow(dead_code)] // wired into the tray app by a later task
 mod ui_host;
 #[cfg(windows)]
 mod ui_paint;
@@ -58,11 +59,14 @@ mod app {
     use lite_bar_core::fps::{FocusClock, FpsTracker};
     use lite_bar_core::game_name::{display_name, is_known_non_game};
     use lite_bar_core::history::LocalTime;
+    use lite_bar_core::hotkey::Hotkey;
     use lite_bar_core::layout::{fps_text, stats_text};
     use lite_bar_core::sessions::{
         liveness_query_due, session_log_line, OpenSession, QueryGate, SessionBook,
     };
     use lite_bar_core::settings::{Settings, StatsLayout};
+    use lite_bar_core::settings_edit::{apply_change, edit_settings_text, SettingsChange};
+    use lite_bar_core::settings_ui::UiAction;
     use windows::core::{w, HSTRING};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -75,7 +79,7 @@ mod app {
         DispatchMessageW, GetMessageW, KillTimer, PostQuitMessage, RegisterClassExW,
         RegisterWindowMessageW, SetTimer, TranslateMessage, MSG, MSGFLT_ALLOW, SW_SHOWNORMAL,
         WINDOW_EX_STYLE, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY,
-        WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
+        WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
     };
 
     use crate::elevation::{is_elevated, relaunch_as_admin};
@@ -86,14 +90,21 @@ mod app {
     use crate::overlay::Overlay;
     use crate::paths::{app_dir, load_or_create_settings};
     use crate::process_info::{process_info, process_state, ProcessInfo, ProcessState};
+    use crate::settings_window::{
+        switch_hotkey, Drained, HotkeyDecision, SaveDebounce, SettingsUi, SAVE_DELAY,
+        WM_SETTINGS_ACTIONS,
+    };
     use crate::single_instance::{acquire_single_instance, InstanceGuard};
-    use crate::stats_files::{local_now, StatsWriter};
+    use crate::stats_files::{list_games, local_now, write_atomic, StatsWriter};
     use crate::tray::{MenuItem, Tray, TrayMenuState, WM_TRAY};
     use crate::{log, tray};
 
     const MUTEX_NAME: &str = "Local\\LiteBar.SingleInstance";
     const TIMER_ID: usize = 1;
     const TIMER_MS: u32 = 250;
+    /// Owner-window timer that writes the settings file once the save debounce is due.
+    const SAVE_TIMER_ID: usize = 2;
+    const SETTINGS_FILE: &str = "settings.toml";
     /// Subfolder of the app dir holding `games.toml`, `games.csv` and `sessions.csv`.
     const STATS_DIR: &str = "stats";
     /// Prune the tracker every this many timer ticks (5 s).
@@ -110,10 +121,15 @@ mod app {
     }
 
     /// Runs `f` on the app state, if it exists and is not already borrowed (re-entrancy).
+    /// Afterwards applies whatever the settings window queued, so a nudge that arrived while
+    /// the app was busy is never lost.
     fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
         APP.with(|app| {
             let mut guard = app.try_borrow_mut().ok()?;
-            guard.as_mut().map(f)
+            let app = guard.as_mut()?;
+            let r = f(app);
+            app.drain_settings_actions();
+            Some(r)
         })
     }
 
@@ -187,6 +203,12 @@ mod app {
         just_shown: bool,
         /// App-clock time each tracked pid's process was last queried.
         last_query: HashMap<u32, f64>,
+        /// The settings window while it is open.
+        settings_ui: Option<SettingsUi>,
+        /// When the window's changes are due to be written.
+        save: SaveDebounce,
+        /// Changes not yet written to the settings file, in order.
+        unsaved: Vec<SettingsChange>,
     }
 
     impl App {
@@ -265,6 +287,247 @@ mod app {
                 self.stop_overlay();
             } else {
                 self.start_overlay();
+            }
+            self.sync_settings_window();
+        }
+
+        /// The settings the window shows: the app's, with "Show overlay" following whether
+        /// the overlay is on right now (the hotkey toggles it without changing the file).
+        fn shown_settings(&self) -> Settings {
+            let mut s = self.settings.clone();
+            s.overlay.visible = self.overlay_on;
+            s
+        }
+
+        fn sync_settings_window(&self) {
+            if let Some(ui) = &self.settings_ui {
+                ui.show(&self.shown_settings());
+            }
+        }
+
+        /// Tray "Settings…" and a double-click on the icon. Focuses the window if open.
+        fn open_settings(&mut self) {
+            self.open_settings_with(SettingsUi::open);
+        }
+
+        #[cfg(test)]
+        fn open_settings_hidden(&mut self) {
+            self.open_settings_with(SettingsUi::open_hidden);
+        }
+
+        fn open_settings_with(
+            &mut self,
+            open: fn(
+                HWND,
+                Settings,
+                Vec<lite_bar_core::settings_ui::GameRow>,
+            ) -> windows::core::Result<SettingsUi>,
+        ) {
+            if let Some(ui) = &self.settings_ui {
+                if ui.is_open() {
+                    ui.focus();
+                    return;
+                }
+            }
+            self.settings_ui = None;
+            let games = list_games(self.writer.stats_dir());
+            match open(self.hwnd, self.shown_settings(), games) {
+                Ok(ui) => self.settings_ui = Some(ui),
+                Err(e) => log::error(&format!("could not open the settings window: {e}")),
+            }
+        }
+
+        /// Applies what the settings window queued, in order; drops the window once it
+        /// closed and writes its pending changes.
+        /// Loops: applying an action can pump messages (`ShellExecuteW`), which may run
+        /// frames that queue more.
+        fn drain_settings_actions(&mut self) {
+            while let Some(ui) = &self.settings_ui {
+                let drained = ui.take();
+                if drained == Drained::default() {
+                    return;
+                }
+                for action in drained.actions {
+                    self.apply_ui_action(action);
+                }
+                if drained.closed {
+                    self.settings_ui = None;
+                    self.flush_settings_save();
+                }
+            }
+        }
+
+        /// Closes the window (Quit, restart, shutdown), applies its last edits and saves.
+        fn close_settings_window(&mut self) {
+            if let Some(ui) = self.settings_ui.take() {
+                for action in ui.close().actions {
+                    self.apply_ui_action(action);
+                }
+            }
+            self.flush_settings_save();
+        }
+
+        fn apply_ui_action(&mut self, action: UiAction) {
+            match action {
+                UiAction::Change(change) => self.apply_settings_change(change),
+                UiAction::ProposeHotkey(hk) => self.propose_hotkey(hk),
+                UiAction::OpenStatsFolder => self.open_stats_folder(),
+                UiAction::CancelHotkeyCapture => self.set_hotkey_status(None),
+            }
+        }
+
+        /// One change from the window: live in memory and on the overlay, saved shortly.
+        fn apply_settings_change(&mut self, change: SettingsChange) {
+            let old_hotkey = self.settings.hotkeys.toggle_overlay;
+            apply_change(&mut self.settings, &change);
+            self.overlay.set_settings(&self.settings.overlay);
+            self.overlay.redraw();
+            self.queue_save(change.clone());
+            match &change {
+                SettingsChange::Visible(_) | SettingsChange::RestoreDefaults
+                    if self.settings.overlay.visible != self.overlay_on =>
+                {
+                    if self.overlay_on {
+                        self.stop_overlay();
+                    } else {
+                        self.start_overlay();
+                    }
+                }
+                SettingsChange::GameName { .. } => {
+                    self.writer.mark_games_csv_dirty();
+                    self.writer.flush(&self.settings.game_names);
+                }
+                _ => {}
+            }
+            let new_hotkey = self.settings.hotkeys.toggle_overlay;
+            if new_hotkey != old_hotkey {
+                // Restore defaults: the default hotkey must be registered too.
+                if let HotkeyDecision::Reject(msg) = self.change_hotkey(new_hotkey, old_hotkey) {
+                    let keep = SettingsChange::ToggleHotkey(old_hotkey);
+                    apply_change(&mut self.settings, &keep);
+                    self.queue_save(keep);
+                    self.reject_hotkey(&msg);
+                }
+            }
+            self.sync_settings_window();
+        }
+
+        /// Unregisters `current`, registers `proposed`, or `current` again if that fails.
+        fn change_hotkey(&mut self, proposed: Hotkey, current: Hotkey) -> HotkeyDecision {
+            let hwnd = self.hwnd;
+            let mut registered = self.hotkey_ok;
+            let decision = switch_hotkey(
+                proposed,
+                current,
+                || hotkeys::unregister(hwnd, HotkeyId::ToggleOverlay),
+                |hk| {
+                    registered = matches!(
+                        hotkeys::register(hwnd, HotkeyId::ToggleOverlay, hk),
+                        Registration::Ok
+                    );
+                    registered
+                },
+            );
+            self.hotkey_ok = registered;
+            decision
+        }
+
+        fn propose_hotkey(&mut self, proposed: Hotkey) {
+            let current = self.settings.hotkeys.toggle_overlay;
+            match self.change_hotkey(proposed, current) {
+                HotkeyDecision::Keep => self.set_hotkey_status(None),
+                HotkeyDecision::Switch => {
+                    log::info(&format!("toggle hotkey is now {proposed}"));
+                    let change = SettingsChange::ToggleHotkey(proposed);
+                    apply_change(&mut self.settings, &change);
+                    self.queue_save(change);
+                    self.set_hotkey_status(None);
+                    self.sync_settings_window();
+                }
+                HotkeyDecision::Reject(msg) => {
+                    log::info(&format!("hotkey {proposed} is taken; keeping {current}"));
+                    self.reject_hotkey(&msg);
+                }
+            }
+        }
+
+        fn set_hotkey_status(&self, status: Option<&str>) {
+            if let Some(ui) = &self.settings_ui {
+                ui.set_status(status);
+            }
+        }
+
+        fn reject_hotkey(&self, msg: &str) {
+            if let Some(ui) = &self.settings_ui {
+                ui.reject_hotkey(msg);
+            }
+        }
+
+        fn open_stats_folder(&self) {
+            let dir = self.writer.stats_dir();
+            match std::fs::create_dir_all(dir) {
+                Ok(()) => shell_open(dir, "stats folder"),
+                Err(e) => log::error(&format!("could not create {}: {e}", dir.display())),
+            }
+        }
+
+        /// Marks `change` for the next save, `SAVE_DELAY` after the last change.
+        fn queue_save(&mut self, change: SettingsChange) {
+            self.unsaved.push(change);
+            self.save.change(Instant::now());
+            // SAFETY: plain FFI on our own window; re-setting the id restarts the timer.
+            unsafe {
+                SetTimer(
+                    Some(self.hwnd),
+                    SAVE_TIMER_ID,
+                    SAVE_DELAY.as_millis() as u32,
+                    None,
+                );
+            }
+        }
+
+        fn on_save_timer(&mut self, now: Instant) {
+            if self.save.due(now) {
+                self.flush_settings_save();
+            }
+        }
+
+        /// Writes the pending changes now, if any.
+        fn flush_settings_save(&mut self) {
+            // SAFETY: plain FFI on our own window.
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), SAVE_TIMER_ID);
+            }
+            if self.save.flush() {
+                self.write_settings_file();
+            }
+        }
+
+        /// Applies the pending changes to the file's current text, touching only their keys,
+        /// and writes it atomically. A missing file starts from the commented template; a file
+        /// that is no longer valid TOML is left alone (the settings stay in memory).
+        fn write_settings_file(&mut self) {
+            let changes = std::mem::take(&mut self.unsaved);
+            let path = self.dir.join(SETTINGS_FILE);
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => {
+                    log::warn(&format!(
+                        "settings not saved: cannot read {}: {e}",
+                        path.display()
+                    ));
+                    return;
+                }
+            };
+            match edit_settings_text(&text, &changes) {
+                Ok(new_text) if new_text == text => {}
+                Ok(new_text) => {
+                    if let Err(e) = write_atomic(&path, new_text.as_bytes()) {
+                        log::warn(&format!("settings not saved: {}: {e}", path.display()));
+                    }
+                }
+                Err(e) => log::warn(&format!("settings not saved: {e}")),
             }
         }
 
@@ -402,10 +665,22 @@ mod app {
                 let shown = display_name(&record.name, &record.exe_path, names);
                 log::info(&session_log_line(&record, &shown));
                 self.writer.record(&record, names);
+                if let Some(ui) = &self.settings_ui {
+                    ui.set_games(list_games(self.writer.stats_dir()));
+                }
             }
         }
 
         fn reload_settings(&mut self) {
+            self.reload_settings_file();
+            self.register_hotkey();
+            log::info("settings reloaded");
+        }
+
+        /// Re-reads the file (after writing the window's pending changes into it) and shows
+        /// the result in the overlay and the open window.
+        fn reload_settings_file(&mut self) {
+            self.flush_settings_save();
             let (settings, warnings) = load_or_create_settings(&self.dir);
             for w in &warnings {
                 log::warn(w);
@@ -414,10 +689,13 @@ mod app {
                 self.writer.mark_games_csv_dirty();
             }
             self.overlay.set_settings(&settings.overlay);
+            self.overlay.redraw();
             self.settings = settings;
             self.writer.flush(&self.settings.game_names);
-            self.register_hotkey();
-            log::info("settings reloaded");
+            if let Some(ui) = &self.settings_ui {
+                ui.set_games(list_games(self.writer.stats_dir()));
+            }
+            self.sync_settings_window();
         }
 
         fn open_settings_file(&self) {
@@ -437,6 +715,7 @@ mod app {
         /// Relaunches elevated. Returns true if this process should exit.
         fn restart_as_admin(&mut self) -> bool {
             let was_on = self.overlay_on;
+            self.close_settings_window();
             self.guard = None;
             hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
             self.stop_overlay();
@@ -461,6 +740,7 @@ mod app {
 
         fn handle_menu(&mut self, item: MenuItem) {
             match item {
+                MenuItem::OpenSettings => self.open_settings(),
                 MenuItem::ToggleOverlay => self.toggle_overlay(),
                 MenuItem::OpenSettingsFile => self.open_settings_file(),
                 MenuItem::OpenGameStats => self.open_game_stats(),
@@ -470,7 +750,10 @@ mod app {
                         quit();
                     }
                 }
-                MenuItem::Quit => quit(),
+                MenuItem::Quit => {
+                    self.close_settings_window();
+                    quit();
+                }
             }
         }
 
@@ -478,6 +761,7 @@ mod app {
         /// window go with the drop).
         fn shutdown(&mut self) {
             log::info("shutting down");
+            self.close_settings_window();
             hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
             self.stop_overlay();
             self.tray.remove();
@@ -487,6 +771,7 @@ mod app {
         /// The user is signing out or Windows is shutting down: the process may be ended as
         /// soon as this returns.
         fn end_session(&mut self) {
+            self.flush_settings_save();
             self.stop_overlay();
             self.finish_all_sessions();
         }
@@ -639,6 +924,15 @@ mod app {
                 with_app(App::on_timer);
                 return LRESULT(0);
             }
+            WM_TIMER if wparam.0 == SAVE_TIMER_ID => {
+                with_app(|app| app.on_save_timer(Instant::now()));
+                return LRESULT(0);
+            }
+            WM_SETTINGS_ACTIONS => {
+                // `with_app` drains the window's queue.
+                with_app(|_| ());
+                return LRESULT(0);
+            }
             WM_HOTKEY if wparam.0 == HotkeyId::ToggleOverlay as usize => {
                 with_app(App::toggle_overlay);
                 return LRESULT(0);
@@ -647,6 +941,8 @@ mod app {
                 let event = (lparam.0 & 0xFFFF) as u32;
                 if event == WM_RBUTTONUP || event == WM_CONTEXTMENU {
                     on_tray_menu();
+                } else if event == WM_LBUTTONDBLCLK && !MENU_OPEN.get() {
+                    with_app(App::open_settings);
                 }
                 return LRESULT(0);
             }
@@ -693,6 +989,12 @@ mod app {
         }
     }
 
+    /// Whether the panic hook stops the ETW trace. A panic inside the settings window's frame
+    /// is caught by its host (the window closes, the app carries on), so the trace must stay.
+    fn panic_stops_trace(in_ui_frame: bool) -> bool {
+        !in_ui_frame
+    }
+
     /// A panic in the window procedure would abort at the FFI boundary: the app would vanish
     /// silently and leak its ETW session. Log it and stop the session on the way out. The
     /// previous hook is not called (there is no console).
@@ -700,7 +1002,9 @@ mod app {
         std::panic::set_hook(Box::new(|info| {
             let location = info.location().map(|l| (l.file(), l.line(), l.column()));
             log::error(&panic_message(info.payload(), location));
-            let _ = ferrisetw::trace::stop_trace_by_name(crate::etw::SESSION_NAME);
+            if panic_stops_trace(crate::ui_host::in_ui_frame()) {
+                let _ = ferrisetw::trace::stop_trace_by_name(crate::etw::SESSION_NAME);
+            }
         }));
     }
 
@@ -773,6 +1077,9 @@ mod app {
             gate: QueryGate::default(),
             just_shown: false,
             last_query: HashMap::new(),
+            settings_ui: None,
+            save: SaveDebounce::default(),
+            unsaved: Vec::new(),
         };
         app.register_hotkey();
         if start_visible {
@@ -804,6 +1111,9 @@ mod app {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::test_util::TempDir;
+        use lite_bar_core::settings_edit::SettingsChange;
+        use std::time::Duration;
 
         #[test]
         fn panic_message_formats_str_payload_and_location() {
@@ -812,6 +1122,193 @@ mod app {
                 panic_message(&*payload, Some(("src/main.rs", 12, 5))),
                 "panic: boom at src/main.rs:12:5"
             );
+        }
+
+        /// A user's settings file: the template plus a comment of their own, CRLF-free.
+        fn user_settings_text() -> String {
+            lite_bar_core::settings::default_settings_toml()
+                .replace("counter_size = 18", "counter_size = 18 # my size")
+        }
+
+        /// An `App` over `dir` with hidden windows: no tray icon, no hotkey, no capture.
+        fn test_app(dir: &Path) -> (App, OwnerWindow) {
+            let owner = create_owner_window().unwrap();
+            let (settings, _) = load_or_create_settings(dir);
+            let overlay = Overlay::new(&settings.overlay).unwrap();
+            let app = App {
+                hwnd: owner.0,
+                dir: dir.to_path_buf(),
+                settings,
+                overlay,
+                tray: Rc::new(Tray::new_hidden(owner.0).unwrap()),
+                tracker: Arc::new(Mutex::new(FpsTracker::new())),
+                clock: Instant::now(),
+                focus_clock: anchored_focus_clock(),
+                capture: None,
+                guard: None,
+                overlay_on: false,
+                needs_admin: false,
+                hotkey_ok: false,
+                ticks: 0,
+                sessions: SessionBook::new(),
+                writer: StatsWriter::new(dir.join(STATS_DIR)),
+                gate: QueryGate::default(),
+                just_shown: false,
+                last_query: HashMap::new(),
+                settings_ui: None,
+                save: SaveDebounce::default(),
+                unsaved: Vec::new(),
+            };
+            (app, owner)
+        }
+
+        fn settings_file(dir: &Path) -> String {
+            std::fs::read_to_string(dir.join("settings.toml")).unwrap()
+        }
+
+        fn counter(n: u16) -> UiAction {
+            UiAction::Change(SettingsChange::CounterSize(n))
+        }
+
+        #[test]
+        fn slider_change_applies_live_and_saves_with_comments() {
+            let dir = TempDir::new("settings-live");
+            std::fs::write(dir.path().join("settings.toml"), user_settings_text()).unwrap();
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            let ui = app.settings_ui.as_ref().expect("window open");
+            ui.paint(); // one real frame of the page
+            assert!(ui.is_open());
+            ui.queue(counter(30));
+            app.drain_settings_actions();
+
+            assert_eq!(app.settings.overlay.counter_size, 30);
+            assert_eq!(app.overlay.settings().counter_size, 30);
+            let shown = app.settings_ui.as_ref().unwrap().shown();
+            assert_eq!(shown.overlay.counter_size, 30);
+            assert_eq!(
+                settings_file(dir.path()),
+                user_settings_text(),
+                "not written before the debounce"
+            );
+
+            app.on_save_timer(Instant::now() + Duration::from_millis(400));
+            assert_eq!(
+                settings_file(dir.path()),
+                user_settings_text().replace("counter_size = 18 #", "counter_size = 30 #")
+            );
+        }
+
+        #[test]
+        fn close_flushes_pending_save() {
+            let dir = TempDir::new("settings-close");
+            std::fs::write(dir.path().join("settings.toml"), user_settings_text()).unwrap();
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            app.settings_ui.as_ref().unwrap().queue(counter(40));
+            app.drain_settings_actions();
+            app.close_settings_window();
+            assert!(app.settings_ui.is_none(), "window dropped");
+            assert!(settings_file(dir.path()).contains("counter_size = 40 # my size"));
+        }
+
+        #[test]
+        fn window_x_button_drains_closes_and_saves() {
+            let dir = TempDir::new("settings-x");
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            let ui = app.settings_ui.as_ref().unwrap();
+            ui.queue(UiAction::Change(SettingsChange::TextSize(14)));
+            ui.send_close();
+            app.drain_settings_actions();
+            assert!(app.settings_ui.is_none());
+            assert_eq!(app.settings.overlay.text_size, 14);
+            // The default file written at load, edited in place.
+            assert!(settings_file(dir.path()).contains("text_size = 14\n"));
+            assert!(settings_file(dir.path()).contains("# Height of the \"FPS\" label"));
+        }
+
+        #[test]
+        fn missing_file_is_saved_from_the_template() {
+            let dir = TempDir::new("settings-missing");
+            let (mut app, _owner) = test_app(dir.path());
+            std::fs::remove_file(dir.path().join("settings.toml")).unwrap();
+            app.open_settings_hidden();
+            app.settings_ui.as_ref().unwrap().queue(counter(25));
+            app.drain_settings_actions();
+            app.close_settings_window();
+            let text = settings_file(dir.path());
+            assert!(text.starts_with("# Lite Bar settings."));
+            assert!(text.contains("counter_size = 25\n"));
+        }
+
+        #[test]
+        fn invalid_file_is_left_alone_and_settings_stay() {
+            let dir = TempDir::new("settings-invalid");
+            let (mut app, _owner) = test_app(dir.path());
+            std::fs::write(dir.path().join("settings.toml"), "broken [[[").unwrap();
+            app.open_settings_hidden();
+            app.settings_ui.as_ref().unwrap().queue(counter(26));
+            app.drain_settings_actions();
+            app.close_settings_window();
+            assert_eq!(settings_file(dir.path()), "broken [[[");
+            assert_eq!(app.settings.overlay.counter_size, 26);
+        }
+
+        #[test]
+        fn game_rename_is_saved_and_shown() {
+            let dir = TempDir::new("settings-rename");
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            app.settings_ui
+                .as_ref()
+                .unwrap()
+                .queue(UiAction::Change(SettingsChange::GameName {
+                    exe_path: "javaw.exe".into(),
+                    name: Some("Minecraft".into()),
+                }));
+            app.drain_settings_actions();
+            assert_eq!(
+                app.settings.game_names.get("javaw.exe").map(String::as_str),
+                Some("Minecraft")
+            );
+            app.close_settings_window();
+            assert!(settings_file(dir.path()).contains("\"javaw.exe\" = \"Minecraft\""));
+        }
+
+        #[test]
+        fn opening_twice_keeps_one_window() {
+            let dir = TempDir::new("settings-twice");
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            let first = app.settings_ui.as_ref().unwrap().id();
+            app.open_settings_hidden();
+            assert_eq!(app.settings_ui.as_ref().unwrap().id(), first);
+        }
+
+        #[test]
+        fn reload_refreshes_the_open_window() {
+            let dir = TempDir::new("settings-reload");
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            let text = settings_file(dir.path()).replace("counter_size = 18", "counter_size = 33");
+            std::fs::write(dir.path().join("settings.toml"), text).unwrap();
+            app.reload_settings_file();
+            assert_eq!(
+                app.settings_ui
+                    .as_ref()
+                    .unwrap()
+                    .shown()
+                    .overlay
+                    .counter_size,
+                33
+            );
+        }
+
+        #[test]
+        fn ui_frame_panics_keep_the_trace() {
+            assert!(panic_stops_trace(false));
+            assert!(!panic_stops_trace(true));
         }
 
         #[test]
