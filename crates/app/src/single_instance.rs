@@ -49,7 +49,7 @@ pub fn acquire_single_instance(name: &str) -> windows::core::Result<Option<Insta
 }
 
 /// How long a just-updated instance waits for the old one to let go of the mutex.
-pub const UPDATED_WAIT: Duration = Duration::from_secs(10);
+pub const UPDATED_WAIT: Duration = Duration::from_secs(60);
 /// How often it tries.
 pub const UPDATED_POLL: Duration = Duration::from_millis(200);
 
@@ -104,7 +104,7 @@ mod tests {
 
     #[test]
     fn updated_flag_waits_for_mutex() {
-        assert_eq!(UPDATED_WAIT, Duration::from_secs(10));
+        assert_eq!(UPDATED_WAIT, Duration::from_secs(60));
         assert_eq!(UPDATED_POLL, Duration::from_millis(200));
         // The old instance lets go of the mutex on the 4th try.
         let clock = FakeClock(Default::default());
@@ -116,7 +116,12 @@ mod tests {
         assert_eq!(got, Some("guard"));
         assert_eq!(clock.0.get(), Duration::from_millis(600));
 
-        // It never does: gives up after 10 s, trying every 200 ms.
+        // Still held after 10 s: keeps waiting.
+        let clock = FakeClock(Default::default());
+        let got = clock.wait(|| (clock.0.get() >= Duration::from_secs(30)).then_some("guard"));
+        assert_eq!(got, Some("guard"));
+
+        // It never does: gives up after 60 s, trying every 200 ms.
         let clock = FakeClock(Default::default());
         let mut tries = 0;
         let got: Option<()> = clock.wait(|| {
@@ -124,8 +129,8 @@ mod tests {
             None
         });
         assert_eq!(got, None);
-        assert_eq!(tries, 51);
-        assert_eq!(clock.0.get(), Duration::from_secs(10));
+        assert_eq!(tries, 301);
+        assert_eq!(clock.0.get(), Duration::from_secs(60));
     }
 
     #[test]

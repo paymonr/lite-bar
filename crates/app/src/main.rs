@@ -279,6 +279,8 @@ mod app {
         /// Set once the updated exe is being started (cleared if that fails): later Restart
         /// now and Update now clicks are ignored, and shutdown has nothing left to do.
         relaunched: bool,
+        /// Starts an elevated copy through UAC (`elevation::relaunch_as_admin`).
+        relaunch_admin: fn() -> windows::core::Result<()>,
     }
 
     impl App {
@@ -571,8 +573,10 @@ mod app {
             hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
             self.stop_overlay();
             self.tray.remove();
-            match relaunch_as_admin() {
+            match (self.relaunch_admin)() {
                 Ok(()) => {
+                    // The elevated copy may start the capture before this one exits.
+                    set_owns_trace(false);
                     self.close_settings_window_for_exit();
                     true
                 }
@@ -631,6 +635,10 @@ mod app {
         /// The user is signing out or Windows is shutting down: the process may be ended as
         /// soon as this returns.
         fn end_session(&mut self) {
+            if self.relaunched {
+                // All saved before the relaunch; the new instance owns the stats files.
+                return;
+            }
             // Drains the window and ends its edits too, so nothing typed is lost.
             self.close_settings_window();
             self.stop_overlay();
@@ -751,7 +759,7 @@ mod app {
     }
 
     /// The single-instance mutex for an instance started by an update: the old one may still
-    /// be exiting, so `acquire` is retried (every 200 ms, up to 10 s) while another instance
+    /// be exiting, so `acquire` is retried (every 200 ms, up to 60 s) while another instance
     /// holds it. An unexpected error ends the wait.
     fn guard_after_update<G>(
         mut acquire: impl FnMut() -> windows::core::Result<Option<G>>,
@@ -768,6 +776,32 @@ mod app {
             },
         )
         .unwrap_or(Ok(None))
+    }
+
+    /// What a start does with the mutex check: `Some(guard)` runs (with it, or without one
+    /// when the check failed), `None` exits because another instance runs. An updated
+    /// instance never exits: if the old one still holds the mutex after the whole wait,
+    /// running without it beats leaving nothing running.
+    fn guard_or_exit<G>(
+        updated: bool,
+        acquired: windows::core::Result<Option<G>>,
+    ) -> Option<Option<G>> {
+        match acquired {
+            Ok(Some(guard)) => Some(Some(guard)),
+            Ok(None) if updated => {
+                log::warn(
+                    "updated, but the previous Lite Bar still holds the lock; running without it",
+                );
+                Some(None)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                log::error(&format!(
+                    "single-instance check failed, running anyway: {e}"
+                ));
+                Some(None)
+            }
+        }
     }
 
     /// Takes the single-instance mutex. Fails open: an unexpected error is logged and the app
@@ -964,20 +998,8 @@ mod app {
         } else {
             acquire_single_instance(MUTEX_NAME)
         };
-        let guard = match acquired {
-            Ok(Some(guard)) => Some(guard),
-            Ok(None) => {
-                if updated {
-                    log::warn("updated, but the previous Lite Bar is still running; exiting");
-                }
-                return; // already running: exit silently
-            }
-            Err(e) => {
-                log::error(&format!(
-                    "single-instance check failed, running anyway: {e}"
-                ));
-                None
-            }
+        let Some(guard) = guard_or_exit(updated, acquired) else {
+            return; // already running: exit silently
         };
 
         // This instance runs the capture from here on (also without a guard, when the
@@ -1061,6 +1083,7 @@ mod app {
             startup_query: crate::startup::query_now,
             startup_change: crate::startup::change,
             relaunched: false,
+            relaunch_admin: relaunch_as_admin,
         };
         app.arm_update_timer();
         app.register_hotkey();
@@ -1176,6 +1199,8 @@ mod app {
                     })
                 },
                 relaunched: false,
+                // Tests never start an elevated copy.
+                relaunch_admin: || Err(windows::core::Error::empty()),
             };
             (app, owner)
         }
@@ -2393,12 +2418,64 @@ mod app {
 
         #[test]
         fn a_successful_relaunch_gives_up_the_trace() {
+            let _lock = TRACE_FLAG.lock().unwrap_or_else(|e| e.into_inner());
             let dir = TempDir::new("install-app-gives-up-trace");
             let (mut app, _owner, _exe, new) = staged_app(dir.path());
             app.relaunch = fake_relaunch;
             set_owns_trace(true);
             assert!(app.on_install_result(Ok(new)), "quits");
             assert!(!owns_trace());
+        }
+
+        /// Serialises the tests that set `OWNS_TRACE` and then read it.
+        static TRACE_FLAG: Mutex<()> = Mutex::new(());
+
+        #[test]
+        fn a_successful_admin_restart_gives_up_the_trace() {
+            let _lock = TRACE_FLAG.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = TempDir::new("admin-restart-gives-up-trace");
+            let (mut app, _owner) = test_app(dir.path());
+            app.relaunch_admin = || Ok(());
+            set_owns_trace(true);
+            assert!(app.restart_as_admin(), "quits");
+            assert!(!owns_trace());
+        }
+
+        #[test]
+        fn a_declined_admin_restart_keeps_the_trace() {
+            let _lock = TRACE_FLAG.lock().unwrap_or_else(|e| e.into_inner());
+            let dir = TempDir::new("admin-restart-declined");
+            let (mut app, _owner) = test_app(dir.path());
+            set_owns_trace(true);
+            assert!(!app.restart_as_admin(), "keeps running");
+            assert!(owns_trace());
+        }
+
+        #[test]
+        fn sign_out_after_relaunch_does_not_flush_again() {
+            let dir = TempDir::new("install-app-endsession-once");
+            write_one_game(dir.path());
+            let (mut app, _owner, _exe, new) = staged_app(dir.path());
+            app.relaunch = fake_relaunch;
+            assert!(app.on_install_result(Ok(new)), "quits");
+            app.writer.mark_games_csv_dirty();
+            app.end_session();
+            assert!(!dir.path().join(STATS_DIR).join("games.csv").exists());
+        }
+
+        #[test]
+        fn an_updated_instance_runs_without_the_guard_rather_than_exit() {
+            // Still held after the whole wait: fail open, so something runs.
+            assert_eq!(guard_or_exit(true, Ok(None::<()>)), Some(None));
+            // A normal start with another instance running exits.
+            assert_eq!(guard_or_exit(false, Ok(None::<()>)), None);
+            assert_eq!(guard_or_exit(true, Ok(Some(1))), Some(Some(1)));
+            assert_eq!(guard_or_exit(false, Ok(Some(1))), Some(Some(1)));
+            // An unexpected error runs without a guard, as before.
+            assert_eq!(
+                guard_or_exit::<()>(false, Err(windows::core::Error::empty())),
+                Some(None)
+            );
         }
 
         #[test]
