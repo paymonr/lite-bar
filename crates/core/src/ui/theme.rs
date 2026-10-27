@@ -39,3 +39,40 @@ pub const SLIDER_TRACK_H: f32 = 4.0;
 pub const SLIDER_THUMB: f32 = 14.0;
 /// Vertical and horizontal spacing between laid-out widgets.
 pub const GAP: f32 = 8.0;
+
+pub const PLACEHOLDER: Rgba = Rgba(0x5D, 0x64, 0x6E, 255);
+pub const SELECTION: Rgba = Rgba(0x5F, 0xA8, 0xFF, 0x60);
+pub const ERROR: Rgba = Rgba(0xFF, 0x55, 0x55, 255);
+/// Accent halo around the selected location button.
+pub const ACCENT_HALO: Rgba = Rgba(0x5F, 0xA8, 0xFF, 0x40);
+pub const SIDEBAR_SELECTED_TEXT: Rgba = Rgba(0xFF, 0xFF, 0xFF, 255);
+/// Muted look (45% opacity) for inactive chips and disabled sidebar items.
+pub const DIM_ALPHA: u8 = 115;
+
+pub const FIELD_RADIUS: f32 = 5.0;
+pub const FIELD_PAD_X: f32 = 8.0;
+pub const SWATCH: f32 = 18.0;
+pub const SWATCH_GAP: f32 = 6.0;
+pub const SWATCH_RADIUS: f32 = 4.0;
+pub const HEX_W: f32 = 76.0;
+pub const HEX_H: f32 = 24.0;
+pub const SCREEN_W: f32 = 160.0;
+pub const SCREEN_H: f32 = 90.0;
+pub const SCREEN_RADIUS: f32 = 6.0;
+pub const LOC_BUTTON: f32 = 14.0;
+pub const LOC_INSET: f32 = 8.0;
+pub const SCROLL_STEP: f32 = 40.0;
+pub const NAV_H: f32 = 32.0;
+pub const NAV_SUB_H: f32 = 26.0;
+pub const NAV_SPACING: f32 = 2.0;
+pub const NAV_RADIUS: f32 = 6.0;
+pub const NAV_PAD_X: f32 = 10.0;
+pub const NAV_SUB_PAD_X: f32 = 30.0;
+pub const CHIP_H: f32 = 18.0;
+pub const CHIP_PAD_X: f32 = 8.0;
+pub const KEY_RADIUS: f32 = 6.0;
+pub const KEY_PAD_X: f32 = 8.0;
+pub const KBD_H: f32 = 18.0;
+pub const KBD_PAD_X: f32 = 6.0;
+pub const CONFIRM_MS: u64 = 3000;
+pub const CARET_BLINK_MS: u64 = 500;

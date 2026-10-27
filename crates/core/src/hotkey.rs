@@ -25,6 +25,16 @@ impl Key {
             Key::F(n) => 0x70 + u16::from(n) - 1,
         }
     }
+
+    /// The key for a Windows virtual-key code, if it is a supported hotkey key.
+    pub fn from_virtual_key(vk: u16) -> Option<Key> {
+        match vk {
+            0x41..=0x5A => Some(Key::Letter(char::from(vk as u8))),
+            0x30..=0x39 => Some(Key::Digit(vk as u8 - 0x30)),
+            0x70..=0x87 => Some(Key::F((vk - 0x70 + 1) as u8)),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for Key {
@@ -104,23 +114,7 @@ impl FromStr for Hotkey {
             }
         }
         let key = key.ok_or(HotkeyError::NoKey)?;
-        // Shift alone types capital letters and shifted digits, so it only counts as a
-        // modifier for function keys.
-        let has_modifier = if matches!(key, Key::F(_)) {
-            ctrl || alt || shift || win
-        } else {
-            ctrl || alt || win
-        };
-        if !has_modifier {
-            return Err(HotkeyError::NoModifier);
-        }
-        Ok(Hotkey {
-            ctrl,
-            alt,
-            shift,
-            win,
-            key,
-        })
+        Hotkey::new(ctrl, alt, shift, win, key)
     }
 }
 
@@ -153,9 +147,70 @@ impl<'de> Deserialize<'de> for Hotkey {
     }
 }
 
+impl Hotkey {
+    /// Builds a hotkey, applying the modifier rules described on [`Hotkey`].
+    pub fn new(
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+        win: bool,
+        key: Key,
+    ) -> Result<Hotkey, HotkeyError> {
+        // Shift alone types capital letters and shifted digits, so it only counts as a
+        // modifier for function keys.
+        let has_modifier = if matches!(key, Key::F(_)) {
+            ctrl || alt || shift || win
+        } else {
+            ctrl || alt || win
+        };
+        if !has_modifier {
+            return Err(HotkeyError::NoModifier);
+        }
+        Ok(Hotkey {
+            ctrl,
+            alt,
+            shift,
+            win,
+            key,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_keys_round_trip() {
+        for key in [
+            Key::Letter('A'),
+            Key::Letter('Z'),
+            Key::Digit(0),
+            Key::Digit(9),
+            Key::F(1),
+            Key::F(24),
+        ] {
+            assert_eq!(Key::from_virtual_key(key.virtual_key()), Some(key));
+        }
+        // Space, Ctrl, F25 (0x88) and numpad 0 are not hotkey keys.
+        for vk in [0x20, 0x11, 0x88, 0x60, 0x2F, 0x3A, 0x40, 0x5B] {
+            assert_eq!(Key::from_virtual_key(vk), None, "{vk:#x}");
+        }
+    }
+
+    #[test]
+    fn new_applies_the_modifier_rules() {
+        assert!(Hotkey::new(true, true, false, false, Key::Letter('K')).is_ok());
+        assert!(matches!(
+            Hotkey::new(false, false, true, false, Key::Letter('A')),
+            Err(HotkeyError::NoModifier)
+        ));
+        assert!(Hotkey::new(false, false, true, false, Key::F(5)).is_ok());
+        assert!(matches!(
+            Hotkey::new(false, false, false, false, Key::F(5)),
+            Err(HotkeyError::NoModifier)
+        ));
+    }
 
     #[test]
     fn parses_and_displays_canonically() {

@@ -1,6 +1,18 @@
-//! Basic widgets: label, button, toggle, slider, segmented.
+//! Widgets. Basic ones (label, button, toggle, slider, segmented) live here; the
+//! rest are in submodules.
 //!
-//! Every widget returns `true` when its value changed or it was clicked.
+//! Widgets returning `bool` return `true` when their value changed or they were clicked.
+
+mod chips;
+mod color;
+mod hotkey;
+mod location;
+mod nav;
+mod text;
+
+pub use color::{ColorPickerEvent, PRESET_COLORS};
+pub use nav::SidebarItem;
+pub use text::TextFieldEvent;
 
 use std::ops::RangeInclusive;
 

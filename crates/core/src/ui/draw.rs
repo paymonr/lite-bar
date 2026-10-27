@@ -1,5 +1,7 @@
 //! Draw commands and text measuring. The host renders `Cmd`s with Direct2D.
 
+use std::rc::Rc;
+
 use super::geom::{Pt, Rect};
 use super::theme::Rgba;
 
@@ -53,6 +55,20 @@ pub enum Cmd {
         to: Pt,
         color: Rgba,
         width: f32,
+    },
+    /// A 1 DIP dashed outline.
+    Dashed {
+        rect: Rect,
+        color: Rgba,
+        radius: f32,
+    },
+    /// RGBA pixels with premultiplied alpha, stretched to `rect`. The host may cache
+    /// the uploaded bitmap per `Rc` while it stays alive.
+    Image {
+        rect: Rect,
+        width_px: u32,
+        height_px: u32,
+        rgba: Rc<Vec<u8>>,
     },
     ClipPush(Rect),
     ClipPop,

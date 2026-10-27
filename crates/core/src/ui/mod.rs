@@ -1,19 +1,26 @@
 //! Immediate-mode UI toolkit. Each frame the host builds an `Input`, calls a page
 //! function with a `Ui`, and renders the `Frame` of draw commands from `finish`.
 
+mod color;
 mod draw;
 mod geom;
+mod hotkey_capture;
 mod input;
+mod text_edit;
 pub mod theme;
 mod widgets;
 
 #[cfg(test)]
 mod tests;
 
+pub use color::{wheel_pixels, Hsv};
 pub use draw::{Cmd, CursorKind, Frame, TextMeasure, TextStyle};
 pub use geom::{Pt, Rect};
-pub use input::{Id, Input, KeyPress, UiKey, UiState};
+pub use hotkey_capture::{HotkeyCapture, HotkeyFieldEvent};
+pub use input::{Id, Input, KeyPress, UiKey, UiState, WheelCache};
+pub use text_edit::{Clipboard, TextEdit};
 pub use theme::Rgba;
+pub use widgets::{ColorPickerEvent, SidebarItem, TextFieldEvent, PRESET_COLORS};
 
 /// Hashes a name to a widget id (FNV-1a, 64 bit).
 pub fn id(name: &str) -> Id {
@@ -67,6 +74,14 @@ pub struct Ui<'a> {
     offset: Pt,
     /// Screen-space clip rects; each entry is already intersected with its parent.
     clips: Vec<Rect>,
+    /// DIP to pixel scale of the target, so generated images match the screen. Default 1.
+    pub scale: f32,
+    /// Used by text fields for copy and paste; without one, paste does nothing.
+    pub clipboard: Option<&'a mut dyn text_edit::Clipboard>,
+    /// `state.focused` when the frame started.
+    focus_start: Option<Id>,
+    /// Whether the focused text field was built this frame.
+    focus_seen: bool,
 }
 
 impl<'a> Ui<'a> {
@@ -79,6 +94,8 @@ impl<'a> Ui<'a> {
         area: Rect,
     ) -> Ui<'a> {
         state.hot_next = None;
+        state.scroll_hot_next = None;
+        let focus_start = state.focused;
         Ui {
             measure,
             input,
@@ -89,6 +106,10 @@ impl<'a> Ui<'a> {
             next_w: None,
             offset: Pt::default(),
             clips: Vec::new(),
+            scale: 1.0,
+            clipboard: None,
+            focus_start,
+            focus_seen: false,
         }
     }
 
@@ -149,7 +170,24 @@ impl<'a> Ui<'a> {
         self.shifted(r)
     }
 
+    /// Width the next widget would get if it asked to fill: `next_width` if set,
+    /// otherwise the rest of the row or the column's width.
+    fn avail_width(&self) -> f32 {
+        if let Some(w) = self.next_w {
+            return w;
+        }
+        let l = self.layouts.last().expect("layout stack is never empty");
+        if l.row {
+            let gap = if l.gap_pending { theme::GAP } else { 0.0 };
+            (l.bounds.right() - l.x - gap).max(0.0)
+        } else {
+            l.bounds.w
+        }
+    }
+
     fn with_layout(&mut self, bounds: Rect, row: bool, f: impl FnOnce(&mut Ui<'a>)) {
+        // A pending width was meant for a widget in the outer layout.
+        self.next_w = None;
         self.layouts.push(Layout::new(bounds, row));
         f(self);
         self.layouts.pop();
@@ -239,6 +277,12 @@ impl<'a> Ui<'a> {
 
     pub fn finish(self) -> Frame {
         self.state.hot = self.state.hot_next.take();
+        self.state.scroll_hot = self.state.scroll_hot_next.take();
+        if !self.focus_seen {
+            // The focused field was not built (e.g. the page changed), so nothing can
+            // type into it or blink its caret.
+            self.state.focused = None;
+        }
         if self.input.released {
             self.state.active = None;
         }

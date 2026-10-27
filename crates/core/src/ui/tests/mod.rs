@@ -1,3 +1,10 @@
+mod chips;
+mod color;
+mod hotkey;
+mod location;
+mod nav;
+mod text;
+
 use super::theme::Rgba;
 use super::*;
 
@@ -45,9 +52,47 @@ fn hover(x: f32, y: f32) -> Input {
 }
 
 fn frame(state: &mut UiState, input: &Input, build: impl FnOnce(&mut Ui)) -> Frame {
-    let mut ui = Ui::new(&Fake, input, state, Rect::new(0.0, 0.0, 214.0, 200.0));
+    frame_in(state, input, Rect::new(0.0, 0.0, 214.0, 200.0), build)
+}
+
+fn frame_in(state: &mut UiState, input: &Input, area: Rect, build: impl FnOnce(&mut Ui)) -> Frame {
+    let mut ui = Ui::new(&Fake, input, state, area);
     build(&mut ui);
     ui.finish()
+}
+
+fn key(key: UiKey) -> KeyPress {
+    KeyPress {
+        key,
+        ctrl: false,
+        alt: false,
+        shift: false,
+        win: false,
+    }
+}
+
+fn with_keys(keys: Vec<KeyPress>) -> Input {
+    Input {
+        keys,
+        ..Input::default()
+    }
+}
+
+fn typing(s: &str) -> Input {
+    Input {
+        text: s.chars().collect(),
+        ..Input::default()
+    }
+}
+
+fn texts(f: &Frame) -> Vec<String> {
+    f.cmds
+        .iter()
+        .filter_map(|c| match c {
+            Cmd::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// "OK" button sits at (0,0) and is 38x28.
@@ -269,7 +314,7 @@ fn fills(f: &Frame) -> Vec<(Rect, Rgba)> {
 }
 
 /// Hover, press, release at (x, y) over one frame builder; returns whether the last frame clicked.
-fn click_at(st: &mut UiState, x: f32, y: f32, build: impl Fn(&mut Ui) -> bool) -> bool {
+fn click_at(st: &mut UiState, x: f32, y: f32, mut build: impl FnMut(&mut Ui) -> bool) -> bool {
     for input in [hover(x, y), hover(x, y), press(x, y)] {
         frame(st, &input, |ui| {
             build(ui);
@@ -461,4 +506,16 @@ fn segmented_shows_hover_feedback() {
     assert!(fills(last.as_ref().unwrap())
         .iter()
         .any(|f| f.1 == theme::BUTTON_BG_HOT));
+}
+
+#[test]
+fn next_width_is_cleared_by_a_new_layout() {
+    let mut st = UiState::default();
+    let f = frame(&mut st, &Input::default(), |ui| {
+        ui.next_width(100.0);
+        ui.region(Rect::new(0.0, 50.0, 200.0, 50.0), |ui| {
+            ui.button(id("a"), "OK");
+        });
+    });
+    assert_eq!(fills(&f)[0].0.w, 38.0);
 }
