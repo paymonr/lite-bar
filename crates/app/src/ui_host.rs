@@ -822,7 +822,7 @@ impl UiWindow {
                 state: UiState::default(),
                 input: InputState::default(),
                 clipboard: WinClipboard { hwnd },
-                canvas: Canvas::new(&d2d)?,
+                canvas: Canvas::opaque(&d2d)?,
                 painter: Painter::new()?,
                 _d2d: d2d,
                 scale: scale_for_dpi(dpi),

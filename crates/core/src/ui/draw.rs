@@ -28,6 +28,9 @@ impl TextStyle {
 pub trait TextMeasure {
     /// Returns (width, height) in DIPs.
     fn measure(&self, text: &str, style: TextStyle) -> (f32, f32);
+    /// Distance in DIPs from the top of a line of `style` text to its baseline, so text
+    /// of different sizes can share a baseline (`Cmd::Text` positions are top-left).
+    fn baseline(&self, style: TextStyle) -> f32;
 }
 
 #[derive(Clone, PartialEq, Debug)]

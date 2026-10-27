@@ -10,8 +10,8 @@ use lite_bar_core::ui::{Cmd, Pt, Rect, Rgba, TextMeasure, TextStyle};
 use windows::core::w;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
-    D2D_RECT_F, D2D_SIZE_U,
+    D2D1_ALPHA_MODE, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F,
+    D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
     ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1Factory, ID2D1RenderTarget, ID2D1SolidColorBrush,
@@ -19,22 +19,24 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_BITMAP_PROPERTIES, D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_CUSTOM,
     D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_LINE_JOIN_MITER,
     D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE,
-    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES,
+    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_METRICS,
+    DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_LINE_METRICS, DWRITE_TEXT_METRICS,
     DWRITE_WORD_WRAPPING_NO_WRAP,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 #[cfg(test)]
 use windows::Win32::Graphics::Gdi::GetPixel;
-use windows::Win32::Graphics::Gdi::{SelectObject, HDC};
+use windows::Win32::Graphics::Gdi::{
+    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetCurrentObject, SelectObject,
+    BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, OBJ_BITMAP,
+};
 use windows_numerics::Vector2;
 
 use crate::log;
-use crate::overlay::{Dib, MemDc};
 
 /// 1 DIP dashes: 4 on, 3 off, in stroke widths.
 const DASHES: [f32; 2] = [4.0, 3.0];
@@ -201,6 +203,16 @@ impl Fonts {
         // SAFETY: valid out-parameter.
         unsafe { layout.GetMetrics(&mut m) }?;
         Ok((m.widthIncludingTrailingWhitespace / scale, m.height / scale))
+    }
+
+    /// Top of the line to the baseline in DIPs, from the font's line metrics at `scale`.
+    fn baseline(&self, style: TextStyle, scale: f32) -> windows::core::Result<f32> {
+        let layout = self.layout("0", style, scale)?;
+        let mut lines = [DWRITE_LINE_METRICS::default(); 1];
+        let mut count = 0;
+        // SAFETY: valid out-parameters; `lines` has room for the single line.
+        unsafe { layout.GetLineMetrics(Some(&mut lines), &mut count) }?;
+        Ok(lines[0].baseline / scale)
     }
 }
 
@@ -495,6 +507,112 @@ impl TextMeasure for Measurer<'_> {
                 (0.0, style.size)
             })
     }
+
+    fn baseline(&self, style: TextStyle) -> f32 {
+        self.fonts.baseline(style, self.scale).unwrap_or_else(|e| {
+            if !self.fonts.measure_failed.replace(true) {
+                log::warn(&format!("DirectWrite text measuring failed: {e}"));
+            }
+            0.8 * style.size
+        })
+    }
+}
+
+/// Memory DC the DIB is selected into. Restores the stock bitmap before deleting the DC.
+struct MemDc {
+    dc: HDC,
+    stock: HGDIOBJ,
+}
+
+impl MemDc {
+    fn new() -> windows::core::Result<MemDc> {
+        // SAFETY: plain FFI; the DC is deleted in Drop.
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            if dc.is_invalid() {
+                return Err(windows::core::Error::from_thread());
+            }
+            Ok(MemDc {
+                dc,
+                stock: GetCurrentObject(dc, OBJ_BITMAP),
+            })
+        }
+    }
+}
+
+impl Drop for MemDc {
+    fn drop(&mut self) {
+        // SAFETY: the DC was created by CreateCompatibleDC and is deleted exactly once.
+        unsafe {
+            SelectObject(self.dc, self.stock);
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
+
+/// A 32-bit top-down DIB section. Must not be selected into a DC when dropped.
+struct Dib {
+    bitmap: HBITMAP,
+    size: Size,
+}
+
+impl Dib {
+    fn new(dc: HDC, size: Size) -> windows::core::Result<Dib> {
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: size.w,
+                biHeight: -size.h, // negative: top-down
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        // SAFETY: `info` is a valid BITMAPINFO and `bits` a valid out-pointer.
+        let bitmap =
+            unsafe { CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) }?;
+        Ok(Dib { bitmap, size })
+    }
+}
+
+#[cfg(test)]
+impl Dib {
+    /// Premultiplied `[b, g, r, a]` at (x, y), read straight from the DIB's bits.
+    fn pixel_bgra(&self, x: i32, y: i32) -> [u8; 4] {
+        use windows::Win32::Graphics::Gdi::{GdiFlush, GetObjectW, DIBSECTION};
+        assert!(x >= 0 && y >= 0 && x < self.size.w && y < self.size.h);
+        let mut ds = DIBSECTION::default();
+        // SAFETY: `ds` is a valid out-buffer; the bits stay valid while the DIB lives and the
+        // read stays inside the w×h×4 top-down buffer.
+        unsafe {
+            let _ = GdiFlush();
+            let n = GetObjectW(
+                self.bitmap.into(),
+                size_of::<DIBSECTION>() as i32,
+                Some((&mut ds as *mut DIBSECTION).cast()),
+            );
+            assert!(n > 0, "GetObjectW failed");
+            let row = ds.dsBm.bmWidthBytes as usize;
+            let p = ds
+                .dsBm
+                .bmBits
+                .cast::<u8>()
+                .add(y as usize * row + x as usize * 4);
+            std::ptr::read(p.cast::<[u8; 4]>())
+        }
+    }
+}
+
+impl Drop for Dib {
+    fn drop(&mut self) {
+        // SAFETY: the bitmap is owned by this value and deselected from its DC beforehand.
+        unsafe {
+            let _ = DeleteObject(self.bitmap.into());
+        }
+    }
 }
 
 /// A software DC render target drawing into a memory DIB, reallocated only on resize.
@@ -506,13 +624,30 @@ pub(crate) struct Canvas {
 }
 
 impl Canvas {
-    pub(crate) fn new(d2d: &ID2D1Factory) -> windows::core::Result<Canvas> {
+    /// For an opaque window; allows ClearType text.
+    pub(crate) fn opaque(d2d: &ID2D1Factory) -> windows::core::Result<Canvas> {
+        Canvas::new(d2d, D2D1_ALPHA_MODE_IGNORE)
+    }
+
+    /// Premultiplied alpha for a layered window, with grayscale text (ClearType needs an
+    /// opaque background).
+    pub(crate) fn transparent(d2d: &ID2D1Factory) -> windows::core::Result<Canvas> {
+        let canvas = Canvas::new(d2d, D2D1_ALPHA_MODE_PREMULTIPLIED)?;
+        // SAFETY: plain COM call.
+        unsafe {
+            canvas
+                .target
+                .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE)
+        };
+        Ok(canvas)
+    }
+
+    fn new(d2d: &ID2D1Factory, alpha: D2D1_ALPHA_MODE) -> windows::core::Result<Canvas> {
         let props = D2D1_RENDER_TARGET_PROPERTIES {
             r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
             pixelFormat: D2D1_PIXEL_FORMAT {
                 format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                // The window is opaque, which also allows ClearType text.
-                alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                alphaMode: alpha,
             },
             // One DIP is one pixel; the painter applies the DPI scale.
             dpiX: 96.0,
@@ -563,6 +698,12 @@ impl Canvas {
         self.dc.dc
     }
 
+    /// Premultiplied `[b, g, r, a]` of the last drawn pixels at (x, y).
+    #[cfg(test)]
+    pub(crate) fn pixel_bgra(&self, x: i32, y: i32) -> [u8; 4] {
+        self.dib.as_ref().expect("drawn").pixel_bgra(x, y)
+    }
+
     #[cfg(test)]
     pub(crate) fn pixel(&self, x: i32, y: i32) -> u32 {
         // SAFETY: plain GDI call on our memory DC.
@@ -585,13 +726,11 @@ mod tests {
 
 #[cfg(test)]
 mod win_tests {
+    use super::*;
     use lite_bar_core::ui::theme;
     use windows::Win32::Graphics::Direct2D::{
         D2D1CreateFactory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     };
-    use windows::Win32::Graphics::DirectWrite::DWRITE_LINE_METRICS;
-
-    use super::*;
 
     /// COLORREF (0x00BBGGRR) of an opaque color.
     fn colorref(c: Rgba) -> u32 {
@@ -618,7 +757,7 @@ mod win_tests {
     fn new_canvas() -> Canvas {
         let d2d: ID2D1Factory =
             unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }.unwrap();
-        Canvas::new(&d2d).unwrap()
+        Canvas::opaque(&d2d).unwrap()
     }
 
     #[test]
@@ -664,6 +803,43 @@ mod win_tests {
         );
         let (wb, _) = p.measurer(1.0).measure("iiii", TextStyle::BODY);
         assert!(wm > wb, "Consolas is wider for i: {wm} vs {wb}");
+    }
+
+    #[test]
+    fn baseline_matches_directwrite() {
+        let p = Painter::new().unwrap();
+        let style = TextStyle {
+            size: 18.0,
+            bold: true,
+            mono: true,
+        };
+        let dwrite: IDWriteFactory =
+            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.unwrap();
+        let line_baseline = unsafe {
+            let f = dwrite
+                .CreateTextFormat(
+                    w!("Consolas"),
+                    None,
+                    DWRITE_FONT_WEIGHT_BOLD,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    18.0,
+                    w!(""),
+                )
+                .unwrap();
+            let text: Vec<u16> = "144".encode_utf16().collect();
+            let l = dwrite.CreateTextLayout(&text, &f, 4096.0, 4096.0).unwrap();
+            let mut lines = [DWRITE_LINE_METRICS::default(); 1];
+            let mut n = 0;
+            l.GetLineMetrics(Some(&mut lines), &mut n).unwrap();
+            lines[0].baseline
+        };
+        let b = p.measurer(1.0).baseline(style);
+        assert!(b > 10.0, "baseline {b}");
+        assert!((b - line_baseline).abs() < 0.5, "{b} vs {line_baseline}");
+        // In DIPs at any scale.
+        let b2 = p.measurer(2.0).baseline(style);
+        assert!((b2 - b).abs() < 1.0, "{b2} vs {b}");
     }
 
     #[test]

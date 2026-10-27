@@ -13,6 +13,9 @@ impl TextMeasure for Fake {
     fn measure(&self, text: &str, style: TextStyle) -> (f32, f32) {
         (7.0 * text.chars().count() as f32, style.size)
     }
+    fn baseline(&self, style: TextStyle) -> f32 {
+        0.8 * style.size
+    }
 }
 
 fn at(x: f32, y: f32) -> Option<Pt> {

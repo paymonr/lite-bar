@@ -1,36 +1,21 @@
-//! Click-through, never-activating, top-most overlay window drawn with Direct2D.
+//! Click-through, never-activating, top-most overlay window.
 //!
-//! Text is rendered by a software `ID2D1DCRenderTarget` into a 32-bit premultiplied top-down DIB
+//! The overlay's look comes from core `overlay_cmds` (shared with the settings preview), painted
+//! by `Painter` through a software `ID2D1DCRenderTarget` into a 32-bit premultiplied top-down DIB
 //! and pushed to a layered window with `UpdateLayeredWindow`, so no GPU driver is loaded.
 
 use std::sync::Once;
 
-use lite_bar_core::color::{rgba_f32, Rgb};
 use lite_bar_core::layout::{overlay_origin, Size, StatsText, BASE_MARGIN_PX};
+use lite_bar_core::overlay_draw::overlay_cmds;
 use lite_bar_core::settings::{OverlaySettings, StatsLayout};
-use windows::core::{w, IUnknown, Interface, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
-use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D_RECT_F,
-};
+use windows::core::{w, PCWSTR};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, SIZE, WPARAM};
+use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1Factory, D2D1_DRAW_TEXT_OPTIONS_NONE,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_RENDER_TARGET_USAGE_NONE, D2D1_ROUNDED_RECT,
-    D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
+    D2D1CreateFactory, ID2D1Factory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
 };
-use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
-    DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-    DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_BOLD, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_LINE_METRICS,
-    DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE, DWRITE_WORD_WRAPPING_NO_WRAP,
-};
-use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
-use windows::Win32::Graphics::Gdi::{
-    CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetCurrentObject, SelectObject,
-    AC_SRC_ALPHA, AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
-    HBITMAP, HDC, HGDIOBJ, OBJ_BITMAP,
-};
+use windows::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, BLENDFUNCTION};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SetWindowPos, ShowWindow,
@@ -38,20 +23,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SW_SHOWNOACTIVATE, ULW_ALPHA, WM_CLOSE, WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
-use windows_numerics::Vector2;
+
+use crate::ui_paint::{Canvas, Painter};
 
 const CLASS_NAME: PCWSTR = w!("LiteBarOverlay");
-const FONT_FAMILY: PCWSTR = w!("Consolas");
-const LABEL_TEXT: &str = "FPS";
-/// Widest text the box always has room for, so it doesn't jump between 99 and 100.
-const MIN_NUMBER_TEXT: &str = "000";
-// Metrics at 100% DPI; multiplied by the DPI scale.
-const BASE_PAD_X: f32 = 8.0;
-const BASE_PAD_Y: f32 = 4.0;
-const BASE_GAP: f32 = 4.0;
-const BASE_RADIUS: f32 = 4.0;
-/// Inline stats sit this many gaps to the right of the `FPS` label.
-const INLINE_STATS_GAP_FACTOR: f32 = 3.0;
 /// Placeholder shown until the first `update`.
 const INITIAL_TEXT: &str = "—";
 
@@ -104,114 +79,11 @@ impl Drop for OwnedWindow {
     }
 }
 
-/// Memory DC the DIB is selected into. Restores the stock bitmap before deleting the DC.
-pub(crate) struct MemDc {
-    pub(crate) dc: HDC,
-    stock: HGDIOBJ,
-}
-
-impl MemDc {
-    pub(crate) fn new() -> windows::core::Result<MemDc> {
-        // SAFETY: plain FFI; the DC is deleted in Drop.
-        unsafe {
-            let dc = CreateCompatibleDC(None);
-            if dc.is_invalid() {
-                return Err(windows::core::Error::from_thread());
-            }
-            Ok(MemDc {
-                dc,
-                stock: GetCurrentObject(dc, OBJ_BITMAP),
-            })
-        }
-    }
-}
-
-impl Drop for MemDc {
-    fn drop(&mut self) {
-        // SAFETY: the DC was created by CreateCompatibleDC and is deleted exactly once.
-        unsafe {
-            SelectObject(self.dc, self.stock);
-            let _ = DeleteDC(self.dc);
-        }
-    }
-}
-
-/// A 32-bit top-down DIB section. Must not be selected into a DC when dropped.
-pub(crate) struct Dib {
-    pub(crate) bitmap: HBITMAP,
-    pub(crate) size: Size,
-}
-
-impl Dib {
-    pub(crate) fn new(dc: HDC, size: Size) -> windows::core::Result<Dib> {
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: size.w,
-                biHeight: -size.h, // negative: top-down
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bits = std::ptr::null_mut();
-        // SAFETY: `info` is a valid BITMAPINFO and `bits` a valid out-pointer.
-        let bitmap =
-            unsafe { CreateDIBSection(Some(dc), &info, DIB_RGB_COLORS, &mut bits, None, 0) }?;
-        Ok(Dib { bitmap, size })
-    }
-}
-
-impl Drop for Dib {
-    fn drop(&mut self) {
-        // SAFETY: the bitmap is owned by this value and deselected from its DC beforehand.
-        unsafe {
-            let _ = DeleteObject(self.bitmap.into());
-        }
-    }
-}
-
-/// Text resources that only depend on the text size and DPI scale.
-struct Style {
-    key: (u16, u16, f32),
-    number_format: IDWriteTextFormat,
-    stats_format: IDWriteTextFormat,
-    label_layout: IDWriteTextLayout,
-    label_width: f32,
-    label_height: f32,
-    label_baseline: f32,
-    min_number_width: f32,
-}
-
-/// Everything needed to paint one frame.
-struct Frame {
-    size: Size,
-    number: IDWriteTextLayout,
-    number_pos: Vector2,
-    label_pos: Vector2,
-    stats: Option<StatsFrame>,
-    radius: f32,
-}
-
-/// The stats line: its layout, position and the UTF-16 ranges drawn in the label color.
-struct StatsFrame {
-    layout: IDWriteTextLayout,
-    pos: Vector2,
-    label_ranges: Vec<(usize, usize)>,
-}
-
 pub struct Overlay {
-    // Drop order matters: render target before the DC/DIB it was bound to; the DC before the DIB
-    // (so the DIB is deselected first).
     window: OwnedWindow,
-    target: ID2D1DCRenderTarget,
-    dwrite: IDWriteFactory,
-    _d2d: ID2D1Factory,
-    dc: MemDc,
-    dib: Option<Dib>,
-    style: Option<Style>,
+    /// Holds a reference to the canvas's target, so it is dropped first.
+    painter: Painter,
+    canvas: Canvas,
     settings: OverlaySettings,
     text: String,
     stats: Option<StatsText>,
@@ -249,30 +121,11 @@ impl Overlay {
             let window = OwnedWindow(hwnd);
 
             let d2d: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-            // dpi 96 makes one DIP equal one pixel, so sizes below are plain pixels.
-            let props = D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-                pixelFormat: windows::Win32::Graphics::Direct2D::Common::D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
-                dpiX: 96.0,
-                dpiY: 96.0,
-                usage: D2D1_RENDER_TARGET_USAGE_NONE,
-                minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
-            };
-            let target = d2d.CreateDCRenderTarget(&props)?;
-            target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
 
             Ok(Overlay {
                 window,
-                target,
-                dwrite,
-                _d2d: d2d,
-                dc: MemDc::new()?,
-                dib: None,
-                style: None,
+                painter: Painter::new()?,
+                canvas: Canvas::transparent(&d2d)?,
                 settings: settings.clone(),
                 text: INITIAL_TEXT.to_owned(),
                 stats: None,
@@ -406,249 +259,32 @@ impl Overlay {
         }
     }
 
-    fn style(&mut self) -> windows::core::Result<&Style> {
-        let key = (
-            self.settings.counter_size,
-            self.settings.text_size,
-            self.scale,
-        );
-        if self.style.as_ref().map(|s| s.key) != Some(key) {
-            let number_px = px(f32::from(self.settings.counter_size), self.scale);
-            let label_px = px(f32::from(self.settings.text_size), self.scale);
-            let number_format = self.format(DWRITE_FONT_WEIGHT_BOLD, number_px)?;
-            let label_format = self.format(DWRITE_FONT_WEIGHT_NORMAL, label_px)?;
-            let label_layout = self.layout(LABEL_TEXT, &label_format)?;
-            let (label_width, label_height, label_baseline) = measure(&label_layout)?;
-            let min_layout = self.layout(MIN_NUMBER_TEXT, &number_format)?;
-            let (min_number_width, ..) = measure(&min_layout)?;
-            self.style = Some(Style {
-                key,
-                number_format,
-                stats_format: label_format,
-                label_layout,
-                label_width,
-                label_height,
-                label_baseline,
-                min_number_width,
-            });
-        }
-        Ok(self.style.as_ref().expect("style was just built"))
-    }
-
-    fn format(
-        &self,
-        weight: DWRITE_FONT_WEIGHT,
-        size_px: f32,
-    ) -> windows::core::Result<IDWriteTextFormat> {
-        // SAFETY: plain COM call. A missing font falls back to a system default inside DirectWrite.
-        unsafe {
-            self.dwrite.CreateTextFormat(
-                FONT_FAMILY,
-                None,
-                weight,
-                DWRITE_FONT_STYLE_NORMAL,
-                DWRITE_FONT_STRETCH_NORMAL,
-                size_px,
-                w!(""),
-            )
-        }
-    }
-
-    fn layout(
-        &self,
-        text: &str,
-        format: &IDWriteTextFormat,
-    ) -> windows::core::Result<IDWriteTextLayout> {
-        let wide: Vec<u16> = text.encode_utf16().collect();
-        // SAFETY: plain COM calls with valid arguments.
-        unsafe {
-            let layout = self
-                .dwrite
-                .CreateTextLayout(&wide, format, 4096.0, 4096.0)?;
-            layout.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP)?;
-            Ok(layout)
-        }
-    }
-
-    fn build_frame(&mut self) -> windows::core::Result<Frame> {
-        let scale = self.scale;
-        let text = self.text.clone();
-        let stats_text = self.stats.clone();
-        let layout_mode = self.settings.stats;
-        let (
-            number_format,
-            stats_format,
-            label_width,
-            label_height,
-            label_baseline,
-            min_number_width,
-        ) = {
-            let s = self.style()?;
-            (
-                s.number_format.clone(),
-                s.stats_format.clone(),
-                s.label_width,
-                s.label_height,
-                s.label_baseline,
-                s.min_number_width,
-            )
-        };
-        let number = self.layout(&text, &number_format)?;
-        let (number_width, number_height, number_baseline) = measure(&number)?;
-
-        let pad_x = px(BASE_PAD_X, scale);
-        let pad_y = px(BASE_PAD_Y, scale);
-        let gap = px(BASE_GAP, scale);
-        let number_box = number_width.max(min_number_width).ceil();
-        // The label sits on the number's baseline.
-        let label_dy = number_baseline - label_baseline;
-        let content_h = number_height.max(label_dy + label_height);
-        let label_right = pad_x + number_box + gap + label_width.ceil();
-
-        let mut width = label_right + pad_x;
-        let mut height = pad_y * 2.0 + content_h;
-        let mut stats = None;
-        if let Some(st) = stats_text {
-            let layout = self.layout(&st.text, &stats_format)?;
-            let (stats_width, stats_height, stats_baseline) = measure(&layout)?;
-            let pos = if layout_mode == StatsLayout::Stacked {
-                // Under the number, left-aligned with it.
-                width = width.max(pad_x * 2.0 + stats_width.ceil());
-                height += stats_height.ceil();
-                Vector2 {
-                    X: pad_x,
-                    Y: pad_y + content_h,
-                }
-            } else {
-                // Right of the label, on the number's baseline.
-                let x = label_right + gap * INLINE_STATS_GAP_FACTOR;
-                let dy = number_baseline - stats_baseline;
-                width = x + stats_width.ceil() + pad_x;
-                height = height.max(pad_y * 2.0 + dy + stats_height);
-                Vector2 {
-                    X: x,
-                    Y: pad_y + dy,
-                }
-            };
-            stats = Some(StatsFrame {
-                layout,
-                pos,
-                label_ranges: st.label_ranges,
-            });
-        }
-
-        Ok(Frame {
-            size: Size {
-                w: width.ceil() as i32,
-                h: height.ceil() as i32,
-            },
-            number,
-            number_pos: Vector2 { X: pad_x, Y: pad_y },
-            label_pos: Vector2 {
-                X: pad_x + number_box + gap,
-                Y: pad_y + label_dy,
-            },
-            stats,
-            radius: px(BASE_RADIUS, scale),
-        })
-    }
-
-    /// Paints the current text into the DIB and returns its size.
+    /// Paints the current text into the DIB and returns its size in pixels.
     fn draw(&mut self) -> windows::core::Result<Size> {
-        let frame = self.build_frame()?;
-        let size = Size {
-            w: frame.size.w.max(1),
-            h: frame.size.h.max(1),
-        };
-
-        if self.dib.as_ref().map(|d| d.size) != Some(size) {
-            let dib = Dib::new(self.dc.dc, size)?;
-            // SAFETY: the new bitmap is valid; the previous DIB is deselected by this call
-            // and only then dropped (by the assignment below).
-            unsafe {
-                SelectObject(self.dc.dc, dib.bitmap.into());
-            }
-            self.dib = Some(dib);
-        }
-
-        let (nc, lc, bg) = (
-            color(self.settings.number_color, 100),
-            color(self.settings.label_color, 100),
-            color(
-                self.settings.background_color,
-                self.settings.background_opacity,
-            ),
+        let scale = self.scale;
+        let (dip, cmds) = overlay_cmds(
+            &self.painter.measurer(scale),
+            &self.settings,
+            &self.text,
+            self.stats.as_ref(),
         );
-        let style = self.style.as_ref().expect("style built by build_frame");
-        let bounds = RECT {
-            left: 0,
-            top: 0,
-            right: size.w,
-            bottom: size.h,
+        // Rounded like the painter rounds the background rect, so it fills the DIB exactly.
+        let size = Size {
+            w: (px(dip.w as f32, scale) as i32).max(1),
+            h: (px(dip.h as f32, scale) as i32).max(1),
         };
-        // SAFETY: plain COM calls. BeginDraw is always paired with EndDraw (no early return
-        // between them); brushes and text effects are set up first so their errors can't leave a draw open.
-        unsafe {
-            let number_brush = self.target.CreateSolidColorBrush(&nc, None)?;
-            let label_brush = self.target.CreateSolidColorBrush(&lc, None)?;
-            let bg_brush = self.target.CreateSolidColorBrush(&bg, None)?;
-            if let Some(stats) = &frame.stats {
-                // Values use the layout's default brush; the labels get their own color.
-                let effect: IUnknown = label_brush.cast()?;
-                for &(start, len) in &stats.label_ranges {
-                    stats.layout.SetDrawingEffect(
-                        &effect,
-                        DWRITE_TEXT_RANGE {
-                            startPosition: start as u32,
-                            length: len as u32,
-                        },
-                    )?;
-                }
-            }
-            self.target.BindDC(self.dc.dc, &bounds)?;
-            self.target.BeginDraw();
-            self.target.Clear(Some(&D2D1_COLOR_F::default()));
-            self.target.FillRoundedRectangle(
-                &D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F {
-                        left: 0.0,
-                        top: 0.0,
-                        right: size.w as f32,
-                        bottom: size.h as f32,
-                    },
-                    radiusX: frame.radius,
-                    radiusY: frame.radius,
-                },
-                &bg_brush,
-            );
-            self.target.DrawTextLayout(
-                frame.number_pos,
-                &frame.number,
-                &number_brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-            );
-            self.target.DrawTextLayout(
-                frame.label_pos,
-                &style.label_layout,
-                &label_brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-            );
-            if let Some(stats) = &frame.stats {
-                self.target.DrawTextLayout(
-                    stats.pos,
-                    &stats.layout,
-                    &number_brush,
-                    D2D1_DRAW_TEXT_OPTIONS_NONE,
-                );
-            }
-            self.target.EndDraw(None, None)?;
-        }
+        let painter = &mut self.painter;
+        self.canvas.draw(size, |target| {
+            // SAFETY: plain COM call inside the canvas's BeginDraw/EndDraw.
+            unsafe { target.Clear(Some(&D2D1_COLOR_F::default())) };
+            painter.paint(target, &cmds, scale)
+        })?;
         Ok(size)
     }
 
     /// Pushes the DIB to the layered window at `origin`.
     fn push(&self, origin: (i32, i32)) -> windows::core::Result<()> {
-        let size = self.dib.as_ref().map(|d| d.size).unwrap_or(self.size);
+        let size = self.size;
         let dst = POINT {
             x: origin.0,
             y: origin.1,
@@ -664,14 +300,14 @@ impl Overlay {
             SourceConstantAlpha: 255,
             AlphaFormat: AC_SRC_ALPHA as u8,
         };
-        // SAFETY: all pointers refer to live locals; the DC holds the DIB selected in `draw`.
+        // SAFETY: all pointers refer to live locals; the canvas's DC holds the DIB drawn in `draw`.
         unsafe {
             UpdateLayeredWindow(
                 self.window.0,
                 None,
                 Some(&dst),
                 Some(&sz),
-                Some(self.dc.dc),
+                Some(self.canvas.dc()),
                 Some(&src),
                 COLORREF(0),
                 Some(&blend),
@@ -681,28 +317,10 @@ impl Overlay {
     }
 }
 
-/// Straight-alpha Direct2D color; D2D premultiplies when blending.
-fn color(rgb: Rgb, opacity_pct: u8) -> D2D1_COLOR_F {
-    let [r, g, b, a] = rgba_f32(rgb, opacity_pct);
-    D2D1_COLOR_F { r, g, b, a }
-}
-
-/// (width, height, baseline) of a single-line layout.
-fn measure(layout: &IDWriteTextLayout) -> windows::core::Result<(f32, f32, f32)> {
-    let mut metrics = DWRITE_TEXT_METRICS::default();
-    let mut lines = [DWRITE_LINE_METRICS::default(); 1];
-    let mut count = 0u32;
-    // SAFETY: plain COM calls with valid out-parameters; `lines` has room for the single line.
-    unsafe {
-        layout.GetMetrics(&mut metrics)?;
-        layout.GetLineMetrics(Some(&mut lines), &mut count)?;
-    }
-    Ok((metrics.width, metrics.height, lines[0].baseline))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lite_bar_core::color::Rgb;
     use lite_bar_core::layout::stats_text;
     use lite_bar_core::settings::{Location, Settings, StatsLayout};
     use windows::Win32::Foundation::RECT;
@@ -799,6 +417,42 @@ mod tests {
         o.update("144", None);
         let big = window_size(&o);
         assert!(big.0 > small.0, "{small:?} -> {big:?}");
+    }
+
+    #[test]
+    fn painted_overlay_shows_background_opacity_and_number_color() {
+        let mut s = Settings::default().overlay;
+        s.background_color = Rgb { r: 0, g: 0, b: 0 };
+        s.background_opacity = 40;
+        s.number_color = Rgb {
+            r: 0x20,
+            g: 0xF0,
+            b: 0x40,
+        };
+        s.stats = StatsLayout::Off;
+        let mut o = Overlay::new(&s).unwrap();
+        o.update("888", None);
+        let (w, h) = window_size(&o);
+        let dib = &o.canvas;
+        assert_eq!(o.size, Size { w, h });
+        // Left padding, away from the rounded corners: background only.
+        let bg = dib.pixel_bgra(2, h / 2);
+        assert_eq!(bg[..3], [0, 0, 0], "black background");
+        assert!(bg[3].abs_diff(102) <= 1, "alpha {} for 40%", bg[3]);
+        // Transparent outside the rounded corner.
+        assert_eq!(dib.pixel_bgra(0, 0)[3], 0, "corner is cut");
+        // Fully covered glyph pixels show the opaque number color.
+        let number_px = (0..h)
+            .flat_map(|y| (0..w).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let p = dib.pixel_bgra(x, y);
+                p[3] == 255
+                    && p[0].abs_diff(0x40) <= 2
+                    && p[1].abs_diff(0xF0) <= 2
+                    && p[2].abs_diff(0x20) <= 2
+            })
+            .count();
+        assert!(number_px > 10, "{number_px} number-colored pixels");
     }
 
     #[test]
