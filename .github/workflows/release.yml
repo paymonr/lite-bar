@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+      - name: Build
+        run: cargo build --release -p lite-bar
+      - name: Read version and check for an existing release
+        id: ver
+        shell: pwsh
+        run: |
+          $meta = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($meta.packages | Where-Object { $_.name -eq 'lite-bar' }).version
+          if (-not $version) { throw 'lite-bar package version not found' }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          gh release view "v$version" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Output "::notice::Release v$version already exists; nothing to publish."
+            "exists=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "exists=false" >> $env:GITHUB_OUTPUT
+          }
+          $global:LASTEXITCODE = 0
+      - name: Checksum
+        if: steps.ver.outputs.exists == 'false'
+        shell: pwsh
+        run: |
+          Copy-Item target/release/lite-bar.exe lite-bar.exe
+          $hash = (Get-FileHash -Algorithm SHA256 lite-bar.exe).Hash.ToLowerInvariant()
+          $path = Join-Path $PWD 'lite-bar.exe.sha256'
+          [IO.File]::WriteAllText($path, "$hash  lite-bar.exe`n", (New-Object System.Text.UTF8Encoding($false)))
+      - name: Publish release
+        if: steps.ver.outputs.exists == 'false'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          gh release create "v$env:VERSION" lite-bar.exe lite-bar.exe.sha256 --title "Lite Bar v$env:VERSION" --generate-notes --target $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

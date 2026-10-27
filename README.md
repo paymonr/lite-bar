@@ -32,6 +32,16 @@ scripts/xwin.sh build --release -p lite-bar
 
 FPS capture needs an elevated (administrator) run in M1.
 
+CI builds natively on a Windows runner with a plain `cargo build --release -p lite-bar`; the cross-compile setup above is only for local development in WSL2. Pull requests are checked by `.github/workflows/ci.yml` (`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`).
+
+## Releases
+
+For maintainers. Releases are published automatically:
+
+1. In a pull request, bump `version` in the root `Cargo.toml` under `[workspace.package]`.
+2. Merge it to `master`. `.github/workflows/release.yml` runs the checks, builds `lite-bar.exe` and, if release `v<version>` doesn't exist yet, publishes it with two assets: `lite-bar.exe` and `lite-bar.exe.sha256` (`<hex>  lite-bar.exe`). The updater downloads exactly these names from the latest release.
+3. A merge to `master` without a version bump publishes nothing, because the tag already exists.
+
 ## Using Lite Bar
 
 Lite Bar lives in the system tray and shows an FPS overlay for the foreground application. It shows `—` while the foreground application is not presenting frames. Quit it from the tray icon: right-click, then **Quit**.
