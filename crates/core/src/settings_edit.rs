@@ -80,7 +80,13 @@ pub fn edit_settings_text(text: &str, changes: &[SettingsChange]) -> Result<Stri
     for change in changes {
         edit_doc(&mut doc, change)?;
     }
-    Ok(doc.to_string())
+    let out = doc.to_string();
+    // toml_edit writes LF for every line it adds or re-emits; keep a CRLF file CRLF.
+    if text.contains("\r\n") {
+        Ok(out.replace("\r\n", "\n").replace('\n', "\r\n"))
+    } else {
+        Ok(out)
+    }
 }
 
 fn edit_doc(doc: &mut DocumentMut, change: &SettingsChange) -> Result<(), String> {
@@ -267,6 +273,24 @@ mod tests {
         assert!(edit_settings_text("this = = [", &[SettingsChange::Visible(true)]).is_err());
     }
 
+    #[test]
+    fn crlf_file_stays_crlf_and_untouched_lines_identical() {
+        let input = "# mine\r\n[overlay]\r\nvisible = true # v\r\nnumber_color = \"#000000\"\r\n\r\n[hotkeys]\r\ntoggle_overlay = \"Win+F9\"\r\n";
+        let out = edit_settings_text(
+            input,
+            &[
+                SettingsChange::NumberColor(rgb("#FF0000")),
+                SettingsChange::CounterSize(30),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "# mine\r\n[overlay]\r\nvisible = true # v\r\nnumber_color = \"#FF0000\"\r\ncounter_size = 30\r\n\r\n[hotkeys]\r\ntoggle_overlay = \"Win+F9\"\r\n"
+        );
+        assert!(!out.replace("\r\n", "").contains('\n'));
+    }
+
     fn rich_text() -> String {
         "# keep me\n[overlay]\nvisible = false\nlocation = \"bottom-right\"\nstats = \"off\"\nnumber_color = \"#010203\" # n\nlabel_color = \"#040506\"\nbackground_color = \"#070809\"\nbackground_opacity = 10\ncounter_size = 40\ntext_size = 20\n\n[hotkeys]\ntoggle_overlay = \"Win+F9\"\n\n[colors]\nsaved = [\"#112233\"]\n\n[game_names]\n\"javaw.exe\" = \"Minecraft\"\n'C:\\g.exe' = \"G\"\n".to_string()
     }
@@ -304,6 +328,11 @@ mod tests {
             SettingsChange::TextSize(6),
             SettingsChange::SavedColors(vec![rgb("#ABCDEF"), rgb("#123456")]),
             SettingsChange::SavedColors(vec![]),
+            SettingsChange::SavedColors((0..20).map(|i| Rgb { r: 0, g: 0, b: i }).collect()),
+            SettingsChange::GameName {
+                exe_path: "D:\\Games\\y\\y.exe".into(),
+                name: Some("Y".into()),
+            },
             SettingsChange::RestoreDefaults,
             SettingsChange::ToggleHotkey(hk),
             SettingsChange::GameName {
@@ -319,11 +348,19 @@ mod tests {
                 name: None,
             },
         ];
-        for text in [rich_text(), default_settings_toml(), String::new()] {
+        let out_of_range = "[overlay]\nbackground_opacity = 300\ncounter_size = 1\n".to_string();
+        for text in [
+            rich_text(),
+            default_settings_toml(),
+            String::new(),
+            out_of_range,
+        ] {
             for c in &changes {
                 let out = edit_settings_text(&text, std::slice::from_ref(c)).unwrap();
                 let (edited, w) = parse_settings(&out);
-                assert!(w.is_empty(), "{c:?}: {w:?}");
+                if !text.contains("= 300") {
+                    assert!(w.is_empty(), "{c:?}: {w:?}");
+                }
                 let base = if text.is_empty() {
                     parse_settings(&default_settings_toml()).0
                 } else {
