@@ -73,3 +73,19 @@ fn stage_gradient_is_generated_once() {
     p.idle();
     assert!(std::rc::Rc::ptr_eq(&first, &image(p.frame())));
 }
+
+#[test]
+fn preview_scales_down_to_fit_the_stage_height() {
+    let mut p = Page::new(TALL);
+    p.settings.overlay.counter_size = 72;
+    p.settings.overlay.stats = StatsLayout::Stacked;
+    p.idle();
+    let s = stage(p.frame());
+    let b = preview_box(p.frame()).unwrap();
+    assert!(
+        b.h <= s.h - 16.0 + 0.5,
+        "fits the stage height: {b:?} in {s:?}"
+    );
+    assert!(b.w <= s.w - 16.0 + 0.5);
+    assert_eq!((b.x, b.y), (s.x + 8.0, s.y + 8.0));
+}

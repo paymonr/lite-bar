@@ -86,7 +86,8 @@ pub(super) fn header(ui: &mut Ui, view: &mut SettingsView, s: &OverlaySettings, 
 }
 
 /// The overlay as `overlay_cmds` draws it, showing 144 FPS and fixed sample stats, placed
-/// in `stage` by the real overlay's rule and scaled down only if it would not fit.
+/// in `stage` by the real overlay's rule and scaled down only if it would not fit (in width
+/// or height).
 fn overlay_preview(ui: &mut Ui, s: &OverlaySettings, stage: Rect) {
     let sample = StatsSummary {
         frames: 0,
@@ -97,12 +98,16 @@ fn overlay_preview(ui: &mut Ui, s: &OverlaySettings, stage: Rect) {
     };
     let stats = stats_text(Some(&sample));
     let (size, cmds) = overlay_cmds(ui.text_measure(), s, "144", Some(&stats));
-    let room = stage.w - 2.0 * STAGE_MARGIN as f32;
-    let k = if size.w > 0 && size.w as f32 > room {
-        (room / size.w as f32).max(0.0)
-    } else {
-        1.0
+    let room_w = stage.w - 2.0 * STAGE_MARGIN as f32;
+    let room_h = stage.h - 2.0 * STAGE_MARGIN as f32;
+    let fit = |room: f32, len: i32| {
+        if len > 0 {
+            (room / len as f32).max(0.0)
+        } else {
+            1.0
+        }
     };
+    let k = fit(room_w, size.w).min(fit(room_h, size.h)).min(1.0);
     let scaled = Size {
         w: (size.w as f32 * k).round() as i32,
         h: (size.h as f32 * k).round() as i32,
