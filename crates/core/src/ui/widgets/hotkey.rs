@@ -96,7 +96,7 @@ impl Ui<'_> {
             capture.start();
             ev = HotkeyFieldEvent::Started;
         } else if capture.is_listening() {
-            if self.input.pressed && !hot {
+            if (self.input.pressed && !hot) || self.input.deactivated {
                 *capture = HotkeyCapture::Idle;
                 ev = HotkeyFieldEvent::Cancelled;
             } else {

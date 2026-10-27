@@ -197,3 +197,15 @@ fn click_reports_capture_start_and_frame_says_capturing() {
     let (_, f) = run(&mut st, &with_keys(vec![key(UiKey::Esc)]), &mut cap);
     assert!(!f.capturing_keys);
 }
+
+#[test]
+fn window_deactivation_cancels_capture() {
+    let (mut st, mut cap) = waiting();
+    let away = Input {
+        deactivated: true,
+        ..Input::default()
+    };
+    let (ev, _) = run(&mut st, &away, &mut cap);
+    assert_eq!(ev, HotkeyFieldEvent::Cancelled);
+    assert_eq!(cap, HotkeyCapture::Idle);
+}

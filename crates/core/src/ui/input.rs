@@ -50,6 +50,8 @@ pub struct Input {
     pub text: Vec<char>,
     /// Monotonic clock in milliseconds, for the caret blink and timed widgets.
     pub now_ms: u64,
+    /// The window stopped being the active one this frame (hotkey capture ends).
+    pub deactivated: bool,
 }
 
 /// The color wheel's last generated pixels, keyed by size and quantised brightness.

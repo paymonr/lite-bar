@@ -42,7 +42,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsIconic, KillTimer, LoadCursorW, RegisterClassExW, SetCursor, SetForegroundWindow, SetTimer,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA, HCURSOR, HTCLIENT, IDC_ARROW,
     IDC_HAND, IDC_IBEAM, MINMAXINFO, SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, SW_SHOW,
-    WINDOW_EX_STYLE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY,
+    WINDOW_EX_STYLE, WM_ACTIVATE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY,
     WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT,
     WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
@@ -199,6 +199,8 @@ enum Event {
     Char(u16),
     /// Capture was taken away (`WM_CAPTURECHANGED`, `WM_CANCELMODE`).
     CaptureLost,
+    /// `WM_ACTIVATE`: the window became active (true) or inactive or minimised (false).
+    Activate(bool),
 }
 
 /// Input state that persists between messages: pointer, button and a pending high surrogate.
@@ -245,6 +247,7 @@ impl InputState {
                 self.down = false;
                 input.released = true;
             }
+            Event::Activate(active) => input.deactivated = !active,
         }
         input.pointer = self.pointer;
         input.down = self.down;
@@ -378,6 +381,8 @@ struct Host {
     capturing_keys: bool,
     keys: KeysDown,
     blink_on: bool,
+    /// The window is active and not minimised; the caret only blinks then.
+    active: bool,
     /// Whether `TrackMouseEvent` is armed for the next `WM_MOUSELEAVE`.
     tracking: bool,
     /// The last frame drew something else than the one before (commands or cursor).
@@ -468,8 +473,9 @@ impl Host {
         self.capturing_keys = frame.capturing_keys;
         // SAFETY (timers and cursor): plain FFI on our own window.
         unsafe {
-            if frame.wants_caret_blink != self.blink_on {
-                self.blink_on = frame.wants_caret_blink;
+            let blink = frame.wants_caret_blink && self.active;
+            if blink != self.blink_on {
+                self.blink_on = blink;
                 if self.blink_on {
                     SetTimer(Some(self.hwnd), BLINK_TIMER, CARET_BLINK_MS as u32, None);
                 } else {
@@ -816,6 +822,18 @@ fn handle(shared: &Shared, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         // While capturing, Alt+letter must not beep or open a menu.
         WM_SYSCHAR if shared.with_host(|h| h.capturing_keys) == Some(true) => LRESULT(0),
+        WM_ACTIVATE => {
+            // Low word: WA_INACTIVE (0) or an active state; high word: minimised.
+            let active = wparam.0 & 0xFFFF != 0 && (wparam.0 >> 16) & 0xFFFF == 0;
+            shared.with_host(|h| {
+                h.active = active;
+                if !active {
+                    h.keys.clear();
+                }
+            });
+            shared.event(Event::Activate(active));
+            default()
+        }
         WM_KILLFOCUS => {
             shared.with_host(|h| h.keys.clear());
             default()
@@ -1015,6 +1033,7 @@ impl UiWindow {
                 capturing_keys: false,
                 keys: KeysDown::default(),
                 blink_on: false,
+                active: true,
                 tracking: false,
                 changed: true,
                 #[cfg(test)]
@@ -1651,6 +1670,34 @@ mod win_tests {
         send(&w, WM_CHAR, 0xDD1E, 0);
         send(&w, WM_CHAR, 'i' as usize, 0);
         assert_eq!(edit.borrow().text, "h𝄞i");
+    }
+
+    #[test]
+    fn caret_blink_stops_while_inactive_and_resumes() {
+        use windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE;
+        let edit = Rc::new(RefCell::new(TextEdit::default()));
+        let w = UiWindow::create(
+            "t",
+            (300.0, 200.0),
+            (480.0, 320.0),
+            Box::new(FieldApp { edit: edit.clone() }),
+            false,
+        )
+        .unwrap();
+        let s = w.scale();
+        let p = at(dip_to_px(10.0, s), dip_to_px(10.0, s));
+        send(&w, WM_MOUSEMOVE, 0, p);
+        send(&w, WM_LBUTTONDOWN, 1, p);
+        send(&w, WM_LBUTTONUP, 0, p);
+        assert!(w.blink_active());
+        send(&w, WM_ACTIVATE, 0, 0); // WA_INACTIVE
+        assert!(!w.blink_active(), "no blinking in the background");
+        send(&w, WM_ACTIVATE, 1, 0); // WA_ACTIVE
+        assert!(w.blink_active(), "blinks again when active");
+        // Minimised (high word set) counts as inactive.
+        send(&w, WM_ACTIVATE, 0x0001_0001, 0);
+        assert!(!w.blink_active());
+        w.close();
     }
 
     #[test]
