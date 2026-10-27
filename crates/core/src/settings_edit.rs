@@ -3,7 +3,7 @@
 //! The settings window applies each change live and writes it into the file without losing the
 //! user's comments: `edit_settings_text` touches only the values of the keys involved.
 
-use toml_edit::{Array, DocumentMut, Item, Table, Value};
+use toml_edit::{Array, DocumentMut, Item, RawString, Table, Value};
 
 use crate::color::Rgb;
 use crate::hotkey::Hotkey;
@@ -153,7 +153,28 @@ fn edit_doc(doc: &mut DocumentMut, change: &SettingsChange) -> Result<(), String
             set(doc, "hotkeys", "toggle_overlay", v.to_string().into())
         }
         SettingsChange::GameName { exe_path, name } => match name {
-            Some(n) => set(doc, "game_names", exe_path, n.as_str().into()),
+            Some(n) => {
+                let is_new = doc
+                    .get("game_names")
+                    .and_then(Item::as_table)
+                    .is_none_or(|t| !t.contains_key(exe_path));
+                let comments = if is_new {
+                    take_tail_comments(doc, "game_names")
+                } else {
+                    String::new()
+                };
+                set(doc, "game_names", exe_path, n.as_str().into())?;
+                if !comments.is_empty() {
+                    if let Some(mut key) = doc
+                        .get_mut("game_names")
+                        .and_then(Item::as_table_mut)
+                        .and_then(|t| t.key_mut(exe_path))
+                    {
+                        key.leaf_decor_mut().set_prefix(comments);
+                    }
+                }
+                Ok(())
+            }
             None => {
                 if let Some(table) = doc.get_mut("game_names").and_then(Item::as_table_mut) {
                     table.remove(exe_path);
@@ -162,6 +183,56 @@ fn edit_doc(doc: &mut DocumentMut, change: &SettingsChange) -> Result<(), String
             }
         },
     }
+}
+
+/// Takes the comment lines right after `section`'s last entry (up to the first blank line) out
+/// of the text that follows it, so a new entry can go after them instead of above them.
+/// toml_edit keeps those lines in the next table's header prefix, or the document's trailing
+/// text when the section is the last one.
+fn take_tail_comments(doc: &mut DocumentMut, section: &str) -> String {
+    let Some(pos) = doc
+        .get(section)
+        .and_then(Item::as_table)
+        .and_then(Table::position)
+    else {
+        return String::new();
+    };
+    let next = doc
+        .as_table()
+        .iter()
+        .filter_map(|(k, item)| {
+            let q = item.as_table()?.position()?;
+            (q > pos).then(|| (q, k.to_string()))
+        })
+        .min()
+        .map(|(_, k)| k);
+    let text = match &next {
+        Some(k) => doc[k.as_str()]
+            .as_table()
+            .and_then(|t| t.decor().prefix())
+            .and_then(RawString::as_str),
+        None => doc.trailing().as_str(),
+    }
+    .unwrap_or("")
+    .to_string();
+    let split: usize = text
+        .split_inclusive('\n')
+        .take_while(|line| line.trim_start().starts_with('#'))
+        .map(str::len)
+        .sum();
+    if split == 0 {
+        return String::new();
+    }
+    let (comments, rest) = text.split_at(split);
+    match &next {
+        Some(k) => {
+            if let Some(t) = doc.get_mut(k).and_then(Item::as_table_mut) {
+                t.decor_mut().set_prefix(rest);
+            }
+        }
+        None => doc.set_trailing(rest),
+    }
+    comments.to_string()
 }
 
 /// Sets `section.key`, creating the section or key when missing (new keys go last). An existing
@@ -338,6 +409,34 @@ mod tests {
         assert_eq!(s.saved_colors, many[4..]);
         let out = edit_settings_text("", &[change]).unwrap();
         assert_eq!(parse_settings(&out).0.saved_colors, many[4..]);
+    }
+
+    #[test]
+    fn new_game_name_goes_after_the_sections_comments() {
+        let add = [SettingsChange::GameName {
+            exe_path: "x.exe".into(),
+            name: Some("X".into()),
+        }];
+        let out = edit_settings_text(&default_settings_toml(), &add).unwrap();
+        assert!(
+            out.ends_with("# 'C:\\Games\\Foo\\foo.exe' = \"Foo: Remastered\"\n\"x.exe\" = \"X\"\n"),
+            "{out}"
+        );
+        assert_eq!(parse_settings(&out).0.game_names["x.exe"], "X");
+
+        let input = "[game_names]\n\"a.exe\" = \"A\"\n# mine\n\n# about other\n[other]\nk = 1\n";
+        let out = edit_settings_text(input, &add).unwrap();
+        assert_eq!(
+            out,
+            "[game_names]\n\"a.exe\" = \"A\"\n# mine\n\"x.exe\" = \"X\"\n\n# about other\n[other]\nk = 1\n"
+        );
+
+        let crlf = default_settings_toml().replace('\n', "\r\n");
+        let out = edit_settings_text(&crlf, &add).unwrap();
+        assert!(
+            out.ends_with("Remastered\"\r\n\"x.exe\" = \"X\"\r\n"),
+            "{out:?}"
+        );
     }
 
     #[test]
