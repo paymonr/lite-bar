@@ -40,6 +40,8 @@ use crate::log;
 
 /// 1 DIP dashes: 4 on, 3 off, in stroke widths.
 const DASHES: [f32; 2] = [4.0, 3.0];
+/// Most text measurements kept; the cache is emptied when it would grow past this.
+const MEASURE_CACHE_CAP: usize = 64;
 
 /// Premultiplied RGBA to premultiplied BGRA, for `DXGI_FORMAT_B8G8R8A8_UNORM`.
 fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
@@ -131,6 +133,31 @@ struct Fonts {
     formats: RefCell<HashMap<(u32, bool, bool), IDWriteTextFormat>>,
     /// A measuring failure has been logged (logged once, not every frame).
     measure_failed: Cell<bool>,
+    /// `measure` results in DIPs, at most `MEASURE_CACHE_CAP` entries.
+    measures: RefCell<HashMap<(String, StyleKey), (f32, f32)>>,
+    /// `baseline` results in DIPs, at most `MEASURE_CACHE_CAP` entries.
+    baselines: RefCell<HashMap<StyleKey, f32>>,
+}
+
+/// A text style at one scale: (size bits, bold, mono, scale bits).
+type StyleKey = (u32, bool, bool, u32);
+
+fn style_key(style: TextStyle, scale: f32) -> StyleKey {
+    (
+        style.size.to_bits(),
+        style.bold,
+        style.mono,
+        scale.to_bits(),
+    )
+}
+
+/// Inserts into a cache that is emptied whenever it is full, so it never exceeds the cap.
+fn insert_bounded<K: std::hash::Hash + Eq, V>(cache: &RefCell<HashMap<K, V>>, key: K, value: V) {
+    let mut cache = cache.borrow_mut();
+    if cache.len() >= MEASURE_CACHE_CAP {
+        cache.clear();
+    }
+    cache.insert(key, value);
 }
 
 impl Fonts {
@@ -141,11 +168,14 @@ impl Fonts {
             dwrite,
             formats: RefCell::new(HashMap::new()),
             measure_failed: Cell::new(false),
+            measures: RefCell::new(HashMap::new()),
+            baselines: RefCell::new(HashMap::new()),
         })
     }
 
     fn format(&self, style: TextStyle, scale: f32) -> windows::core::Result<IDWriteTextFormat> {
-        let size_px = style.size * scale;
+        // Whole pixels, like the overlay always used.
+        let size_px = (style.size * scale).round();
         let key = (size_px.to_bits(), style.bold, style.mono);
         if let Some(f) = self.formats.borrow().get(&key) {
             return Ok(f.clone());
@@ -198,21 +228,33 @@ impl Fonts {
         style: TextStyle,
         scale: f32,
     ) -> windows::core::Result<(f32, f32)> {
+        let key = (text.to_owned(), style_key(style, scale));
+        if let Some(&size) = self.measures.borrow().get(&key) {
+            return Ok(size);
+        }
         let layout = self.layout(text, style, scale)?;
         let mut m = DWRITE_TEXT_METRICS::default();
         // SAFETY: valid out-parameter.
         unsafe { layout.GetMetrics(&mut m) }?;
-        Ok((m.widthIncludingTrailingWhitespace / scale, m.height / scale))
+        let size = (m.widthIncludingTrailingWhitespace / scale, m.height / scale);
+        insert_bounded(&self.measures, key, size);
+        Ok(size)
     }
 
     /// Top of the line to the baseline in DIPs, from the font's line metrics at `scale`.
     fn baseline(&self, style: TextStyle, scale: f32) -> windows::core::Result<f32> {
+        let key = style_key(style, scale);
+        if let Some(&b) = self.baselines.borrow().get(&key) {
+            return Ok(b);
+        }
         let layout = self.layout("0", style, scale)?;
         let mut lines = [DWRITE_LINE_METRICS::default(); 1];
         let mut count = 0;
         // SAFETY: valid out-parameters; `lines` has room for the single line.
         unsafe { layout.GetLineMetrics(Some(&mut lines), &mut count) }?;
-        Ok(lines[0].baseline / scale)
+        let b = lines[0].baseline / scale;
+        insert_bounded(&self.baselines, key, b);
+        Ok(b)
     }
 }
 
@@ -488,6 +530,11 @@ impl Painter {
     fn cached_images(&self) -> usize {
         self.images.len()
     }
+
+    #[cfg(test)]
+    fn cached_measures(&self) -> usize {
+        self.fonts.measures.borrow().len()
+    }
 }
 
 /// `TextMeasure` for one frame at one scale.
@@ -728,6 +775,7 @@ mod tests {
 mod win_tests {
     use super::*;
     use lite_bar_core::ui::theme;
+    use windows::core::PCWSTR;
     use windows::Win32::Graphics::Direct2D::{
         D2D1CreateFactory, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     };
@@ -758,6 +806,73 @@ mod win_tests {
         let d2d: ID2D1Factory =
             unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }.unwrap();
         Canvas::opaque(&d2d).unwrap()
+    }
+
+    /// Width of `text` in DIPs as DirectWrite lays it out at exactly `size_px`, over `scale`.
+    fn raw_width(family: PCWSTR, bold: bool, size_px: f32, text: &str, scale: f32) -> f32 {
+        let dwrite: IDWriteFactory =
+            unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.unwrap();
+        let weight = if bold {
+            DWRITE_FONT_WEIGHT_BOLD
+        } else {
+            DWRITE_FONT_WEIGHT_NORMAL
+        };
+        unsafe {
+            let f = dwrite
+                .CreateTextFormat(
+                    family,
+                    None,
+                    weight,
+                    DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL,
+                    size_px,
+                    w!(""),
+                )
+                .unwrap();
+            let wide: Vec<u16> = text.encode_utf16().collect();
+            let l = dwrite.CreateTextLayout(&wide, &f, 4096.0, 4096.0).unwrap();
+            let mut m = DWRITE_TEXT_METRICS::default();
+            l.GetMetrics(&mut m).unwrap();
+            m.widthIncludingTrailingWhitespace / scale
+        }
+    }
+
+    #[test]
+    fn font_pixel_sizes_are_rounded() {
+        let p = Painter::new().unwrap();
+        let style = TextStyle {
+            size: 18.0,
+            bold: true,
+            mono: true,
+        };
+        let text = "0000000000";
+        // 18 × 1.25 = 22.5 → 23 px, as the old overlay rounded it.
+        let w = p.measurer(1.25).measure(text, style).0;
+        let want = raw_width(w!("Consolas"), true, 23.0, text, 1.25);
+        let unrounded = raw_width(w!("Consolas"), true, 22.5, text, 1.25);
+        assert!(
+            (w - want).abs() < 0.01,
+            "{w} vs {want} (unrounded {unrounded})"
+        );
+    }
+
+    #[test]
+    fn measurements_are_cached_and_the_cache_stays_bounded() {
+        let p = Painter::new().unwrap();
+        let m = p.measurer(1.0);
+        let first = m.measure("FPS", TextStyle::BODY);
+        assert_eq!(p.cached_measures(), 1);
+        assert_eq!(m.measure("FPS", TextStyle::BODY), first);
+        assert_eq!(p.cached_measures(), 1, "a repeat is a cache hit");
+        // Same text at another scale or style is its own entry.
+        p.measurer(2.0).measure("FPS", TextStyle::BODY);
+        m.measure("FPS", TextStyle::BOLD);
+        assert_eq!(p.cached_measures(), 3);
+        for i in 0..500 {
+            m.measure(&i.to_string(), TextStyle::BODY);
+            assert!(p.cached_measures() <= MEASURE_CACHE_CAP);
+        }
+        assert_eq!(m.measure("FPS", TextStyle::BODY), first);
     }
 
     #[test]

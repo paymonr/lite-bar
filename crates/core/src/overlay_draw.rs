@@ -119,21 +119,29 @@ fn text(pos: Pt, text: &str, style: TextStyle, color: Rgba) -> Cmd {
 
 /// Splits the stats line into consecutive non-empty parts, flagging the label ranges.
 fn stats_runs(st: &StatsText) -> Vec<(&str, bool)> {
-    // UTF-16 offset to byte offset (offsets past the end clamp to it).
-    let byte_at = |u16_pos: usize| {
-        let mut units = 0;
-        for (i, c) in st.text.char_indices() {
-            if units >= u16_pos {
-                return i;
-            }
-            units += c.len_utf16();
+    // Label start/end offsets in UTF-16 units, mapped to byte offsets in one pass over the
+    // text (offsets past the end clamp to it; overlapping ranges never go backwards).
+    let mut bounds: Vec<usize> = st
+        .label_ranges
+        .iter()
+        .flat_map(|&(start, len)| [start, start + len])
+        .collect();
+    let mut next = 0;
+    let mut units = 0;
+    for (i, c) in st.text.char_indices() {
+        while next < bounds.len() && bounds[next] <= units {
+            bounds[next] = i;
+            next += 1;
         }
-        st.text.len()
-    };
+        units += c.len_utf16();
+    }
+    for b in &mut bounds[next..] {
+        *b = st.text.len();
+    }
     let mut runs = Vec::new();
     let mut at = 0;
-    for &(start, len) in &st.label_ranges {
-        let (start, end) = (byte_at(start).max(at), byte_at(start + len).max(at));
+    for &[start, end] in bounds.as_chunks::<2>().0 {
+        let (start, end) = (start.max(at), end.max(at));
         runs.push((&st.text[at..start], false));
         runs.push((&st.text[start..end], true));
         at = end;

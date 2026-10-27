@@ -420,6 +420,24 @@ mod tests {
     }
 
     #[test]
+    fn painted_background_is_premultiplied() {
+        let mut s = Settings::default().overlay;
+        s.background_color = Rgb {
+            r: 0xFF,
+            g: 0,
+            b: 0,
+        };
+        s.background_opacity = 40;
+        let mut o = Overlay::new(&s).unwrap();
+        o.update("144", None);
+        let [b, g, r, a] = o.canvas.pixel_bgra(2, o.size.h / 2);
+        // Straight alpha would keep R at 255; premultiplied R is 255 × 0.4.
+        assert!(a.abs_diff(102) <= 1, "alpha {a}");
+        assert!(r.abs_diff(102) <= 1, "red {r}");
+        assert_eq!((g, b), (0, 0));
+    }
+
+    #[test]
     fn painted_overlay_shows_background_opacity_and_number_color() {
         let mut s = Settings::default().overlay;
         s.background_color = Rgb { r: 0, g: 0, b: 0 };
