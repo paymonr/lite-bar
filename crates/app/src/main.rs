@@ -30,6 +30,9 @@ mod tray;
 #[cfg(windows)]
 #[allow(dead_code)] // wired into the tray app by a later task
 mod ui_host;
+#[cfg(windows)]
+#[allow(dead_code)] // shared with the overlay by a later task
+mod ui_paint;
 
 #[cfg(windows)]
 use app::run;
