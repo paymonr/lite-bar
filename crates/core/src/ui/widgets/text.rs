@@ -1,15 +1,20 @@
 //! Single-line text field.
 
 use super::super::theme;
-use super::super::{Clipboard, Cmd, CursorKind, Id, Pt, Rect, TextEdit, TextStyle, Ui, UiKey};
+use super::super::{
+    tab_key, Clipboard, Cmd, CursorKind, Id, Pt, Rect, TextEdit, TextStyle, Ui, UiKey,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TextFieldEvent {
     None,
     /// The text was edited this frame.
     Changed,
-    /// Enter was pressed or the field lost focus.
+    /// Enter or Tab was pressed or the field lost focus.
     Committed,
+    /// Esc: the text went back to what it was when the field got focus, and the field
+    /// lost focus.
+    Cancelled,
 }
 
 /// Stands in when the host gave the `Ui` no clipboard.
@@ -53,6 +58,7 @@ impl Ui<'_> {
         placeholder: &str,
         style: TextStyle,
     ) -> TextFieldEvent {
+        self.focusables.push(id);
         let hot = self.hover(id, rect);
         if hot {
             self.cursor = CursorKind::IBeam;
@@ -61,7 +67,11 @@ impl Ui<'_> {
         let mut ev = TextFieldEvent::None;
         if self.input.pressed {
             if hot {
+                if self.state.focused != Some(id) {
+                    self.state.focus_revert = Some(edit.text.clone());
+                }
                 self.state.focused = Some(id);
+                self.state.focus_fresh = false;
                 edit.all_selected = false;
                 edit.last_input_ms = self.input.now_ms;
                 if let Some(p) = self.input.pointer {
@@ -76,6 +86,9 @@ impl Ui<'_> {
         }
         if self.state.focused == Some(id) {
             self.focus_seen = true;
+            if std::mem::take(&mut self.state.focus_fresh) {
+                self.state.focus_revert = Some(edit.text.clone());
+            }
             let before = edit.text.clone();
             if !self.input.text.is_empty() || !self.input.keys.is_empty() {
                 edit.last_input_ms = self.input.now_ms;
@@ -93,15 +106,29 @@ impl Ui<'_> {
                     ev = TextFieldEvent::Committed;
                     break;
                 }
+                if let Some(forward) = tab_key(k) {
+                    self.tab = Some(forward);
+                    ev = TextFieldEvent::Committed;
+                    break;
+                }
+                if k.key == UiKey::Esc {
+                    if let Some(text) = self.state.focus_revert.take() {
+                        *edit = TextEdit::new(&text);
+                    }
+                    ev = TextFieldEvent::Cancelled;
+                    break;
+                }
                 edit.apply(k, cb);
             }
-            if ev == TextFieldEvent::Committed {
+            if matches!(ev, TextFieldEvent::Committed | TextFieldEvent::Cancelled) {
                 self.state.focused = None;
+                self.state.focus_revert = None;
             } else if edit.text != before {
                 ev = TextFieldEvent::Changed;
             }
         }
         let focused = self.state.focused == Some(id);
+        self.caret_seen |= focused;
         self.draw_text_input(rect, edit, placeholder, style, focused);
         ev
     }

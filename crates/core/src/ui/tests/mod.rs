@@ -1,5 +1,6 @@
 mod chips;
 mod color;
+mod focus;
 mod hotkey;
 mod location;
 mod nav;

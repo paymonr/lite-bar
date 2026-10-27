@@ -86,6 +86,7 @@ fn game_row(ui: &mut Ui, game: &GameRow, e: &mut GameEdit, out: &mut Vec<UiActio
             TextFieldEvent::None => {}
             TextFieldEvent::Changed => e.pending = true,
             TextFieldEvent::Committed => out.extend(e.commit()),
+            TextFieldEvent::Cancelled => e.pending = false,
         },
     );
 }

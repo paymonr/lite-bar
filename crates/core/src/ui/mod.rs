@@ -39,6 +39,11 @@ pub fn id_with(base: Id, index: usize) -> Id {
     (base ^ (index as u64).wrapping_add(0x9e37_79b9_7f4a_7c15)).wrapping_mul(0x0000_0100_0000_01b3)
 }
 
+/// Tab without Ctrl, Alt or Win: `Some(true)` forward, `Some(false)` with Shift (back).
+fn tab_key(k: &KeyPress) -> Option<bool> {
+    (k.key == UiKey::Tab && !k.ctrl && !k.alt && !k.win).then_some(!k.shift)
+}
+
 /// Id used by `Ui::block` so overlays can claim the pointer.
 const BLOCKER: Id = 0;
 
@@ -82,8 +87,14 @@ pub struct Ui<'a> {
     pub clipboard: Option<&'a mut dyn text_edit::Clipboard>,
     /// `state.focused` when the frame started.
     focus_start: Option<Id>,
-    /// Whether the focused text field was built this frame.
+    /// Whether the focused widget was built this frame.
     focus_seen: bool,
+    /// Whether a focused text field (with a caret) was built this frame.
+    caret_seen: bool,
+    /// Widgets that take focus, in build order, for Tab.
+    focusables: Vec<Id>,
+    /// Tab (true) or Shift+Tab (false) moved focus away from the focused widget.
+    tab: Option<bool>,
     /// Earliest `now_ms` at which a widget needs a frame without input.
     redraw_at: Option<u64>,
     #[cfg(test)]
@@ -116,6 +127,9 @@ impl<'a> Ui<'a> {
             clipboard: None,
             focus_start,
             focus_seen: false,
+            caret_seen: false,
+            focusables: Vec::new(),
+            tab: None,
             redraw_at: None,
             #[cfg(test)]
             hits: Vec::new(),
@@ -444,7 +458,38 @@ impl<'a> Ui<'a> {
         self.redraw_at = Some(self.redraw_at.map_or(at, |r| r.min(at)));
     }
 
-    pub fn finish(self) -> Frame {
+    /// Moves focus for a Tab that the focused widget passed on, or that arrived with nothing
+    /// focused, to the next (or previous) focusable widget, wrapping around.
+    fn tab_focus(&mut self) {
+        let dir = self.tab.or_else(|| {
+            if self.focus_start.is_some() {
+                return None;
+            }
+            self.input.keys.iter().find_map(tab_key)
+        });
+        let Some(forward) = dir else {
+            return;
+        };
+        let n = self.focusables.len();
+        if n == 0 {
+            return;
+        }
+        let from = self
+            .focus_start
+            .and_then(|f| self.focusables.iter().position(|x| *x == f));
+        let next = match (from, forward) {
+            (Some(i), true) => (i + 1) % n,
+            (Some(i), false) => (i + n - 1) % n,
+            (None, true) => 0,
+            (None, false) => n - 1,
+        };
+        self.state.focused = Some(self.focusables[next]);
+        self.state.focus_fresh = true;
+        self.state.focus_revert = None;
+        self.request_redraw();
+    }
+
+    pub fn finish(mut self) -> Frame {
         self.state.hot = self.state.hot_next.take();
         self.state.scroll_hot = self.state.scroll_hot_next.take();
         if !self.focus_seen {
@@ -452,12 +497,13 @@ impl<'a> Ui<'a> {
             // type into it or blink its caret.
             self.state.focused = None;
         }
+        self.tab_focus();
         if self.input.released {
             self.state.active = None;
         }
         Frame {
             cmds: self.cmds,
-            wants_caret_blink: self.state.focused.is_some(),
+            wants_caret_blink: self.caret_seen && self.state.focused.is_some(),
             cursor: self.cursor,
             redraw_after_ms: self.redraw_at,
             #[cfg(test)]

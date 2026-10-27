@@ -68,8 +68,13 @@ pub struct UiState {
     /// Topmost widget under the pointer so far this frame; becomes `hot` at `finish`.
     pub hot_next: Option<Id>,
     pub active: Option<Id>,
-    /// The focused text field; typed text and keys go only to it.
+    /// The focused text field or hotkey field; typed text and keys go only to it.
     pub focused: Option<Id>,
+    /// Focus arrived by Tab; the focused widget takes it on its next build (a hotkey
+    /// field starts listening, a text field notes the text Esc goes back to).
+    pub focus_fresh: bool,
+    /// The focused text field's text when it got focus; Esc puts it back.
+    pub focus_revert: Option<String>,
     pub scroll: HashMap<Id, f32>,
     /// Innermost scroll area under the pointer in the previous frame; only it takes the wheel.
     pub scroll_hot: Option<Id>,

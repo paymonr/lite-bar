@@ -1,7 +1,7 @@
 //! Hotkey capture field.
 
 use super::super::theme::{self, Rgba};
-use super::super::{Cmd, HotkeyCapture, HotkeyFieldEvent, Id, Pt, Rect, TextStyle, Ui};
+use super::super::{tab_key, Cmd, HotkeyCapture, HotkeyFieldEvent, Id, Pt, Rect, TextStyle, Ui};
 use crate::hotkey::Hotkey;
 
 const KBD_STYLE: TextStyle = TextStyle {
@@ -84,14 +84,29 @@ impl Ui<'_> {
         };
         self.draw_hotkey(rect, &content, border);
 
+        self.focusables.push(id);
         let (hot, clicked) = self.interact(id, rect);
         let mut ev = HotkeyFieldEvent::None;
-        if capture.is_listening() {
+        if self.state.focused == Some(id) {
+            self.focus_seen = true;
+        }
+        let tabbed_in =
+            self.state.focused == Some(id) && std::mem::take(&mut self.state.focus_fresh);
+        if tabbed_in && !capture.is_listening() {
+            capture.start();
+        } else if capture.is_listening() {
             if self.input.pressed && !hot {
                 *capture = HotkeyCapture::Idle;
                 ev = HotkeyFieldEvent::Cancelled;
             } else {
                 for k in &self.input.keys {
+                    if let Some(forward) = tab_key(k) {
+                        // Tab moves on, like from a text field.
+                        self.tab = Some(forward);
+                        *capture = HotkeyCapture::Idle;
+                        ev = HotkeyFieldEvent::Cancelled;
+                        break;
+                    }
                     ev = capture.feed(k);
                     if ev != HotkeyFieldEvent::None {
                         break;
@@ -100,6 +115,11 @@ impl Ui<'_> {
             }
         } else if clicked {
             capture.start();
+            self.state.focused = Some(id);
+            self.focus_seen = true;
+        }
+        if !capture.is_listening() && self.state.focused == Some(id) {
+            self.state.focused = None;
         }
         ev
     }
