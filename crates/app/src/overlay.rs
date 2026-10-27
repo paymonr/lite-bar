@@ -45,8 +45,6 @@ const FONT_FAMILY: PCWSTR = w!("Consolas");
 const LABEL_TEXT: &str = "FPS";
 /// Widest text the box always has room for, so it doesn't jump between 99 and 100.
 const MIN_NUMBER_TEXT: &str = "000";
-/// Label text size relative to the number text size.
-const LABEL_SIZE_RATIO: f32 = 0.6;
 // Metrics at 100% DPI; multiplied by the DPI scale.
 const BASE_PAD_X: f32 = 8.0;
 const BASE_PAD_Y: f32 = 4.0;
@@ -177,7 +175,7 @@ impl Drop for Dib {
 
 /// Text resources that only depend on the text size and DPI scale.
 struct Style {
-    key: (u16, f32),
+    key: (u16, u16, f32),
     number_format: IDWriteTextFormat,
     stats_format: IDWriteTextFormat,
     label_layout: IDWriteTextLayout,
@@ -409,13 +407,14 @@ impl Overlay {
     }
 
     fn style(&mut self) -> windows::core::Result<&Style> {
-        let key = (self.settings.text_size, self.scale);
+        let key = (
+            self.settings.counter_size,
+            self.settings.text_size,
+            self.scale,
+        );
         if self.style.as_ref().map(|s| s.key) != Some(key) {
-            let number_px = px(f32::from(self.settings.text_size), self.scale);
-            let label_px = px(
-                (f32::from(self.settings.text_size) * LABEL_SIZE_RATIO).round(),
-                self.scale,
-            );
+            let number_px = px(f32::from(self.settings.counter_size), self.scale);
+            let label_px = px(f32::from(self.settings.text_size), self.scale);
             let number_format = self.format(DWRITE_FONT_WEIGHT_BOLD, number_px)?;
             let label_format = self.format(DWRITE_FONT_WEIGHT_NORMAL, label_px)?;
             let label_layout = self.layout(LABEL_TEXT, &label_format)?;
@@ -777,16 +776,29 @@ mod tests {
     }
 
     #[test]
+    fn larger_counter_size_makes_a_larger_window() {
+        let mut s = Settings::default().overlay;
+        let mut o = Overlay::new(&s).unwrap();
+        o.update("144", None);
+        let small = window_size(&o);
+        s.counter_size = 36;
+        o.set_settings(&s);
+        o.update("144", None);
+        let big = window_size(&o);
+        assert!(big.0 > small.0 && big.1 > small.1, "{small:?} -> {big:?}");
+    }
+
+    #[test]
     fn larger_text_size_makes_a_larger_window() {
         let mut s = Settings::default().overlay;
         let mut o = Overlay::new(&s).unwrap();
         o.update("144", None);
         let small = window_size(&o);
-        s.text_size = 36;
+        s.text_size = 30;
         o.set_settings(&s);
         o.update("144", None);
         let big = window_size(&o);
-        assert!(big.0 > small.0 && big.1 > small.1, "{small:?} -> {big:?}");
+        assert!(big.0 > small.0, "{small:?} -> {big:?}");
     }
 
     #[test]

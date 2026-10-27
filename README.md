@@ -63,7 +63,8 @@ The settings file is created with the default values and a comment for every key
 | `label_color` | `"#RRGGBB"` | `"#FFFFFF"` |
 | `background_color` | `"#RRGGBB"` | `"#000000"` |
 | `background_opacity` | integer percent, 0-100 | `55` |
-| `text_size` | integer pixels, 8-72 | `18` |
+| `counter_size` | height of the FPS number, integer pixels, 8-72 | `18` |
+| `text_size` | height of the "FPS" label and the statistics, integer pixels, 6-48 | `11` |
 
 `[hotkeys]`
 
@@ -72,6 +73,12 @@ The settings file is created with the default values and a comment for every key
 | `toggle_overlay` | string, e.g. `"Ctrl+Alt+Shift+L"` | `"Ctrl+Alt+Shift+L"` |
 
 Hotkey syntax: zero or more modifiers (`Ctrl`, `Alt`, `Shift`, `Win`) and exactly one key (`A`-`Z`, `0`-`9` or `F1`-`F24`), joined with `+`, case-insensitive. For letter and digit keys at least one of `Ctrl`, `Alt` or `Win` is required (`Shift` alone would stop you typing capital letters). Function keys also accept `Shift` alone, e.g. `Shift+F5`. If the combination is already taken by another program, the tray menu shows the hotkey as unavailable.
+
+`[colors]`
+
+| Key | Type and values | Default |
+| --- | --- | --- |
+| `saved` | list of `"#RRGGBB"` colors saved in the settings window's color picker, at most 16 (extra and invalid entries are ignored with a warning) | `[]` |
 
 `[game_names]`
 

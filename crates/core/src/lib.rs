@@ -9,3 +9,4 @@ pub mod hotkey;
 pub mod layout;
 pub mod sessions;
 pub mod settings;
+pub mod settings_edit;
