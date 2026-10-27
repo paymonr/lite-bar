@@ -208,3 +208,56 @@ fn caret_blinks_with_now_ms() {
     assert_eq!(lines(&field(&mut st, &on, &mut e).1), 1);
     assert_eq!(lines(&field(&mut st, &off, &mut e).1), 0);
 }
+
+/// x of the caret line in `f`, if drawn.
+fn caret_x(f: &Frame) -> Option<f32> {
+    f.cmds.iter().find_map(|c| match c {
+        Cmd::Line { from, .. } => Some(from.x),
+        _ => None,
+    })
+}
+
+/// x of the field's text in `f`.
+fn text_x(f: &Frame) -> f32 {
+    f.cmds
+        .iter()
+        .find_map(|c| match c {
+            Cmd::Text { pos, .. } => Some(pos.x),
+            _ => None,
+        })
+        .unwrap()
+}
+
+#[test]
+fn long_text_scrolls_so_the_caret_stays_visible() {
+    // 50 chars are 350 wide; the field shows 214 - 2 × 8.
+    let long = "x".repeat(50);
+    let (mut st, mut e) = focused_field(&long);
+    let (_, f) = field(&mut st, &with_keys(vec![key(UiKey::End)]), &mut e);
+    let x = caret_x(&f).expect("caret drawn");
+    assert!((8.0..=206.0).contains(&x), "caret at {x}");
+    assert!(text_x(&f) < 8.0, "text shifted left");
+    // Typing at the end keeps it in view.
+    let (_, f) = field(&mut st, &typing("yy"), &mut e);
+    assert!((8.0..=206.0).contains(&caret_x(&f).unwrap()));
+    // A click lands on the char under the pointer, not where it would be unscrolled.
+    let shift = 8.0 - text_x(&f);
+    field(&mut st, &hover(100.0, 10.0), &mut e);
+    field(&mut st, &press(100.0, 10.0), &mut e);
+    let want = ((100.0 - 8.0 + shift) / 7.0).round() as usize;
+    assert_eq!(e.caret, want);
+    // Home scrolls back to the start.
+    let (_, f) = field(&mut st, &with_keys(vec![key(UiKey::Home)]), &mut e);
+    assert_eq!(caret_x(&f), Some(8.0));
+    assert_eq!(text_x(&f), 8.0);
+}
+
+#[test]
+fn an_unfocused_field_shows_the_start_of_its_text() {
+    let long = "x".repeat(50);
+    let (mut st, mut e) = focused_field(&long);
+    field(&mut st, &with_keys(vec![key(UiKey::End)]), &mut e);
+    let (_, f) = field(&mut st, &with_keys(vec![key(UiKey::Enter)]), &mut e);
+    assert_eq!(st.focused, None);
+    assert_eq!(text_x(&f), 8.0);
+}

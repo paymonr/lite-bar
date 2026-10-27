@@ -27,6 +27,14 @@ impl Clipboard for NoClipboard {
     fn set(&mut self, _: &str) {}
 }
 
+/// Byte offset of the caret in `edit.text`.
+fn caret_byte(edit: &TextEdit) -> usize {
+    edit.text
+        .char_indices()
+        .nth(edit.caret)
+        .map_or(edit.text.len(), |(b, _)| b)
+}
+
 impl Ui<'_> {
     /// A full-width text field (or `next_width`). Clicking focuses it; typed text and
     /// editing keys then go to `edit`. A press anywhere else blurs it and commits.
@@ -75,7 +83,7 @@ impl Ui<'_> {
                 edit.all_selected = false;
                 edit.last_input_ms = self.input.now_ms;
                 if let Some(p) = self.input.pointer {
-                    edit.caret = self.caret_at(&edit.text, p.x - text_x, style);
+                    edit.caret = self.caret_at(&edit.text, p.x - text_x + edit.scroll, style);
                 }
             } else if self.focus_start == Some(id) {
                 if self.state.focused == Some(id) {
@@ -129,8 +137,31 @@ impl Ui<'_> {
         }
         let focused = self.state.focused == Some(id);
         self.caret_seen |= focused;
+        self.scroll_to_caret(rect, edit, style, focused);
         self.draw_text_input(rect, edit, placeholder, style, focused);
         ev
+    }
+
+    /// Scrolls a focused field just enough to show the caret; an unfocused one shows the start.
+    fn scroll_to_caret(&self, rect: Rect, edit: &mut TextEdit, style: TextStyle, focused: bool) {
+        if !focused {
+            edit.scroll = 0.0;
+            return;
+        }
+        let room = (rect.w - 2.0 * theme::FIELD_PAD_X).max(0.0);
+        let caret_x = self
+            .measure
+            .measure(&edit.text[..caret_byte(edit)], style)
+            .0;
+        let text_w = self.measure.measure(&edit.text, style).0;
+        let mut scroll = edit.scroll;
+        if caret_x - scroll > room {
+            scroll = caret_x - room;
+        }
+        if caret_x < scroll {
+            scroll = caret_x;
+        }
+        edit.scroll = scroll.min((text_w - room).max(0.0)).max(0.0);
     }
 
     fn draw_text_input(
@@ -146,7 +177,7 @@ impl Ui<'_> {
             color: theme::BG,
             radius: theme::FIELD_RADIUS,
         });
-        let text_x = rect.x + theme::FIELD_PAD_X;
+        let text_x = rect.x + theme::FIELD_PAD_X - edit.scroll;
         let line_h = self.measure.measure("Ag", style).1;
         let text_y = rect.y + (rect.h - line_h) / 2.0;
         let pos = Pt {
@@ -180,12 +211,7 @@ impl Ui<'_> {
             let since = ui.input.now_ms.saturating_sub(edit.last_input_ms);
             let blink_on = (since / theme::CARET_BLINK_MS).is_multiple_of(2);
             if focused && blink_on {
-                let b = edit
-                    .text
-                    .char_indices()
-                    .nth(edit.caret)
-                    .map_or(edit.text.len(), |(b, _)| b);
-                let x = text_x + ui.measure.measure(&edit.text[..b], style).0;
+                let x = text_x + ui.measure.measure(&edit.text[..caret_byte(edit)], style).0;
                 ui.cmds.push(Cmd::Line {
                     from: Pt { x, y: text_y },
                     to: Pt {

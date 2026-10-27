@@ -9,7 +9,7 @@ pub trait Clipboard {
 }
 
 /// A single line of text with a caret. `caret` counts chars, not bytes.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct TextEdit {
     pub text: String,
     pub caret: usize,
@@ -19,6 +19,9 @@ pub struct TextEdit {
     /// `Input::now_ms` of the last click or keystroke in the field; the caret blink
     /// restarts from it so the caret shows right after typing.
     pub last_input_ms: u64,
+    /// How far the text is scrolled left in the field, in DIPs, so the caret stays visible.
+    /// Kept by the text field.
+    pub scroll: f32,
 }
 
 /// Ctrl without Alt: Windows reports AltGr as Ctrl+Alt, and AltGr combinations type
@@ -35,6 +38,7 @@ impl TextEdit {
             caret: text.chars().count(),
             all_selected: false,
             last_input_ms: 0,
+            scroll: 0.0,
         }
     }
 
