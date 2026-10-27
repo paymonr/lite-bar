@@ -855,6 +855,7 @@ impl UiWindow {
         register_window_class();
         let title = HSTRING::from(title);
         let (work, monitor_dpi) = cursor_monitor();
+        let (create_w, create_h) = window_size_for_client(size_dip, monitor_dpi);
         // SAFETY: plain FFI; the window is destroyed by PendingWindow on every error path.
         unsafe {
             // Created on the cursor's monitor so it gets that monitor's DPI.
@@ -865,8 +866,8 @@ impl UiWindow {
                 WS_OVERLAPPEDWINDOW,
                 work.left,
                 work.top,
-                window_size_for_client(size_dip, monitor_dpi).0,
-                window_size_for_client(size_dip, monitor_dpi).1,
+                create_w,
+                create_h,
                 None,
                 None,
                 Some(GetModuleHandleW(None)?.into()),
@@ -874,7 +875,12 @@ impl UiWindow {
             )?;
             let pending = PendingWindow(hwnd);
             let dpi = GetDpiForWindow(hwnd);
-            let (w, h) = window_size_for_client(size_dip, dpi);
+            // Usually the same DPI; only recomputed when the window landed elsewhere.
+            let (w, h) = if dpi == monitor_dpi {
+                (create_w, create_h)
+            } else {
+                window_size_for_client(size_dip, dpi)
+            };
             let (x, y) = centered_in(work, (w, h));
             SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE)?;
             let dark = BOOL(1);
@@ -968,8 +974,16 @@ impl UiWindow {
         self.shared.with_host(|h| h.canvas.pixel(x, y))
     }
 
+    /// The commands of the last frame.
     #[cfg(test)]
-    fn scale(&self) -> f32 {
+    pub fn cmds(&self) -> Vec<Cmd> {
+        self.shared
+            .with_host(|h| h.cmds.clone())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub fn scale(&self) -> f32 {
         self.shared.with_host(|h| h.scale).unwrap_or(0.0)
     }
 

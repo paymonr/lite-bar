@@ -356,6 +356,54 @@ impl SettingsUi {
     }
 
     #[cfg(test)]
+    pub fn status(&self) -> Option<String> {
+        self.state.borrow().status.clone()
+    }
+
+    /// A rejection waiting to be shown in the capture field.
+    #[cfg(test)]
+    pub fn pending_reject(&self) -> Option<String> {
+        self.state.borrow().reject.clone()
+    }
+
+    /// Where the text `text` in `color` was drawn by the last frame, in pixels (its top-left
+    /// plus a few DIPs).
+    #[cfg(test)]
+    pub fn find_text_px(&self, text: &str, color: lite_bar_core::ui::Rgba) -> Option<(i32, i32)> {
+        let s = self.window.scale();
+        self.window.cmds().into_iter().find_map(|c| match c {
+            lite_bar_core::ui::Cmd::Text {
+                pos,
+                text: t,
+                color: c,
+                ..
+            } if t == text && c == color => Some((
+                ((pos.x + 4.0) * s).round() as i32,
+                ((pos.y + 4.0) * s).round() as i32,
+            )),
+            _ => None,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn scale(&self) -> f32 {
+        self.window.scale()
+    }
+
+    #[cfg(test)]
+    pub fn send_msg(&self, msg: u32, wparam: usize, lparam: isize) {
+        // SAFETY: plain FFI on our own window.
+        unsafe {
+            windows::Win32::UI::WindowsAndMessaging::SendMessageW(
+                self.window.hwnd(),
+                msg,
+                Some(WPARAM(wparam)),
+                Some(LPARAM(lparam)),
+            );
+        }
+    }
+
+    #[cfg(test)]
     pub fn id(&self) -> usize {
         self.window.hwnd().0 as usize
     }
