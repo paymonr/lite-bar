@@ -38,12 +38,20 @@ jobs:
           $version = ($meta.packages | Where-Object { $_.name -eq 'lite-bar' }).version
           if (-not $version) { throw 'lite-bar package version not found' }
           "version=$version" >> $env:GITHUB_OUTPUT
-          gh release view "v$version" *> $null
-          if ($LASTEXITCODE -eq 0) {
+          # A draft (e.g. left by an interrupted run) counts as not published: it is
+          # deleted and created again below.
+          $draft = gh release view "v$version" --json isDraft -q .isDraft 2> $null
+          if ($LASTEXITCODE -ne 0) {
+            "exists=false" >> $env:GITHUB_OUTPUT
+            "draft=false" >> $env:GITHUB_OUTPUT
+          } elseif ("$draft".Trim() -eq 'true') {
+            Write-Output "::notice::Release v$version is a draft; replacing it."
+            "exists=false" >> $env:GITHUB_OUTPUT
+            "draft=true" >> $env:GITHUB_OUTPUT
+          } else {
             Write-Output "::notice::Release v$version already exists; nothing to publish."
             "exists=true" >> $env:GITHUB_OUTPUT
-          } else {
-            "exists=false" >> $env:GITHUB_OUTPUT
+            "draft=false" >> $env:GITHUB_OUTPUT
           }
           $global:LASTEXITCODE = 0
       - name: Checksum
@@ -59,6 +67,11 @@ jobs:
         shell: pwsh
         env:
           VERSION: ${{ steps.ver.outputs.version }}
+          DRAFT: ${{ steps.ver.outputs.draft }}
         run: |
+          if ($env:DRAFT -eq 'true') {
+            gh release delete "v$env:VERSION" --yes --cleanup-tag
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
           gh release create "v$env:VERSION" lite-bar.exe lite-bar.exe.sha256 --title "Lite Bar v$env:VERSION" --generate-notes --target $env:GITHUB_SHA
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
