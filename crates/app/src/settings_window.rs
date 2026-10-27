@@ -212,6 +212,21 @@ impl UiApp for SettingsPage {
         }
     }
 
+    fn finish_edits(&mut self) {
+        let last = self.view.finish_edits();
+        let Ok(mut st) = self.state.try_borrow_mut() else {
+            return;
+        };
+        for a in &last {
+            if let UiAction::Change(c) = a {
+                apply_change(&mut st.settings, c);
+            }
+        }
+        if st.queue.push(last) {
+            self.nudge();
+        }
+    }
+
     fn closed(&mut self) {
         let last = self.view.finish_edits();
         let Ok(mut st) = self.state.try_borrow_mut() else {
@@ -324,6 +339,11 @@ impl SettingsUi {
             st.status = Some(msg.to_string());
         }
         self.window.request_redraw();
+    }
+
+    /// Ends edits in progress (an unfinished game name) into the queue; the window stays open.
+    pub fn finish_edits(&self) {
+        self.window.finish_edits();
     }
 
     /// Closes the window; returns what it queued, including its final edits.

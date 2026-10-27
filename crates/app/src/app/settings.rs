@@ -79,6 +79,16 @@ impl App {
         }
     }
 
+    /// Before an elevated relaunch: ends edits still in progress and writes everything, with
+    /// the window left open (UAC may be declined).
+    pub(super) fn save_settings_before_restart(&mut self) {
+        if let Some(ui) = &self.settings_ui {
+            ui.finish_edits();
+        }
+        self.drain_settings_actions();
+        self.flush_settings_save();
+    }
+
     /// Closes the window (Quit, restart, shutdown), applies its last edits and saves.
     pub(super) fn close_settings_window(&mut self) {
         if let Some(ui) = self.settings_ui.take() {

@@ -240,6 +240,8 @@ pub trait UiApp {
     /// menus or other modal loops. Messages arriving while a frame runs are skipped.
     fn frame(&mut self, ui: &mut Ui);
     fn closed(&mut self);
+    /// Ends edits still in progress, as on close, but keeps the window open.
+    fn finish_edits(&mut self) {}
 }
 
 const CLASS_NAME: PCWSTR = w!("LiteBarUiWindow");
@@ -957,6 +959,18 @@ impl UiWindow {
         unsafe {
             let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
+    }
+
+    /// Calls `UiApp::finish_edits`. Does nothing while closed or while a handler holds the
+    /// page (never the case from the app's own message handlers).
+    pub fn finish_edits(&self) {
+        let done = self.shared.with_host(|h| {
+            catch_unwind(AssertUnwindSafe(|| as_ui_frame(|| h.app.finish_edits()))).is_ok()
+        });
+        if done == Some(false) {
+            log::error("settings window: finish_edits() panicked");
+        }
+        self.request_redraw();
     }
 
     /// Calls `UiApp::closed` (once) and destroys the window. Does nothing if already closed.

@@ -473,7 +473,7 @@ mod app {
         fn restart_as_admin(&mut self) -> bool {
             let was_on = self.overlay_on;
             // The new instance reads the file; the window stays open if UAC is declined.
-            self.flush_settings_save();
+            self.save_settings_before_restart();
             self.guard = None;
             hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
             self.stop_overlay();
@@ -1103,16 +1103,35 @@ mod app {
 
         #[test]
         fn end_session_keeps_window_edits() {
-            use windows::Win32::UI::WindowsAndMessaging::{
-                WM_CHAR, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-            };
             let dir = TempDir::new("settings-endsession");
             write_one_game(dir.path());
             let (mut app, _owner) = test_app(dir.path());
+            type_uncommitted_game_name(&mut app, "Mine"); // typed, never committed
+            let ui = app.settings_ui.as_ref().unwrap();
+            ui.queue(counter(41)); // queued, never drained
+            app.end_session();
+
+            assert!(app.settings_ui.is_none(), "window closed");
+            let (saved, _) = load_or_create_settings(dir.path());
+            assert_eq!(saved.overlay.counter_size, 41);
+            assert_eq!(
+                saved
+                    .game_names
+                    .get(r"C:\Games\Minecraft.exe")
+                    .map(String::as_str),
+                Some("Mine")
+            );
+        }
+
+        /// Opens the window on a played game and types `name` into its name field without
+        /// committing it.
+        fn type_uncommitted_game_name(app: &mut App, name: &str) {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                WM_CHAR, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+            };
             app.open_settings_hidden();
             let ui = app.settings_ui.as_ref().unwrap();
             ui.paint();
-            // Scroll to the bottom, where the game names are.
             let s = ui.scale();
             let mid = at((450.0 * s) as i32, (400.0 * s) as i32);
             ui.send_msg(WM_MOUSEMOVE, 0, mid);
@@ -1126,15 +1145,23 @@ mod app {
             ui.send_msg(WM_MOUSEMOVE, 0, at(x, y));
             ui.send_msg(WM_LBUTTONDOWN, 1, at(x, y));
             ui.send_msg(WM_LBUTTONUP, 0, at(x, y));
-            for c in "Mine".chars() {
-                ui.send_msg(WM_CHAR, c as usize, 0); // typed, never committed
+            for c in name.chars() {
+                ui.send_msg(WM_CHAR, c as usize, 0);
             }
-            ui.queue(counter(41)); // queued, never drained
-            app.end_session();
+        }
 
-            assert!(app.settings_ui.is_none(), "window closed");
+        #[test]
+        fn restart_prep_saves_an_in_progress_rename_and_keeps_the_window() {
+            let dir = TempDir::new("settings-restart");
+            write_one_game(dir.path());
+            let (mut app, _owner) = test_app(dir.path());
+            type_uncommitted_game_name(&mut app, "Mine");
+            app.save_settings_before_restart();
+            assert!(
+                app.settings_ui.as_ref().is_some_and(|ui| ui.is_open()),
+                "window stays open (UAC may be declined)"
+            );
             let (saved, _) = load_or_create_settings(dir.path());
-            assert_eq!(saved.overlay.counter_size, 41);
             assert_eq!(
                 saved
                     .game_names
