@@ -42,6 +42,18 @@ impl Rect {
         }
     }
 
+    /// Overlap of two rects; zero-sized when they do not overlap.
+    pub fn intersect(&self, o: Rect) -> Rect {
+        let x = self.x.max(o.x);
+        let y = self.y.max(o.y);
+        Rect::new(
+            x,
+            y,
+            (self.right().min(o.right()) - x).max(0.0),
+            (self.bottom().min(o.bottom()) - y).max(0.0),
+        )
+    }
+
     /// Splits off a left part of width `w` (clamped to the rect); returns (left, rest).
     pub fn split_left(&self, w: f32) -> (Rect, Rect) {
         let w = w.clamp(0.0, self.w);

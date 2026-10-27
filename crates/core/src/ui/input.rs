@@ -48,10 +48,11 @@ pub struct Input {
 
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct UiState {
+    /// Topmost widget under the pointer in the previous frame; used for visuals and clicks.
     pub hot: Option<Id>,
+    /// Topmost widget under the pointer so far this frame; becomes `hot` at `finish`.
+    pub hot_next: Option<Id>,
     pub active: Option<Id>,
     pub focused: Option<Id>,
     pub scroll: HashMap<Id, f32>,
-    /// Pointer x at the start of the current slider drag.
-    pub drag_origin: Option<f32>,
 }

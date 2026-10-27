@@ -33,6 +33,7 @@ pub const BUTTON_PAD_X: f32 = 12.0;
 pub const SEGMENT_PAD_X: f32 = 14.0;
 pub const TOGGLE_W: f32 = 38.0;
 pub const TOGGLE_H: f32 = 20.0;
+pub const TOGGLE_KNOB: f32 = 14.0;
 pub const SLIDER_H: f32 = 20.0;
 pub const SLIDER_TRACK_H: f32 = 4.0;
 pub const SLIDER_THUMB: f32 = 14.0;

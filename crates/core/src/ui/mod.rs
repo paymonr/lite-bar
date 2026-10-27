@@ -30,10 +30,29 @@ pub fn id_with(base: Id, index: usize) -> Id {
     (base ^ (index as u64).wrapping_add(0x9e37_79b9_7f4a_7c15)).wrapping_mul(0x0000_0100_0000_01b3)
 }
 
-struct RowCursor {
+/// Id used by `Ui::block` so overlays can claim the pointer.
+const BLOCKER: Id = 0;
+
+/// One level of layout. Rows place items left to right and centre them vertically;
+/// otherwise items stack top to bottom. A gap goes between items, not after the last.
+struct Layout {
+    bounds: Rect,
     x: f32,
     y: f32,
-    h: f32,
+    row: bool,
+    gap_pending: bool,
+}
+
+impl Layout {
+    fn new(bounds: Rect, row: bool) -> Layout {
+        Layout {
+            bounds,
+            x: bounds.x,
+            y: bounds.y,
+            row,
+            gap_pending: false,
+        }
+    }
 }
 
 pub struct Ui<'a> {
@@ -42,78 +61,184 @@ pub struct Ui<'a> {
     state: &'a mut UiState,
     cmds: Vec<Cmd>,
     cursor: CursorKind,
-    bounds: Rect,
-    y: f32,
-    row: Option<RowCursor>,
+    layouts: Vec<Layout>,
+    next_w: Option<f32>,
+    /// Content offset (for scrolling) applied to every allocated rect and `block`.
+    offset: Pt,
+    /// Screen-space clip rects; each entry is already intersected with its parent.
+    clips: Vec<Rect>,
 }
 
 impl<'a> Ui<'a> {
+    /// Starts a frame. One `Ui` per frame; use `row`, `column`, `region` and `clip`
+    /// to lay out several areas inside it.
     pub fn new(
         measure: &'a dyn TextMeasure,
         input: &'a Input,
         state: &'a mut UiState,
         area: Rect,
     ) -> Ui<'a> {
-        state.hot = None;
+        state.hot_next = None;
         Ui {
             measure,
             input,
             state,
             cmds: Vec::new(),
             cursor: CursorKind::Arrow,
-            bounds: area,
-            y: area.y,
-            row: None,
+            layouts: vec![Layout::new(area, false)],
+            next_w: None,
+            offset: Pt::default(),
+            clips: Vec::new(),
         }
     }
 
-    pub fn id(&self, name: &str) -> Id {
-        id(name)
+    fn top(&mut self) -> &mut Layout {
+        self.layouts
+            .last_mut()
+            .expect("layout stack is never empty")
     }
 
-    pub fn id_with(&self, base: Id, index: usize) -> Id {
-        id_with(base, index)
-    }
-
-    /// Adds vertical space, or horizontal space inside a `row`.
+    /// Adds `px` of space after the previous item, replacing the usual gap.
     pub fn space(&mut self, px: f32) {
-        match &mut self.row {
-            Some(r) => r.x += px,
-            None => self.y += px,
+        let l = self.top();
+        if l.row {
+            l.x += px;
+        } else {
+            l.y += px;
         }
+        l.gap_pending = false;
+    }
+
+    /// The next widget (or row/column) gets exactly this width.
+    pub fn next_width(&mut self, w: f32) {
+        self.next_w = Some(w);
+    }
+
+    /// Reserves a rect in layout space. `w` of `None` fills the remaining width.
+    fn alloc_local(&mut self, w: Option<f32>, h: f32) -> Rect {
+        let nw = self.next_w.take();
+        let l = self.top();
+        if l.gap_pending {
+            if l.row {
+                l.x += theme::GAP;
+            } else {
+                l.y += theme::GAP;
+            }
+        }
+        l.gap_pending = true;
+        if l.row {
+            let w = nw.or(w).unwrap_or((l.bounds.right() - l.x).max(0.0));
+            let rect = Rect::new(l.x, l.bounds.y + (l.bounds.h - h) / 2.0, w, h);
+            l.x += w;
+            rect
+        } else {
+            let w = nw.or(w).unwrap_or(l.bounds.w);
+            let rect = Rect::new(l.bounds.x, l.y, w, h);
+            l.y += h;
+            rect
+        }
+    }
+
+    fn shifted(&self, r: Rect) -> Rect {
+        Rect::new(r.x + self.offset.x, r.y + self.offset.y, r.w, r.h)
+    }
+
+    /// Reserves a rect for the next widget, in screen space (offset applied).
+    fn alloc(&mut self, w: Option<f32>, h: f32) -> Rect {
+        let r = self.alloc_local(w, h);
+        self.shifted(r)
+    }
+
+    fn with_layout(&mut self, bounds: Rect, row: bool, f: impl FnOnce(&mut Ui<'a>)) {
+        self.layouts.push(Layout::new(bounds, row));
+        f(self);
+        self.layouts.pop();
     }
 
     /// Lays out the widgets built by `f` left to right in a strip of `height`,
-    /// vertically centred, then moves the cursor below it.
+    /// vertically centred. Rows nest.
     pub fn row(&mut self, height: f32, f: impl FnOnce(&mut Ui<'a>)) {
-        self.row = Some(RowCursor {
-            x: self.bounds.x,
-            y: self.y,
-            h: height,
-        });
-        f(self);
-        self.row = None;
-        self.y += height + theme::GAP;
+        let rect = self.alloc_local(None, height);
+        self.with_layout(rect, true, f);
     }
 
-    /// Reserves a rect for the next widget. `w` of `None` fills the remaining width.
-    fn alloc(&mut self, w: Option<f32>, h: f32) -> Rect {
-        match &mut self.row {
-            Some(r) => {
-                let w = w.unwrap_or((self.bounds.right() - r.x).max(0.0));
-                let rect = Rect::new(r.x, r.y + (r.h - h) / 2.0, w, h);
-                r.x += w + theme::GAP;
-                rect
-            }
-            None => {
-                let rect = Rect::new(self.bounds.x, self.y, w.unwrap_or(self.bounds.w), h);
-                self.y += h + theme::GAP;
-                rect
-            }
+    /// A vertical stack inside a row, as tall as the row. Give it a width with
+    /// `next_width`, or it fills the rest of the row.
+    pub fn column(&mut self, f: impl FnOnce(&mut Ui<'a>)) {
+        let l = self.top();
+        let h = if l.row {
+            l.bounds.h
+        } else {
+            (l.bounds.bottom() - l.y).max(0.0)
+        };
+        let rect = self.alloc_local(None, h);
+        self.with_layout(rect, false, f);
+    }
+
+    /// Runs `f` with vertical layout confined to `rect` (layout space). The outer
+    /// cursor does not move.
+    pub fn region(&mut self, rect: Rect, f: impl FnOnce(&mut Ui<'a>)) {
+        self.with_layout(rect, false, f);
+    }
+
+    /// Same as `region`; reads better when pinning something to a fixed position.
+    pub fn place(&mut self, rect: Rect, f: impl FnOnce(&mut Ui<'a>)) {
+        self.region(rect, f);
+    }
+
+    /// Pins a row of widgets of total `width` to the right edge of the current row
+    /// (or of a new control-height strip when in a column). Does not consume row space.
+    pub fn right_aligned(&mut self, width: f32, f: impl FnOnce(&mut Ui<'a>)) {
+        self.next_w = None;
+        let l = self.top();
+        let strip = if l.row {
+            l.bounds
+        } else {
+            self.alloc_local(None, theme::CONTROL_HEIGHT)
+        };
+        let rect = Rect::new(strip.right() - width, strip.y, width, strip.h);
+        self.with_layout(rect, true, f);
+    }
+
+    /// Shifts everything laid out inside `f` by (dx, dy), for scrolling content.
+    /// Hit tests move with the drawing.
+    pub fn offset(&mut self, dx: f32, dy: f32, f: impl FnOnce(&mut Ui<'a>)) {
+        self.offset.x += dx;
+        self.offset.y += dy;
+        f(self);
+        self.offset.x -= dx;
+        self.offset.y -= dy;
+    }
+
+    /// Clips drawing inside `f` to `rect` (screen space) and stops widgets outside it
+    /// from reacting to the pointer.
+    pub fn clip(&mut self, rect: Rect, f: impl FnOnce(&mut Ui<'a>)) {
+        let eff = self.clips.last().map_or(rect, |c| c.intersect(rect));
+        self.cmds.push(Cmd::ClipPush(rect));
+        self.clips.push(eff);
+        f(self);
+        self.clips.pop();
+        self.cmds.push(Cmd::ClipPop);
+    }
+
+    /// Claims the pointer over `rect` (layout space) for anything registered before
+    /// it this frame, so overlays and popovers hide widgets beneath from hover and clicks.
+    pub fn block(&mut self, rect: Rect) {
+        let r = self.shifted(rect);
+        if self.pointer_hits(r) {
+            self.state.hot_next = Some(BLOCKER);
         }
     }
 
+    /// Whether the pointer is over `rect` and inside the current clip.
+    fn pointer_hits(&self, rect: Rect) -> bool {
+        self.input
+            .pointer
+            .is_some_and(|p| rect.contains(p) && self.clips.last().is_none_or(|c| c.contains(p)))
+    }
+
     pub fn finish(self) -> Frame {
+        self.state.hot = self.state.hot_next.take();
         if self.input.released {
             self.state.active = None;
         }

@@ -8,24 +8,33 @@ use super::theme::{self, Rgba};
 use super::{Cmd, CursorKind, Id, Pt, Rect, TextStyle, Ui};
 
 impl Ui<'_> {
-    /// Marks `rect` hot when the pointer is over it, and active when pressed on it.
-    /// Returns whether the pointer is over `rect`.
+    /// Registers `rect` as a hit target and returns whether `id` is the hot widget
+    /// under the pointer. Hot is resolved from the previous frame's topmost hit, so
+    /// widgets drawn or blocked later in a frame win. A press on a hot widget makes it
+    /// active. Every interactive widget goes through here.
     fn hover(&mut self, id: Id, rect: Rect) -> bool {
-        let over = self.input.pointer.is_some_and(|p| rect.contains(p));
-        if over {
-            self.state.hot = Some(id);
+        if !self.pointer_hits(rect) {
+            return false;
+        }
+        self.state.hot_next = Some(id);
+        let hot = self.state.hot == Some(id);
+        if hot {
             self.cursor = CursorKind::Hand;
             if self.input.pressed {
                 self.state.active = Some(id);
             }
         }
-        over
+        hot
     }
 
-    /// Click semantics: released while still over the widget that was pressed.
-    fn clicked(&mut self, id: Id, rect: Rect) -> bool {
-        let over = self.hover(id, rect);
-        over && self.input.released && self.state.active == Some(id)
+    /// Returns (hot, clicked). A click is a release while still hot over the widget
+    /// that was pressed.
+    fn interact(&mut self, id: Id, rect: Rect) -> (bool, bool) {
+        let hot = self.hover(id, rect);
+        (
+            hot,
+            hot && self.input.released && self.state.active == Some(id),
+        )
     }
 
     fn text_centered(&mut self, rect: Rect, text: &str, style: TextStyle, color: Rgba) {
@@ -60,10 +69,10 @@ impl Ui<'_> {
     pub fn button(&mut self, id: Id, text: &str) -> bool {
         let (tw, _) = self.measure.measure(text, TextStyle::BODY);
         let rect = self.alloc(Some(tw + 2.0 * theme::BUTTON_PAD_X), theme::CONTROL_HEIGHT);
-        let clicked = self.clicked(id, rect);
-        let bg = if self.state.active == Some(id) && self.state.hot == Some(id) {
+        let (hot, clicked) = self.interact(id, rect);
+        let bg = if hot && self.state.active == Some(id) {
             theme::BUTTON_BG_ACTIVE
-        } else if self.state.hot == Some(id) {
+        } else if hot {
             theme::BUTTON_BG_HOT
         } else {
             theme::BUTTON_BG
@@ -85,7 +94,7 @@ impl Ui<'_> {
 
     pub fn toggle(&mut self, id: Id, value: &mut bool) -> bool {
         let rect = self.alloc(Some(theme::TOGGLE_W), theme::TOGGLE_H);
-        let clicked = self.clicked(id, rect);
+        let (_, clicked) = self.interact(id, rect);
         if clicked {
             *value = !*value;
         }
@@ -95,7 +104,7 @@ impl Ui<'_> {
             color: track,
             radius: theme::TOGGLE_H / 2.0,
         });
-        let knob = 14.0;
+        let knob = theme::TOGGLE_KNOB;
         let inset = (theme::TOGGLE_H - knob) / 2.0;
         let kx = if *value {
             rect.right() - inset - knob
@@ -110,14 +119,16 @@ impl Ui<'_> {
         clicked
     }
 
+    /// Click or drag to set the value. While active it follows `pointer.x` clamped to
+    /// the track, even outside the widget, until the button is released anywhere.
+    /// Precision: the value is interpolated in `f32`, so ranges wider than about 2^24
+    /// steps are not represented exactly.
     pub fn slider(&mut self, id: Id, value: &mut i64, range: RangeInclusive<i64>) -> bool {
         let (lo, hi) = (*range.start(), *range.end());
         let rect = self.alloc(None, theme::SLIDER_H);
         let half = theme::SLIDER_THUMB / 2.0;
         let (x0, x1) = (rect.x + half, (rect.right() - half).max(rect.x + half));
-        if self.hover(id, rect) && self.input.pressed {
-            self.state.drag_origin = self.input.pointer.map(|p| p.x);
-        }
+        self.hover(id, rect);
         let mut changed = false;
         if self.state.active == Some(id) {
             if let Some(p) = self.input.pointer {
@@ -182,9 +193,17 @@ impl Ui<'_> {
         for (i, (opt, w)) in options.iter().zip(&widths).enumerate() {
             let cell = Rect::new(x, rect.y, *w, rect.h);
             x += w;
-            if self.clicked(super::id_with(id, i), cell) && *selected != i {
+            let (hot, clicked) = self.interact(super::id_with(id, i), cell);
+            if clicked && *selected != i {
                 *selected = i;
                 changed = true;
+            }
+            if hot && *selected != i {
+                self.cmds.push(Cmd::Fill {
+                    rect: cell.shrink(1.0),
+                    color: theme::BUTTON_BG_HOT,
+                    radius: theme::SEGMENT_RADIUS - 1.0,
+                });
             }
             if *selected == i {
                 let inner = cell.shrink(1.0);
