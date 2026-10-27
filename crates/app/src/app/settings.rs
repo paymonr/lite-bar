@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use lite_bar_core::hotkey::Hotkey;
 use lite_bar_core::settings::Settings;
-use lite_bar_core::settings_edit::{apply_change, edit_settings_text, SettingsChange};
+use lite_bar_core::settings_edit::{apply_change, edit_settings_text, push_change, SettingsChange};
 use lite_bar_core::settings_ui::{GameRow, UiAction};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
@@ -15,6 +15,13 @@ use crate::hotkeys::{self, HotkeyId, Registration};
 use crate::log;
 use crate::settings_window::{switch_hotkey, Drained, HotkeyDecision, SettingsUi, SAVE_DELAY};
 use crate::stats_files::{list_games, write_atomic};
+
+/// Shown in the window when the file cannot be edited (not valid TOML, a bad section).
+pub(super) const SAVE_FAILED_FILE: &str =
+    "Can't save: the settings file has an error.\nFix it, then choose Reload settings.";
+/// Shown in the window when the file cannot be read or written.
+pub(super) const SAVE_FAILED_WRITE: &str =
+    "Can't save: the settings file could not be written.\nYour changes are kept and saved with the next change.";
 
 impl App {
     /// The settings the window shows: the app's, with "Show overlay" following whether
@@ -54,7 +61,10 @@ impl App {
         self.settings_ui = None;
         let games = list_games(self.writer.stats_dir());
         match open(self.hwnd, self.shown_settings(), games) {
-            Ok(ui) => self.settings_ui = Some(ui),
+            Ok(ui) => {
+                ui.set_save_error(self.save_error);
+                self.settings_ui = Some(ui);
+            }
             Err(e) => log::error(&format!("could not open the settings window: {e}")),
         }
     }
@@ -240,7 +250,7 @@ impl App {
 
     /// Marks `change` for the next save, `SAVE_DELAY` after the last change.
     pub(super) fn queue_save(&mut self, change: SettingsChange) {
-        self.unsaved.push(change);
+        push_change(&mut self.unsaved, change);
         self.save.change(Instant::now());
         // SAFETY: plain FFI on our own window; re-setting the id restarts the timer.
         unsafe {
@@ -268,6 +278,15 @@ impl App {
         // Changes left over from a failed save are retried too.
         if self.save.flush() || !self.unsaved.is_empty() {
             self.write_settings_file();
+        } else {
+            self.set_save_error(None);
+        }
+    }
+
+    fn set_save_error(&mut self, msg: Option<&'static str>) {
+        self.save_error = msg;
+        if let Some(ui) = &self.settings_ui {
+            ui.set_save_error(msg);
         }
     }
 
@@ -277,15 +296,17 @@ impl App {
     /// could not be written stay pending, so the next save (a change, closing the window,
     /// Reload) tries again.
     pub(super) fn write_settings_file(&mut self) {
-        if !self.try_write_settings_file() {
+        let result = self.try_write_settings_file();
+        if result.is_err() {
             log::warn(
                 "settings changes kept; they are saved with the next change, on close or on Reload",
             );
         }
+        self.set_save_error(result.err());
     }
 
-    /// Returns false (with `unsaved` untouched) when nothing could be written.
-    fn try_write_settings_file(&mut self) -> bool {
+    /// On failure `unsaved` is untouched and the error is the message for the window.
+    fn try_write_settings_file(&mut self) -> Result<(), &'static str> {
         let path = self.dir.join(SETTINGS_FILE);
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
@@ -295,23 +316,23 @@ impl App {
                     "settings not saved: cannot read {}: {e}",
                     path.display()
                 ));
-                return false;
+                return Err(SAVE_FAILED_WRITE);
             }
         };
         let written = match edit_settings_text(&text, &self.unsaved) {
             Ok(new_text) if new_text == text => Ok(()),
             Ok(new_text) => write_atomic(&path, new_text.as_bytes())
-                .map_err(|e| format!("{}: {e}", path.display())),
-            Err(e) => Err(e),
+                .map_err(|e| (format!("{}: {e}", path.display()), SAVE_FAILED_WRITE)),
+            Err(e) => Err((e, SAVE_FAILED_FILE)),
         };
         match written {
             Ok(()) => {
                 self.unsaved.clear();
-                true
+                Ok(())
             }
-            Err(e) => {
+            Err((e, shown)) => {
                 log::warn(&format!("settings not saved: {e}"));
-                false
+                Err(shown)
             }
         }
     }

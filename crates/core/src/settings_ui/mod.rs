@@ -35,6 +35,8 @@ pub const GAMES_HINT: &str = "Games appear here after you play one for over a mi
 const SIDEBAR_W: f32 = 170.0;
 const SIDEBAR_BG: Rgba = Rgba(0x19, 0x1B, 0x20, 255);
 const LOGO_BG: Rgba = Rgba(0x2F, 0x6F, 0xDB, 255);
+/// Status text for problems: a failed save, a hotkey another app holds.
+const PROBLEM_TEXT: Rgba = Rgba(0xFF, 0x8A, 0x80, 255);
 /// Line between rows inside a card.
 const ROW_LINE: Rgba = Rgba(0x30, 0x34, 0x3D, 255);
 const PAGE_PAD_X: f32 = 24.0;
@@ -184,12 +186,14 @@ impl SettingsView {
 }
 
 /// Builds the whole window: sidebar, pinned header with the preview, scrolling sections.
+/// `save_error` (lines split by `\n`) shows pinned above the sections while saving fails.
 pub fn settings_frame(
     ui: &mut Ui,
     view: &mut SettingsView,
     settings: &Settings,
     games: &[GameRow],
     hotkey_status: Option<&str>,
+    save_error: Option<&str>,
 ) -> Vec<UiAction> {
     let mut out = Vec::new();
     let area = ui.available();
@@ -201,7 +205,10 @@ pub fn settings_frame(
         (area.w - side.w - 1.0).max(0.0),
         area.h,
     );
-    let header_h = preview::header(ui, view, &settings.overlay, main);
+    let mut header_h = preview::header(ui, view, &settings.overlay, main);
+    if let Some(msg) = save_error {
+        header_h += save_error_strip(ui, msg, main, main.y + header_h);
+    }
     let body = Rect::new(
         main.x,
         main.y + header_h,
@@ -242,6 +249,29 @@ pub fn settings_frame(
         }
     }
     out
+}
+
+/// The lines of `msg` in the error color across `main` from `top`; returns the height used.
+fn save_error_strip(ui: &mut Ui, msg: &str, main: Rect, top: f32) -> f32 {
+    const PAD_Y: f32 = 8.0;
+    let m = ui.text_measure();
+    let max_w = (main.w - 2.0 * PAGE_PAD_X).max(0.0);
+    let mut y = top + PAD_Y;
+    for line in msg.lines() {
+        let text = ellipsize(ui, line, TextStyle::BODY, max_w);
+        let h = m.measure(&text, TextStyle::BODY).1;
+        ui.paint(Cmd::Text {
+            pos: Pt {
+                x: main.x + PAGE_PAD_X,
+                y,
+            },
+            text,
+            style: TextStyle::BODY,
+            color: PROBLEM_TEXT,
+        });
+        y += h + 2.0;
+    }
+    y + PAD_Y - 2.0 - top
 }
 
 /// Returns whether a section was clicked.

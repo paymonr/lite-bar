@@ -169,6 +169,8 @@ struct WindowState {
     games: Vec<GameRow>,
     /// Shown under the hotkey field.
     status: Option<String>,
+    /// Why the last save failed; pinned above the sections until a save works.
+    save_error: Option<String>,
     /// A rejected hotkey proposal, put into the capture field by the next frame.
     reject: Option<String>,
     queue: ActionQueue,
@@ -205,6 +207,7 @@ impl UiApp for SettingsPage {
             &st.settings,
             &games,
             st.status.as_deref(),
+            st.save_error.as_deref(),
         );
         // The page shows its own changes right away; the app applies them for real.
         for a in &actions {
@@ -336,6 +339,17 @@ impl SettingsUi {
         self.window.request_redraw();
     }
 
+    /// Shows (or with `None` clears) why saving failed.
+    pub fn set_save_error(&self, msg: Option<&str>) {
+        let mut st = self.state.borrow_mut();
+        if st.save_error.as_deref() == msg {
+            return;
+        }
+        st.save_error = msg.map(str::to_string);
+        drop(st);
+        self.window.request_redraw();
+    }
+
     /// Shows a refused hotkey in the capture field and the status line.
     pub fn reject_hotkey(&self, msg: &str) {
         {
@@ -378,6 +392,11 @@ impl SettingsUi {
     #[cfg(test)]
     pub fn send_close(&self) {
         self.send(windows::Win32::UI::WindowsAndMessaging::WM_CLOSE);
+    }
+
+    #[cfg(test)]
+    pub fn save_error(&self) -> Option<String> {
+        self.state.borrow().save_error.clone()
     }
 
     #[cfg(test)]

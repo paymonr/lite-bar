@@ -6,6 +6,7 @@ mod nav;
 mod overlay;
 mod preview;
 mod restore;
+mod status;
 
 use super::*;
 use crate::color::Rgb;
@@ -76,6 +77,7 @@ struct Page {
     settings: Settings,
     games: Vec<GameRow>,
     status: Option<String>,
+    save_error: Option<String>,
     area: Rect,
     now: u64,
     last: Option<Frame>,
@@ -97,6 +99,7 @@ impl Page {
                 game("eldenring.exe", "ELDEN RING", Some("Elden Ring")),
             ],
             status: None,
+            save_error: None,
             area,
             now: 0,
             last: None,
@@ -120,6 +123,7 @@ impl Page {
             &self.settings,
             &self.games,
             self.status.as_deref(),
+            self.save_error.as_deref(),
         );
         self.last = Some(ui.finish());
         for a in &actions {

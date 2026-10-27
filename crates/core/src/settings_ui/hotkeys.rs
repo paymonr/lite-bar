@@ -1,11 +1,8 @@
 //! Hotkeys section: the show / hide capture field and the host's status line.
 
-use super::{ellipsize, end_card, setting_row, SettingsView, UiAction, HINT};
+use super::{ellipsize, end_card, setting_row, SettingsView, UiAction, HINT, PROBLEM_TEXT};
 use crate::settings::Settings;
-use crate::ui::{id, theme, HotkeyFieldEvent, Rgba, Ui};
-
-/// Status text for a hotkey another app already holds.
-const TAKEN: Rgba = Rgba(0xFF, 0x8A, 0x80, 255);
+use crate::ui::{id, theme, HotkeyFieldEvent, Ui};
 
 pub(super) fn section(
     ui: &mut Ui,
@@ -36,7 +33,7 @@ pub(super) fn section(
         }
         if let Some(status) = status {
             let color = if status.starts_with("Already") {
-                TAKEN
+                PROBLEM_TEXT
             } else {
                 theme::MUTED
             };

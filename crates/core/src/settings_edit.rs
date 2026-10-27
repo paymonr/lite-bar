@@ -66,6 +66,25 @@ pub fn apply_change(settings: &mut Settings, change: &SettingsChange) {
     }
 }
 
+/// Whether writing `new` makes writing `old` (an earlier change) pointless: both set the
+/// same key, or `new` restores the defaults that `old` set.
+fn supersedes(new: &SettingsChange, old: &SettingsChange) -> bool {
+    use SettingsChange::*;
+    match (new, old) {
+        (GameName { exe_path: a, .. }, GameName { exe_path: b, .. }) => a == b,
+        (RestoreDefaults, GameName { .. } | SavedColors(_)) => false,
+        (RestoreDefaults, _) => true,
+        _ => std::mem::discriminant(new) == std::mem::discriminant(old),
+    }
+}
+
+/// Adds `change` to the changes waiting to be written, dropping the earlier ones it replaces,
+/// so the list stays bounded while saves keep failing.
+pub fn push_change(pending: &mut Vec<SettingsChange>, change: SettingsChange) {
+    pending.retain(|old| !supersedes(&change, old));
+    pending.push(change);
+}
+
 /// Returns `text` with `changes` applied, rewriting only the touched keys. An empty file starts
 /// from the commented default template. Invalid TOML is an `Err` and nothing should be written.
 pub fn edit_settings_text(text: &str, changes: &[SettingsChange]) -> Result<String, String> {
@@ -266,6 +285,47 @@ mod tests {
         let (s, _) = parse_settings(&out);
         assert_eq!(s.game_names.len(), 1);
         assert_eq!(s.game_names["C:\\Games\\x.exe"], "X");
+    }
+
+    #[test]
+    fn pending_changes_collapse_per_key() {
+        let name = |exe: &str, n: &str| SettingsChange::GameName {
+            exe_path: exe.to_string(),
+            name: Some(n.to_string()),
+        };
+        let mut pending = Vec::new();
+        for n in 10..=40 {
+            push_change(&mut pending, SettingsChange::CounterSize(n));
+            push_change(&mut pending, SettingsChange::BackgroundOpacity(n as u8));
+        }
+        push_change(&mut pending, name("a.exe", "A"));
+        push_change(&mut pending, name("b.exe", "B"));
+        push_change(&mut pending, name("a.exe", "A2"));
+        assert_eq!(
+            pending,
+            vec![
+                SettingsChange::CounterSize(40),
+                SettingsChange::BackgroundOpacity(40),
+                name("b.exe", "B"),
+                name("a.exe", "A2"),
+            ]
+        );
+        // Restore defaults replaces every overlay key and the hotkey, not game names; later
+        // changes stay after it.
+        push_change(&mut pending, SettingsChange::RestoreDefaults);
+        push_change(&mut pending, SettingsChange::TextSize(14));
+        push_change(&mut pending, SettingsChange::RestoreDefaults);
+        assert_eq!(
+            pending,
+            vec![
+                name("b.exe", "B"),
+                name("a.exe", "A2"),
+                SettingsChange::RestoreDefaults,
+            ]
+        );
+        push_change(&mut pending, SettingsChange::TextSize(14));
+        let text = edit_settings_text(&default_settings_toml(), &pending).unwrap();
+        assert_eq!(parse_settings(&text).0.overlay.text_size, 14);
     }
 
     #[test]

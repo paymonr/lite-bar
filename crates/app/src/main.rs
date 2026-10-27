@@ -208,6 +208,8 @@ mod app {
         unsaved: Vec<SettingsChange>,
         /// The toggle hotkey is unregistered while the window's capture field listens.
         hotkey_released: bool,
+        /// Why the last settings save failed (shown in the window), until one works.
+        save_error: Option<&'static str>,
     }
 
     impl App {
@@ -845,6 +847,7 @@ mod app {
             save: SaveDebounce::default(),
             unsaved: Vec::new(),
             hotkey_released: false,
+            save_error: None,
         };
         app.register_hotkey();
         if start_visible {
@@ -925,6 +928,7 @@ mod app {
                 save: SaveDebounce::default(),
                 unsaved: Vec::new(),
                 hotkey_released: false,
+                save_error: None,
             };
             (app, owner)
         }
@@ -1539,6 +1543,76 @@ mod app {
             ui.paint();
             assert!(ui.find_text_px(NEEDS_MODIFIER, error).is_some());
             app.close_settings_window();
+        }
+
+        #[test]
+        fn failed_save_shows_status_and_success_clears_it() {
+            use crate::app::settings::{SAVE_FAILED_FILE, SAVE_FAILED_WRITE};
+            let red = lite_bar_core::ui::Rgba(0xFF, 0x8A, 0x80, 255);
+            let first_line = |m: &str| m.lines().next().unwrap().to_string();
+            let dir = TempDir::new("settings-save-status");
+            let path = dir.path().join("settings.toml");
+            std::fs::write(&path, user_settings_text()).unwrap();
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            let save = |app: &mut App, n: u16| {
+                app.settings_ui.as_ref().unwrap().queue(counter(n));
+                app.drain_settings_actions();
+                app.on_save_timer(Instant::now() + Duration::from_millis(400));
+            };
+
+            std::fs::write(&path, "broken [[[").unwrap();
+            save(&mut app, 21);
+            let ui = app.settings_ui.as_ref().unwrap();
+            assert_eq!(ui.save_error().as_deref(), Some(SAVE_FAILED_FILE));
+            ui.paint();
+            assert!(ui
+                .find_text_px(&first_line(SAVE_FAILED_FILE), red)
+                .is_some());
+
+            // Fixed by hand: the next save works and clears it.
+            std::fs::write(&path, user_settings_text()).unwrap();
+            save(&mut app, 22);
+            assert_eq!(app.settings_ui.as_ref().unwrap().save_error(), None);
+
+            // Broken again, then fixed and reloaded.
+            std::fs::write(&path, "broken [[[").unwrap();
+            save(&mut app, 23);
+            assert!(app.settings_ui.as_ref().unwrap().save_error().is_some());
+            std::fs::write(&path, user_settings_text()).unwrap();
+            app.reload_settings_file();
+            assert_eq!(app.settings_ui.as_ref().unwrap().save_error(), None);
+            assert!(settings_file(dir.path()).contains("counter_size = 23 # my size"));
+
+            // A write error has its own message.
+            std::fs::create_dir(dir.path().join("settings.toml.tmp")).unwrap();
+            save(&mut app, 24);
+            assert_eq!(
+                app.settings_ui.as_ref().unwrap().save_error().as_deref(),
+                Some(SAVE_FAILED_WRITE)
+            );
+            std::fs::remove_dir(dir.path().join("settings.toml.tmp")).unwrap();
+            app.close_settings_window();
+            assert!(settings_file(dir.path()).contains("counter_size = 24 # my size"));
+        }
+
+        #[test]
+        fn a_save_error_shows_when_the_window_opens_again() {
+            use crate::app::settings::SAVE_FAILED_FILE;
+            let dir = TempDir::new("settings-save-reopen");
+            let path = dir.path().join("settings.toml");
+            std::fs::write(&path, user_settings_text()).unwrap();
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            app.settings_ui.as_ref().unwrap().queue(counter(30));
+            app.drain_settings_actions();
+            std::fs::write(&path, "broken [[[").unwrap();
+            app.close_settings_window();
+            app.open_settings_hidden();
+            assert_eq!(
+                app.settings_ui.as_ref().unwrap().save_error().as_deref(),
+                Some(SAVE_FAILED_FILE)
+            );
         }
     }
 }
