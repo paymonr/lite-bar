@@ -14,18 +14,25 @@ const STATS: [(StatsLayout, &str); 3] = [
 pub(super) fn section(ui: &mut Ui, s: &OverlaySettings, out: &mut Vec<UiAction>) {
     let mut emit = |c: SettingsChange| out.push(UiAction::Change(c));
     ui.card(|ui| {
-        setting_row(ui, ROW_H, "Show overlay", None, theme::TOGGLE_W, |ui| {
-            let mut v = s.visible;
-            if ui.toggle(id("settings.visible"), &mut v) {
-                emit(SettingsChange::Visible(v));
-            }
-        });
+        setting_row(
+            ui,
+            ROW_H,
+            Some("Show overlay"),
+            &[],
+            theme::TOGGLE_W,
+            |ui| {
+                let mut v = s.visible;
+                if ui.toggle(id("settings.visible"), &mut v) {
+                    emit(SettingsChange::Visible(v));
+                }
+            },
+        );
         row_line(ui);
         setting_row(
             ui,
             theme::SCREEN_H,
-            "Location",
-            Some("Where the counter sits on screen"),
+            Some("Location"),
+            &["Where the counter sits on screen"],
             theme::SCREEN_W,
             |ui| {
                 let mut loc = s.location;
@@ -44,8 +51,8 @@ pub(super) fn section(ui: &mut Ui, s: &OverlaySettings, out: &mut Vec<UiAction>)
         setting_row(
             ui,
             ROW_H,
-            "Stats",
-            Some("avg, 1% low and 1% high"),
+            Some("Stats"),
+            &["avg, 1% low and 1% high"],
             w,
             |ui| {
                 let mut sel = STATS.iter().position(|(l, _)| *l == s.stats).unwrap_or(0);

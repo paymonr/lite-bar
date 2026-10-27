@@ -28,8 +28,14 @@ const THUMB_MIN_H: f32 = 20.0;
 
 impl<'a> Ui<'a> {
     /// A vertical list of items; clicking an enabled one selects it. A selected
-    /// sub-item also highlights the top-level item above it.
-    pub fn sidebar(&mut self, id: Id, items: &[SidebarItem], selected: &mut usize) -> bool {
+    /// sub-item also highlights the top-level item above it. Returns the index of an
+    /// item clicked this frame, even one that was already selected.
+    pub fn sidebar(
+        &mut self,
+        id: Id,
+        items: &[SidebarItem],
+        selected: &mut usize,
+    ) -> Option<usize> {
         let height = |it: &SidebarItem| {
             if it.indent {
                 theme::NAV_SUB_H
@@ -43,16 +49,16 @@ impl<'a> Ui<'a> {
             Some(it) if it.indent => items[..*selected].iter().rposition(|p| !p.indent),
             _ => Some(*selected),
         };
-        let mut changed = false;
+        let mut clicked_item = None;
         let mut y = area.y;
         for (i, it) in items.iter().enumerate() {
             let rect = Rect::new(area.x, y, area.w, height(it));
             y = rect.bottom() + theme::NAV_SPACING;
             let hot = if it.enabled {
                 let (hot, clicked) = self.interact(id_with(id, i), rect);
-                if clicked && *selected != i {
+                if clicked {
                     *selected = i;
-                    changed = true;
+                    clicked_item = Some(i);
                 }
                 hot
             } else {
@@ -65,7 +71,7 @@ impl<'a> Ui<'a> {
             };
             self.draw_nav_item(rect, it, on, hot);
         }
-        changed
+        clicked_item
     }
 
     fn draw_nav_item(&mut self, rect: Rect, it: &SidebarItem, on: bool, hot: bool) {
@@ -161,6 +167,11 @@ impl<'a> Ui<'a> {
                 radius: THUMB_W / 2.0,
             });
         }
+    }
+
+    /// A scroll area's current offset (0 before it is first built).
+    pub fn scroll_offset(&self, id: Id) -> f32 {
+        self.state.scroll.get(&id).copied().unwrap_or(0.0)
     }
 
     /// Sets a scroll area's offset; it is clamped when the area is next built.

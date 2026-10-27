@@ -160,19 +160,32 @@ fn sidebar_selects_enabled_items() {
         id("nav"),
         &ITEMS,
         &mut sel
-    )));
+    ) == Some(2)));
     assert_eq!(sel, 2);
-    assert!(!click_at(&mut st, 20.0, 70.0, |ui| ui.sidebar(
-        id("nav"),
-        &ITEMS,
-        &mut sel
-    )));
     assert!(click_at(&mut st, 20.0, 10.0, |ui| ui.sidebar(
         id("nav"),
         &ITEMS,
         &mut sel
-    )));
+    ) == Some(0)));
     assert_eq!(sel, 0);
+}
+
+#[test]
+fn sidebar_reports_a_click_on_the_selected_item() {
+    let mut st = UiState::default();
+    let mut sel = 2usize;
+    assert!(click_at(&mut st, 20.0, 70.0, |ui| ui.sidebar(
+        id("nav"),
+        &ITEMS,
+        &mut sel
+    ) == Some(2)));
+    assert_eq!(sel, 2);
+    // No click, no report.
+    let mut got = Some(9);
+    frame(&mut st, &hover(20.0, 70.0), |ui| {
+        got = ui.sidebar(id("nav"), &ITEMS, &mut sel)
+    });
+    assert_eq!(got, None);
 }
 
 #[test]
@@ -180,11 +193,9 @@ fn disabled_sidebar_items_are_not_selectable() {
     let mut st = UiState::default();
     let mut sel = 1usize;
     // Sound mixer spans y 90..122.
-    assert!(!click_at(&mut st, 20.0, 100.0, |ui| ui.sidebar(
-        id("nav"),
-        &ITEMS,
-        &mut sel
-    )));
+    assert!(!click_at(&mut st, 20.0, 100.0, |ui| ui
+        .sidebar(id("nav"), &ITEMS, &mut sel)
+        .is_some()));
     assert_eq!(sel, 1);
     let f = frame(&mut st, &hover(20.0, 100.0), |ui| {
         ui.sidebar(id("nav"), &ITEMS, &mut sel);
@@ -192,4 +203,15 @@ fn disabled_sidebar_items_are_not_selectable() {
     assert_eq!(f.cursor, CursorKind::Arrow);
     let t = texts(&f);
     assert!(t.contains(&"Sound mixer".to_string()) && t.contains(&"soon".to_string()));
+}
+
+#[test]
+fn scroll_offset_reads_the_areas_scroll() {
+    let mut st = UiState::default();
+    st.scroll.insert(id("s"), 25.0);
+    let mut got = (0.0, 0.0);
+    frame(&mut st, &Input::default(), |ui| {
+        got = (ui.scroll_offset(id("s")), ui.scroll_offset(id("other")))
+    });
+    assert_eq!(got, (25.0, 0.0));
 }

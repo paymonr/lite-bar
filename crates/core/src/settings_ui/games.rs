@@ -1,13 +1,13 @@
 //! Game names section: a name field per played game, and the stats folder button.
 
 use super::{
-    button_width, end_card, row_line, text_block, title_block, GameEdit, GameRow, SettingsView,
+    button_width, end_card, row_line, setting_row, text_block, GameEdit, GameRow, SettingsView,
     UiAction, GAMES_HINT, ROW_H,
 };
-use crate::ui::{id, TextEdit, TextFieldEvent, Ui};
+use crate::ui::{id, theme, TextEdit, TextFieldEvent, Ui};
 
 const FIELD_W: f32 = 220.0;
-const GAME_ROW_H: f32 = 40.0;
+const GAME_ROW_H: f32 = theme::CONTROL_HEIGHT;
 const OPEN_FOLDER: &str = "Open stats folder";
 
 pub(super) fn section(
@@ -33,7 +33,8 @@ pub(super) fn section(
 
     ui.card(|ui| {
         if games.is_empty() {
-            text_block(ui, ROW_H, &[GAMES_HINT]);
+            let w = ui.available().w;
+            text_block(ui, ROW_H, None, &[GAMES_HINT], w);
             return;
         }
         for (i, game) in games.iter().enumerate() {
@@ -48,13 +49,11 @@ pub(super) fn section(
         }
         row_line(ui);
         let bw = button_width(ui, OPEN_FOLDER);
-        ui.row(ROW_H, |ui| {
-            ui.right_aligned(bw, |ui| {
-                if ui.button(id("settings.open_stats"), OPEN_FOLDER) {
-                    out.push(UiAction::OpenStatsFolder);
-                }
-            });
-            ui.column(|ui| text_block(ui, ROW_H, &["games.csv and sessions.csv open in Excel"]));
+        let lines = ["games.csv and sessions.csv open in Excel"];
+        setting_row(ui, theme::CONTROL_HEIGHT, None, &lines, bw, |ui| {
+            if ui.button(id("settings.open_stats"), OPEN_FOLDER) {
+                out.push(UiAction::OpenStatsFolder);
+            }
         });
     });
     end_card(ui);
@@ -71,16 +70,19 @@ fn game_row(ui: &mut Ui, game: &GameRow, e: &mut GameEdit, out: &mut Vec<UiActio
         e.synced = game.override_name.clone();
     }
     let exe = file_name(&game.exe_path);
-    ui.row(GAME_ROW_H, |ui| {
-        ui.right_aligned(FIELD_W, |ui| {
-            match ui.text_field(field, &mut e.edit, &game.stored_name) {
-                TextFieldEvent::None => {}
-                TextFieldEvent::Changed => e.pending = true,
-                TextFieldEvent::Committed => out.extend(e.commit(&game.exe_path)),
-            }
-        });
-        ui.column(|ui| title_block(ui, GAME_ROW_H, &game.stored_name, Some(exe)));
-    });
+    let field_w = FIELD_W.min(ui.available().w);
+    setting_row(
+        ui,
+        GAME_ROW_H,
+        Some(&game.stored_name),
+        &[exe],
+        field_w,
+        |ui| match ui.text_field(field, &mut e.edit, &game.stored_name) {
+            TextFieldEvent::None => {}
+            TextFieldEvent::Changed => e.pending = true,
+            TextFieldEvent::Committed => out.extend(e.commit(&game.exe_path)),
+        },
+    );
 }
 
 /// The last path component, for showing `C:\Games\x.exe` as `x.exe`.

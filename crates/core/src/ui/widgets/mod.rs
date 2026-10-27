@@ -25,6 +25,12 @@ impl Ui<'_> {
     /// widgets drawn or blocked later in a frame win. A press on a hot widget makes it
     /// active. Every interactive widget goes through here.
     fn hover(&mut self, id: Id, rect: Rect) -> bool {
+        self.record_hit(rect);
+        self.hover_unrecorded(id, rect)
+    }
+
+    /// `hover` for widgets that record their own hit target.
+    fn hover_unrecorded(&mut self, id: Id, rect: Rect) -> bool {
         if !self.pointer_hits(rect) {
             return false;
         }
@@ -79,15 +85,31 @@ impl Ui<'_> {
     }
 
     pub fn button(&mut self, id: Id, text: &str) -> bool {
-        let (tw, _) = self.measure.measure(text, TextStyle::BODY);
+        self.styled_button(id, text, false)
+    }
+
+    /// A button in the accent color with bold text, for the main action of a group.
+    pub fn button_accent(&mut self, id: Id, text: &str) -> bool {
+        self.styled_button(id, text, true)
+    }
+
+    fn styled_button(&mut self, id: Id, text: &str, accent: bool) -> bool {
+        let style = if accent {
+            TextStyle::BOLD
+        } else {
+            TextStyle::BODY
+        };
+        let (tw, _) = self.measure.measure(text, style);
         let rect = self.alloc(Some(tw + 2.0 * theme::BUTTON_PAD_X), theme::CONTROL_HEIGHT);
         let (hot, clicked) = self.interact(id, rect);
-        let bg = if hot && self.state.active == Some(id) {
-            theme::BUTTON_BG_ACTIVE
-        } else if hot {
-            theme::BUTTON_BG_HOT
-        } else {
-            theme::BUTTON_BG
+        let pressed = hot && self.state.active == Some(id);
+        let (bg, border, fg) = match (accent, hot, pressed) {
+            (true, _, true) => (theme::ACCENT, theme::ACCENT, theme::ON_ACCENT),
+            (true, true, false) => (theme::ACCENT_HOT, theme::ACCENT_HOT, theme::ON_ACCENT),
+            (true, false, _) => (theme::ACCENT, theme::ACCENT, theme::ON_ACCENT),
+            (false, _, true) => (theme::BUTTON_BG_ACTIVE, theme::BUTTON_BORDER, theme::TEXT),
+            (false, true, false) => (theme::BUTTON_BG_HOT, theme::BUTTON_BORDER, theme::TEXT),
+            (false, false, _) => (theme::BUTTON_BG, theme::BUTTON_BORDER, theme::TEXT),
         };
         self.cmds.push(Cmd::Fill {
             rect,
@@ -96,11 +118,11 @@ impl Ui<'_> {
         });
         self.cmds.push(Cmd::Stroke {
             rect,
-            color: theme::BUTTON_BORDER,
+            color: border,
             radius: theme::BUTTON_RADIUS,
             width: 1.0,
         });
-        self.text_centered(rect, text, TextStyle::BODY, theme::TEXT);
+        self.text_centered(rect, text, style, fg);
         clicked
     }
 

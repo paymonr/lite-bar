@@ -17,6 +17,8 @@ pub const BORDER: Rgba = Rgba(0x3A, 0x3E, 0x48, 255);
 pub const TEXT: Rgba = Rgba(0xE6, 0xE6, 0xE6, 255);
 pub const MUTED: Rgba = Rgba(0x9A, 0xA3, 0xAD, 255);
 pub const ACCENT: Rgba = Rgba(0x5F, 0xA8, 0xFF, 255);
+/// Accent buttons under the pointer.
+pub const ACCENT_HOT: Rgba = Rgba(0x7D, 0xB9, 0xFF, 255);
 
 pub const BUTTON_BG: Rgba = Rgba(0x30, 0x34, 0x3D, 255);
 pub const BUTTON_BG_HOT: Rgba = Rgba(0x3A, 0x3F, 0x4A, 255);

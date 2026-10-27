@@ -93,4 +93,8 @@ pub struct Frame {
     /// An `Input::now_ms` time at which the host should run one more frame even
     /// without input, e.g. to show an armed confirm button disarming.
     pub redraw_after_ms: Option<u64>,
+    /// Every hit target registered this frame, clipped to where it can be hit; for tests
+    /// that check a page's layout.
+    #[cfg(test)]
+    pub hits: Vec<Rect>,
 }

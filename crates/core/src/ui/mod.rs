@@ -86,6 +86,8 @@ pub struct Ui<'a> {
     focus_seen: bool,
     /// Earliest `now_ms` at which a widget needs a frame without input.
     redraw_at: Option<u64>,
+    #[cfg(test)]
+    hits: Vec<Rect>,
 }
 
 impl<'a> Ui<'a> {
@@ -115,6 +117,8 @@ impl<'a> Ui<'a> {
             focus_start,
             focus_seen: false,
             redraw_at: None,
+            #[cfg(test)]
+            hits: Vec::new(),
         }
     }
 
@@ -273,6 +277,15 @@ impl<'a> Ui<'a> {
         }
     }
 
+    /// Notes a hit target for `Frame::hits` (tests only).
+    fn record_hit(&mut self, _rect: Rect) {
+        #[cfg(test)]
+        {
+            let r = self.clips.last().map_or(_rect, |c| c.intersect(_rect));
+            self.hits.push(r);
+        }
+    }
+
     /// Whether the pointer is over `rect` and inside the current clip.
     fn pointer_hits(&self, rect: Rect) -> bool {
         self.input
@@ -299,6 +312,10 @@ impl<'a> Ui<'a> {
     /// no layout space and no input; use `clip` rather than a painted `ClipPush` when
     /// widgets inside must stop reacting outside the clip.
     pub fn paint(&mut self, cmd: Cmd) {
+        if matches!(cmd, Cmd::ClipPush(_) | Cmd::ClipPop) {
+            debug_assert!(false, "paint takes no clips; use Ui::clip");
+            return;
+        }
         let (dx, dy) = (self.offset.x, self.offset.y);
         let r = |r: Rect| Rect::new(r.x + dx, r.y + dy, r.w, r.h);
         let p = |p: Pt| Pt {
@@ -368,8 +385,7 @@ impl<'a> Ui<'a> {
                 height_px,
                 rgba,
             },
-            Cmd::ClipPush(rect) => Cmd::ClipPush(r(rect)),
-            Cmd::ClipPop => Cmd::ClipPop,
+            Cmd::ClipPush(_) | Cmd::ClipPop => unreachable!("rejected above"),
         };
         self.cmds.push(cmd);
     }
@@ -444,6 +460,8 @@ impl<'a> Ui<'a> {
             wants_caret_blink: self.state.focused.is_some(),
             cursor: self.cursor,
             redraw_after_ms: self.redraw_at,
+            #[cfg(test)]
+            hits: self.hits,
         }
     }
 }

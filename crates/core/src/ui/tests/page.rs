@@ -161,3 +161,63 @@ fn color_picker_size_matches_the_widget() {
     // Narrower than that wraps the hex box to a second line.
     assert_eq!(color_picker_size(2, 400.0), (330.0, 54.0));
 }
+
+#[test]
+#[should_panic(expected = "use Ui::clip")]
+fn paint_rejects_raw_clips() {
+    let mut st = UiState::default();
+    frame(&mut st, &Input::default(), |ui| {
+        ui.paint(Cmd::ClipPush(Rect::new(0.0, 0.0, 5.0, 5.0)))
+    });
+}
+
+#[test]
+fn accent_button_clicks_and_uses_the_accent_look() {
+    let mut st = UiState::default();
+    let run = |st: &mut UiState, input: &Input| {
+        let mut clicked = false;
+        let f = frame(st, input, |ui| clicked = ui.button_accent(id("a"), "Go"));
+        (clicked, f)
+    };
+    // Hot comes from the previous frame.
+    run(&mut st, &hover(5.0, 5.0));
+    let (_, f) = run(&mut st, &hover(5.0, 5.0));
+    assert_eq!(
+        f.cmds[0],
+        Cmd::Fill {
+            rect: Rect::new(0.0, 0.0, 38.0, 28.0),
+            color: theme::ACCENT_HOT,
+            radius: theme::BUTTON_RADIUS
+        }
+    );
+    match &f.cmds[2] {
+        Cmd::Text { style, color, .. } => {
+            assert_eq!(*style, TextStyle::BOLD);
+            assert_eq!(*color, theme::ON_ACCENT);
+        }
+        c => panic!("expected the label, got {c:?}"),
+    }
+    run(&mut st, &press(5.0, 5.0));
+    assert!(run(&mut st, &release(5.0, 5.0)).0);
+    let (_, f) = run(&mut st, &Input::default());
+    assert!(matches!(f.cmds[0], Cmd::Fill { color, .. } if color == theme::ACCENT));
+}
+
+#[test]
+fn frames_list_their_hit_targets_for_tests() {
+    let mut st = UiState::default();
+    let f = frame(&mut st, &Input::default(), |ui| {
+        ui.button(id("a"), "OK");
+        ui.clip(Rect::new(0.0, 0.0, 100.0, 40.0), |ui| {
+            ui.button(id("b"), "Hidden");
+        });
+    });
+    // The second button is clipped to the strip it still shows in.
+    assert_eq!(
+        f.hits,
+        vec![
+            Rect::new(0.0, 0.0, 38.0, 28.0),
+            Rect::new(0.0, 36.0, 66.0, 4.0)
+        ]
+    );
+}

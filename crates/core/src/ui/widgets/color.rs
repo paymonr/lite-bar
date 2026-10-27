@@ -163,8 +163,9 @@ impl Ui<'_> {
             .input
             .pointer
             .is_some_and(|p| (p.x - cx).hypot(p.y - cy) <= r);
+        self.record_hit(rect);
         if in_disc {
-            self.hover(id, rect);
+            self.hover_unrecorded(id, rect);
         }
         let mut changed = false;
         if self.state.active == Some(id) {

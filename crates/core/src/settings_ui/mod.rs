@@ -21,12 +21,14 @@ use crate::ui::{
     id, theme, Cmd, HotkeyCapture, Hsv, Id, Pt, Rect, Rgba, SidebarItem, TextEdit, TextStyle, Ui,
 };
 
-/// Sidebar items, in order.
-pub const NAV_SETTINGS: usize = 0;
-pub const NAV_OVERLAY: usize = 1;
-pub const NAV_APPEARANCE: usize = 2;
-pub const NAV_HOTKEYS: usize = 3;
-pub const NAV_GAMES: usize = 4;
+/// Sidebar sections under the static "Settings" header, in page order.
+pub const NAV_OVERLAY: usize = 0;
+pub const NAV_APPEARANCE: usize = 1;
+pub const NAV_HOTKEYS: usize = 2;
+pub const NAV_GAMES: usize = 3;
+
+/// Smallest window (width, height) in DIPs the page is laid out for.
+pub const MIN_WINDOW_DIP: (f32, f32) = (720.0, 520.0);
 
 pub const GAMES_HINT: &str = "Games appear here after you play one for over a minute.";
 
@@ -130,6 +132,9 @@ pub struct SettingsView {
     headings: [f32; 4],
     /// Height of the scrolling content in the last frame.
     content_h: f32,
+    /// Scroll offset right after a sidebar click; while the page stays there the clicked
+    /// section stays highlighted (the last one may never reach the top).
+    nav_scroll: Option<f32>,
     /// Shows "Defaults restored." until the next change.
     restored: bool,
     /// The preview stage's background, generated once.
@@ -151,6 +156,7 @@ impl Default for SettingsView {
             games: BTreeMap::new(),
             headings: [0.0; 4],
             content_h: 0.0,
+            nav_scroll: None,
             restored: false,
             stage_bg: None,
         }
@@ -179,7 +185,7 @@ pub fn settings_frame(
     let mut out = Vec::new();
     let area = ui.available();
     let side = Rect::new(area.x, area.y, SIDEBAR_W.min(area.w), area.h);
-    sidebar(ui, view, side);
+    let clicked = sidebar(ui, view, side);
     let main = Rect::new(
         side.right() + 1.0,
         area.y,
@@ -200,6 +206,18 @@ pub fn settings_frame(
             new_h = content(ui, view, settings, games, hotkey_status, &mut out);
         });
     });
+    let scroll = ui.scroll_offset(scroll_id());
+    if clicked {
+        view.nav_scroll = Some(scroll);
+    } else if view.nav_scroll != Some(scroll) {
+        // Scroll-spy: the last section whose heading is at or above the viewport top.
+        view.nav_scroll = None;
+        view.selected = view
+            .headings
+            .iter()
+            .rposition(|h| *h <= scroll + 0.5)
+            .unwrap_or(NAV_OVERLAY);
+    }
     if new_h != view.content_h {
         view.content_h = new_h;
         ui.request_redraw();
@@ -212,7 +230,9 @@ pub fn settings_frame(
     out
 }
 
-fn sidebar(ui: &mut Ui, view: &mut SettingsView, side: Rect) {
+/// Returns whether a section was clicked.
+fn sidebar(ui: &mut Ui, view: &mut SettingsView, side: Rect) -> bool {
+    let mut clicked = false;
     ui.paint(Cmd::Fill {
         rect: side,
         color: SIDEBAR_BG,
@@ -244,25 +264,23 @@ fn sidebar(ui: &mut Ui, view: &mut SettingsView, side: Rect) {
             ui.label("Lite Bar", TextStyle::BOLD, theme::TEXT);
         });
         ui.space(14.0);
-        let item = |label, indent| SidebarItem {
+        settings_header(ui);
+        let item = |label| SidebarItem {
             label,
-            indent,
+            indent: true,
             enabled: true,
             note: None,
         };
         let items = [
-            item("Settings", false),
-            item("Overlay", true),
-            item("Appearance", true),
-            item("Hotkeys", true),
-            item("Game names", true),
+            item("Overlay"),
+            item("Appearance"),
+            item("Hotkeys"),
+            item("Game names"),
         ];
-        if ui.sidebar(id("settings.nav"), &items, &mut view.selected) {
-            let y = match view.selected {
-                NAV_SETTINGS | NAV_OVERLAY => 0.0,
-                i => view.headings[i - 1],
-            };
-            ui.set_scroll(scroll_id(), y);
+        if let Some(i) = ui.sidebar(id("settings.nav"), &items, &mut view.selected) {
+            // Any click scrolls, also on the selected section.
+            ui.set_scroll(scroll_id(), view.headings[i]);
+            clicked = true;
         }
         ui.space(14.0);
         let later = |label, note| SidebarItem {
@@ -279,6 +297,34 @@ fn sidebar(ui: &mut Ui, view: &mut SettingsView, side: Rect) {
         let mut none = usize::MAX;
         ui.sidebar(id("settings.nav.later"), &future, &mut none);
     });
+    clicked
+}
+
+/// The always-on "Settings" header above its sections, drawn like a selected item.
+fn settings_header(ui: &mut Ui) {
+    let a = ui.available();
+    let rect = Rect::new(a.x, a.y, a.w, theme::NAV_H);
+    ui.paint(Cmd::Fill {
+        rect,
+        color: theme::SURFACE,
+        radius: theme::NAV_RADIUS,
+    });
+    ui.paint(Cmd::Fill {
+        rect: Rect::new(rect.x, rect.y, 3.0, rect.h),
+        color: theme::ACCENT,
+        radius: 0.0,
+    });
+    let h = ui.text_measure().measure("Settings", TextStyle::BODY).1;
+    ui.paint(Cmd::Text {
+        pos: Pt {
+            x: rect.x + theme::NAV_PAD_X,
+            y: rect.y + (rect.h - h) / 2.0,
+        },
+        text: "Settings".to_string(),
+        style: TextStyle::BODY,
+        color: theme::SIDEBAR_SELECTED_TEXT,
+    });
+    ui.space(theme::NAV_H + theme::NAV_SPACING);
 }
 
 /// The scrolling sections; returns their total height.
@@ -338,67 +384,104 @@ fn restore_row(ui: &mut Ui, view: &SettingsView, out: &mut Vec<UiAction>) {
         .0
         .max(m.measure(CONFIRM, TextStyle::BOLD).0)
         + 2.0 * theme::BUTTON_PAD_X;
+    let lines: &[&str] = if view.restored {
+        &["Defaults restored."]
+    } else {
+        &[
+            "Puts every overlay setting and the hotkey back to how Lite Bar ships.",
+            "Your game names and saved colors are kept.",
+        ]
+    };
     ui.space(18.0 - CARD_SPACING);
-    ui.row(ROW_H, |ui| {
-        ui.right_aligned(w, |ui| {
-            if ui.confirm_button(id("settings.restore"), TEXT, CONFIRM) {
-                out.push(UiAction::Change(SettingsChange::RestoreDefaults));
-            }
-        });
-        ui.column(|ui| {
-            let lines: &[&str] = if view.restored {
-                &["Defaults restored."]
-            } else {
-                &[
-                    "Puts every overlay setting and the hotkey back to how Lite Bar ships.",
-                    "Your game names and saved colors are kept.",
-                ]
-            };
-            text_block(ui, ROW_H, lines);
-        });
+    setting_row(ui, theme::CONTROL_HEIGHT, None, lines, w, |ui| {
+        if ui.confirm_button(id("settings.restore"), TEXT, CONFIRM) {
+            out.push(UiAction::Change(SettingsChange::RestoreDefaults));
+        }
     });
 }
 
-/// Muted lines, vertically centred in a column `h` tall.
-fn text_block(ui: &mut Ui, h: f32, lines: &[&str]) {
-    let line_h = ui.text_measure().measure("Ag", HINT).1;
-    let n = lines.len() as f32;
-    let total = line_h * n + 2.0 * (n - 1.0).max(0.0);
-    ui.space(((h - total) / 2.0).max(0.0));
+/// `text` cut to fit `max_w`, ending in "…" when shortened.
+fn ellipsize(ui: &Ui, text: &str, style: TextStyle, max_w: f32) -> String {
+    let m = ui.text_measure();
+    if m.measure(text, style).0 <= max_w {
+        return text.to_string();
+    }
+    let mut chars: Vec<char> = text.chars().collect();
+    while !chars.is_empty() {
+        chars.pop();
+        let s: String = chars.iter().collect::<String>().trim_end().to_string() + "…";
+        if m.measure(&s, style).0 <= max_w {
+            return s;
+        }
+    }
+    String::new()
+}
+
+/// Width and height of an optional bold title over muted lines.
+fn text_size(ui: &Ui, title: Option<&str>, lines: &[&str]) -> (f32, f32) {
+    let m = ui.text_measure();
+    let mut w: f32 = 0.0;
+    let mut h: f32 = 0.0;
+    if let Some(t) = title {
+        let (tw, th) = m.measure(t, TextStyle::BOLD);
+        w = tw;
+        h = th;
+    }
     for (i, l) in lines.iter().enumerate() {
-        if i > 0 {
+        let (lw, lh) = m.measure(l, HINT);
+        w = w.max(lw);
+        h += lh + if i > 0 || title.is_some() { 2.0 } else { 0.0 };
+    }
+    (w, h)
+}
+
+/// An optional bold title over muted lines, each cut to `max_w`, vertically centred in
+/// `h` of the current column.
+fn text_block(ui: &mut Ui, h: f32, title: Option<&str>, lines: &[&str], max_w: f32) {
+    let (_, text_h) = text_size(ui, title, lines);
+    ui.space(((h - text_h) / 2.0).max(0.0));
+    if let Some(t) = title {
+        let t = ellipsize(ui, t, TextStyle::BOLD, max_w);
+        ui.label(&t, TextStyle::BOLD, theme::TEXT);
+    }
+    for (i, l) in lines.iter().enumerate() {
+        if i > 0 || title.is_some() {
             ui.space(2.0);
         }
-        ui.label(l, HINT, theme::MUTED);
+        let l = ellipsize(ui, l, HINT, max_w);
+        ui.label(&l, HINT, theme::MUTED);
     }
 }
 
-/// A card row `h` tall: `title` (bold) and an optional muted `hint` on the left, and the
-/// widgets built by `control`, `control_w` wide, on the right.
+/// A card row: an optional bold `title` over muted `lines` on the left and the widgets
+/// built by `control` (`control_w` wide, `control_h` tall) on the right. When both do not
+/// fit side by side the control goes under the text, left-aligned. Text never runs
+/// under the control; it is cut with "…" instead. Returns whether it stacked.
 fn setting_row<'a>(
     ui: &mut Ui<'a>,
-    h: f32,
-    title: &str,
-    hint: Option<&str>,
+    control_h: f32,
+    title: Option<&str>,
+    lines: &[&str],
     control_w: f32,
     control: impl FnOnce(&mut Ui<'a>),
-) {
-    ui.row(h, |ui| {
-        ui.right_aligned(control_w, control);
-        ui.column(|ui| title_block(ui, h, title, hint));
-    });
-}
-
-/// A bold title over an optional muted hint, vertically centred in a column `h` tall.
-fn title_block(ui: &mut Ui, h: f32, title: &str, hint: Option<&str>) {
-    let m = ui.text_measure();
-    let title_h = m.measure(title, TextStyle::BOLD).1;
-    let hint_h = hint.map_or(0.0, |t| 2.0 + m.measure(t, HINT).1);
-    ui.space(((h - title_h - hint_h) / 2.0).max(0.0));
-    ui.label(title, TextStyle::BOLD, theme::TEXT);
-    if let Some(hint) = hint {
-        ui.space(2.0);
-        ui.label(hint, HINT, theme::MUTED);
+) -> bool {
+    let row_w = ui.available().w;
+    let (text_w, text_h) = text_size(ui, title, lines);
+    if text_w + 2.0 * theme::GAP + control_w <= row_w {
+        let h = control_h.max(text_h).max(ROW_H);
+        ui.row(h, |ui| {
+            ui.right_aligned(control_w, control);
+            ui.column(|ui| text_block(ui, h, title, lines, row_w - control_w - theme::GAP));
+        });
+        false
+    } else {
+        text_block(ui, text_h, title, lines, row_w);
+        ui.space(6.0);
+        ui.row(control_h, |ui| {
+            ui.next_width(control_w.min(row_w));
+            ui.row(control_h, control);
+        });
+        true
     }
 }
 

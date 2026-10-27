@@ -2,7 +2,9 @@
 
 use std::ops::RangeInclusive;
 
-use super::{end_card, row_line, setting_row, title_block, SettingsView, UiAction, HINT, ROW_H};
+use super::{
+    end_card, row_line, setting_row, text_block, text_size, SettingsView, UiAction, ROW_H,
+};
 use crate::color::Rgb;
 use crate::settings::{OverlaySettings, Settings, MAX_SAVED_COLORS};
 use crate::settings_edit::SettingsChange;
@@ -27,6 +29,9 @@ const VALUE_W: f32 = 44.0;
 const COLOR_TITLE_W: f32 = 150.0;
 const SWATCHES_MAX_W: f32 = 440.0;
 const WHEEL: f32 = 170.0;
+const WHEEL_GAP: f32 = 18.0;
+const MIX_HEX_W: f32 = theme::HEX_W + 14.0;
+const BRIGHTNESS: &str = "Brightness";
 const MIX_CHIP_W: f32 = 56.0;
 const MIX_CHIP_H: f32 = 40.0;
 const USE_FOR: [&str; 3] = ["Use for number", "Use for text", "Use for background"];
@@ -106,7 +111,7 @@ fn size_row(ui: &mut Ui, row: &SizeRow, out: &mut Vec<UiAction>) {
     let chip = format!("Default {}{}", row.default, row.unit);
     let chip_w = ui.text_measure().measure(&chip, CHIP_STYLE).0 + 2.0 * theme::CHIP_PAD_X;
     let w = SLIDER_W + theme::GAP + VALUE_W + theme::GAP + chip_w;
-    setting_row(ui, ROW_H, row.title, row.hint, w, |ui| {
+    setting_row(ui, ROW_H, Some(row.title), row.hint.as_slice(), w, |ui| {
         let key = id(&format!("settings.size.{}", row.key));
         let mut v = i64::from(row.value);
         ui.next_width(SLIDER_W);
@@ -141,7 +146,7 @@ fn color_rows(ui: &mut Ui, view: &mut SettingsView, settings: &Settings, out: &m
         if i > 0 {
             row_line(ui);
         }
-        setting_row(ui, h.max(ROW_H), title, None, w, |ui| {
+        setting_row(ui, h.max(ROW_H), Some(title), &[], w, |ui| {
             let mut c = color;
             ui.next_width(w);
             match ui.color_picker(id_with(id("settings.color"), i), &mut c, saved, hex) {
@@ -158,52 +163,101 @@ fn color_rows(ui: &mut Ui, view: &mut SettingsView, settings: &Settings, out: &m
 }
 
 fn mixer(ui: &mut Ui, view: &mut SettingsView, saved: &[Rgb], out: &mut Vec<UiAction>) {
-    ui.row(30.0, |ui| {
-        ui.column(|ui| {
-            title_block(
-                ui,
-                30.0,
-                "Color mixer",
-                Some("Find any color, then use it or save it to your colors."),
-            )
-        })
-    });
-    ui.space(2.0);
-    ui.label(
+    let lines = [
+        "Find any color, then use it or save it to your colors.",
         "Saved colors show with a dashed edge in every row above.",
-        HINT,
-        theme::MUTED,
-    );
+    ];
+    let inner_w = ui.available().w;
+    let (_, text_h) = text_size(ui, Some("Color mixer"), &lines);
+    text_block(ui, text_h, Some("Color mixer"), &lines, inner_w);
     ui.space(10.0);
-    ui.row(WHEEL, |ui| {
+    // The controls fit beside the wheel down to `MIN_WINDOW_DIP`; they wrap their
+    // buttons onto more lines as needed.
+    let side_w = (inner_w - WHEEL - WHEEL_GAP).max(0.0);
+    let col_h = controls_height(ui, side_w);
+    let h = WHEEL.max(col_h);
+    ui.row(h, |ui| {
         ui.color_wheel(id("settings.wheel"), &mut view.mixer, WHEEL);
-        ui.space(18.0);
+        ui.space(WHEEL_GAP);
         ui.column(|ui| {
-            ui.space(15.0);
-            brightness(ui, &mut view.mixer);
-            ui.row(MIX_CHIP_H, |ui| chip_and_hex(ui, view));
-            let color = view.mixer.to_rgb();
-            ui.row(theme::CONTROL_HEIGHT, |ui| {
-                let changes: [fn(Rgb) -> SettingsChange; 3] = [
-                    SettingsChange::NumberColor,
-                    SettingsChange::LabelColor,
-                    SettingsChange::BackgroundColor,
-                ];
-                for (i, (text, change)) in USE_FOR.iter().zip(changes).enumerate() {
-                    if ui.button(id_with(id("settings.use"), i), text) {
-                        out.push(UiAction::Change(change(color)));
+            ui.space((h - col_h) / 2.0);
+            controls(ui, view, saved, side_w, out);
+        });
+    });
+}
+
+/// Labels and styles of the mixer's buttons, in order; the first is the accent one.
+fn mixer_buttons() -> [(&'static str, TextStyle); 4] {
+    [
+        (USE_FOR[0], TextStyle::BOLD),
+        (USE_FOR[1], TextStyle::BODY),
+        (USE_FOR[2], TextStyle::BODY),
+        (SAVE, TextStyle::BODY),
+    ]
+}
+
+/// The buttons split into lines that fit `w`, as indices.
+fn button_lines(ui: &Ui, w: f32) -> Vec<Vec<usize>> {
+    let m = ui.text_measure();
+    let mut lines: Vec<Vec<usize>> = Vec::new();
+    let mut x = 0.0;
+    for (i, (t, st)) in mixer_buttons().iter().enumerate() {
+        let bw = m.measure(t, *st).0 + 2.0 * theme::BUTTON_PAD_X;
+        match lines.last_mut() {
+            Some(line) if x + theme::GAP + bw <= w => {
+                line.push(i);
+                x += theme::GAP + bw;
+            }
+            _ => {
+                lines.push(vec![i]);
+                x = bw;
+            }
+        }
+    }
+    lines
+}
+
+fn controls_height(ui: &Ui, w: f32) -> f32 {
+    let n = button_lines(ui, w).len() as f32;
+    theme::SLIDER_H
+        + theme::GAP
+        + MIX_CHIP_H
+        + theme::GAP
+        + n * theme::CONTROL_HEIGHT
+        + (n - 1.0) * theme::GAP
+}
+
+/// Brightness, the chip with the hex box, and the buttons, wrapped to `w`.
+fn controls(ui: &mut Ui, view: &mut SettingsView, saved: &[Rgb], w: f32, out: &mut Vec<UiAction>) {
+    brightness(ui, &mut view.mixer);
+    ui.row(MIX_CHIP_H, |ui| chip_and_hex(ui, view));
+    let color = view.mixer.to_rgb();
+    let changes: [fn(Rgb) -> SettingsChange; 3] = [
+        SettingsChange::NumberColor,
+        SettingsChange::LabelColor,
+        SettingsChange::BackgroundColor,
+    ];
+    for line in button_lines(ui, w) {
+        ui.row(theme::CONTROL_HEIGHT, |ui| {
+            for i in line {
+                if i < USE_FOR.len() {
+                    let bid = id_with(id("settings.use"), i);
+                    let clicked = if i == 0 {
+                        ui.button_accent(bid, USE_FOR[i])
+                    } else {
+                        ui.button(bid, USE_FOR[i])
+                    };
+                    if clicked {
+                        out.push(UiAction::Change(changes[i](color)));
                     }
-                }
-            });
-            ui.row(theme::CONTROL_HEIGHT, |ui| {
-                if ui.button(id("settings.save_color"), SAVE) {
+                } else if ui.button(id("settings.save_color"), SAVE) {
                     if let Some(list) = with_saved(saved, color) {
                         out.push(UiAction::Change(SettingsChange::SavedColors(list)));
                     }
                 }
-            });
+            }
         });
-    });
+    }
 }
 
 /// `saved` with `color` appended (oldest dropped past the cap), or `None` if it is
@@ -221,13 +275,14 @@ fn with_saved(saved: &[Rgb], color: Rgb) -> Option<Vec<Rgb>> {
 
 fn brightness(ui: &mut Ui, mixer: &mut Hsv) {
     ui.row(theme::SLIDER_H, |ui| {
-        ui.next_width(70.0);
+        let (lw, lh) = ui.text_measure().measure(BRIGHTNESS, TextStyle::BODY);
+        ui.next_width(lw);
         ui.column(|ui| {
-            ui.space(((theme::SLIDER_H - TextStyle::BODY.size) / 2.0).max(0.0));
-            ui.label("Brightness", TextStyle::BODY, theme::MUTED);
+            ui.space(((theme::SLIDER_H - lh) / 2.0).max(0.0));
+            ui.label(BRIGHTNESS, TextStyle::BODY, theme::MUTED);
         });
         let mut v = (mixer.v * 100.0).round() as i64;
-        ui.next_width(SLIDER_W);
+        ui.next_width(SLIDER_W.min(ui.available().w));
         if ui.slider(id("settings.brightness"), &mut v, 0..=100) {
             mixer.v = v as f32 / 100.0;
         }
@@ -255,7 +310,7 @@ fn chip_and_hex(ui: &mut Ui, view: &mut SettingsView) {
     if !ui.is_focused(hex_id) && view.mixer_hex.text != current {
         view.mixer_hex = TextEdit::new(&current);
     }
-    ui.next_width(theme::HEX_W + 14.0);
+    ui.next_width(MIX_HEX_W);
     if ui.text_field(hex_id, &mut view.mixer_hex, "") == TextFieldEvent::Committed {
         if let Ok(c) = Rgb::parse_hex(view.mixer_hex.text.trim()) {
             view.mixer = Hsv::from_rgb(c);

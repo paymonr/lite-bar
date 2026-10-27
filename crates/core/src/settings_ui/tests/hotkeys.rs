@@ -1,0 +1,41 @@
+use super::*;
+
+#[test]
+fn hotkey_capture_emits_proposal() {
+    let mut p = Page::new(TALL);
+    p.click_text("Ctrl");
+    let a = p.keys(vec![KeyPress {
+        ctrl: true,
+        alt: true,
+        ..key(UiKey::Other(0x4B))
+    }]);
+    assert_eq!(
+        a,
+        vec![UiAction::ProposeHotkey(
+            Hotkey::new(true, true, false, false, Key::Letter('K')).unwrap()
+        )]
+    );
+}
+
+#[test]
+fn esc_cancels_hotkey_capture() {
+    let mut p = Page::new(TALL);
+    p.click_text("Ctrl");
+    let a = p.keys(vec![key(UiKey::Esc)]);
+    assert_eq!(a, vec![UiAction::CancelHotkeyCapture]);
+}
+
+#[test]
+fn hotkey_status_shows_under_the_field() {
+    let mut p = Page::new(TALL);
+    p.status = Some("Saved".to_string());
+    p.idle();
+    let field_y = find_text(p.frame(), "Ctrl").unwrap().0.y;
+    let (pos, _, color) = find_text(p.frame(), "Saved").unwrap();
+    assert_eq!(color, theme::MUTED);
+    assert!(pos.y > field_y);
+    p.status = Some("Already used by another app".to_string());
+    p.idle();
+    let (_, _, color) = find_text(p.frame(), "Already used by another app").unwrap();
+    assert_eq!(color, Rgba(0xFF, 0x8A, 0x80, 255));
+}
