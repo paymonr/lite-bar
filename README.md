@@ -55,6 +55,7 @@ The overlay toggles with `Ctrl+Alt+Shift+L` by default.
 
 - **Overlay**: show or hide the counter, its location on screen, and the statistics layout.
 - **Appearance**: number, text and background colors (hex fields, a color wheel, default chips and up to 16 saved colors; right-click a saved color to remove it), background opacity, counter size and text size.
+- **General**: the **Start with Windows** switch (see [Start with Windows](#start-with-windows)).
 - **Hotkeys**: click the field and press the new combination; Esc cancels. A combination another app already holds is refused with "Already used by another app" and the old hotkey stays.
 - **Updates**: the **Check for updates** switch, **Check now** and the update status (see [Updates](#updates)).
 - **Game names**: rename any game you've played. The name is saved under `[game_names]` and `games.csv` is regenerated; **Open stats folder** opens the stats folder.
@@ -76,6 +77,16 @@ When a newer release is out, Settings shows "Update available: v…" with an **U
 4. Lite Bar quits the same way as **Quit**: the open settings are saved and the play sessions are written. It then starts the new `lite-bar.exe --updated`. If Lite Bar was running as administrator, the new instance is too. The new instance waits up to 10 s for the old one to exit. Every start of Lite Bar also deletes a leftover `lite-bar.exe.old` in the background.
 
 Any failure shows "Update failed: …" in red in Settings, with **Open release page**, and leaves the running version untouched. When trying again may help, Settings also shows **Try again**, which downloads the same release again. For example, the checksum may not match, or the download may be cut off or time out. If Lite Bar's folder can't be written to (for example, under Program Files without administrator rights), Settings says "Can't update in this folder — download it from GitHub". In that case, download `lite-bar.exe` from the release page and replace the file yourself. If the new exe is in place but couldn't be started, Settings says "Update installed — restart Lite Bar to finish" and offers **Restart now** to try again. Until then, the old version keeps running, and Lite Bar doesn't offer the installed version again. If only `lite-bar.exe.old` is left in Lite Bar's folder (for example, after a crash mid-update), rename it back to `lite-bar.exe`.
+
+### Start with Windows
+
+FPS capture needs administrator rights, so Lite Bar starts at sign-in through a Windows scheduled task rather than the Startup folder. The task runs Lite Bar elevated with no UAC prompt at each boot. It is off by default. Turn it on with **Settings → General → Start with Windows**.
+
+- The task is named `Lite Bar`, in the root folder of Task Scheduler. It runs at sign-in of the current user with highest privileges, has no time limit and also runs on battery. It is created with `schtasks /Create /XML` and removed with `schtasks /Delete`.
+- The switch shows whether the task really exists. Lite Bar checks it when the window opens and after each change.
+- If Lite Bar is already running as administrator, the switch changes the task directly. If not, Lite Bar starts `lite-bar.exe --startup on` (or `off`) as administrator, so you see one UAC prompt. That process changes the task and exits. Declining the prompt leaves everything as it was. After that, every sign-in starts Lite Bar elevated with no prompt.
+- The task starts the `lite-bar.exe` it was created from. **Update now** replaces that file in place, so the task keeps working after updates. If you move `lite-bar.exe`, the switch shows "On (points to another copy)". Turn it on again to point the task at the copy you're running.
+- To remove the task by hand, run this from an administrator prompt: `schtasks /Delete /TN "Lite Bar" /F`.
 
 ### Files
 

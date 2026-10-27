@@ -1,5 +1,6 @@
 mod appearance;
 mod games;
+mod general;
 mod hotkeys;
 mod layout;
 mod nav;
@@ -14,6 +15,7 @@ use crate::color::Rgb;
 use crate::hotkey::Key;
 use crate::settings::{Location, StatsLayout, MAX_SAVED_COLORS};
 use crate::settings_edit::apply_change;
+use crate::startup_task::StartupState;
 use crate::ui::{id, theme, Cmd, Frame, Input, KeyPress, Pt, Rect, Rgba, TextMeasure, TextStyle};
 use crate::ui::{UiKey, UiState, PRESET_COLORS};
 use crate::update::{current_version, ReleaseInfo, UpdateState};
@@ -81,6 +83,8 @@ struct Page {
     status: Option<String>,
     save_error: Option<String>,
     update: UpdateState,
+    startup: StartupState,
+    elevated: bool,
     area: Rect,
     now: u64,
     last: Option<Frame>,
@@ -104,6 +108,8 @@ impl Page {
             status: None,
             save_error: None,
             update: UpdateState::Idle,
+            startup: StartupState::Off,
+            elevated: true,
             area,
             now: 0,
             last: None,
@@ -128,9 +134,15 @@ impl Page {
             &self.games,
             self.status.as_deref(),
             self.save_error.as_deref(),
-            UpdatesInput {
-                state: &self.update,
-                current: current_version(),
+            PageInput {
+                updates: UpdatesInput {
+                    state: &self.update,
+                    current: current_version(),
+                },
+                startup: StartupInput {
+                    state: &self.startup,
+                    elevated: self.elevated,
+                },
             },
         );
         self.last = Some(ui.finish());
@@ -374,5 +386,17 @@ fn all_update_states() -> Vec<UpdateState> {
         },
         UpdateState::RestartRequired,
         UpdateState::CheckFailed,
+    ]
+}
+
+/// Every state the General section can show.
+fn all_startup_states() -> Vec<StartupState> {
+    vec![
+        StartupState::Unknown,
+        StartupState::On,
+        StartupState::Off,
+        StartupState::OnOtherCopy,
+        StartupState::Busy,
+        StartupState::Error("Couldn't change the startup task: schtasks exited with code 1".into()),
     ]
 }

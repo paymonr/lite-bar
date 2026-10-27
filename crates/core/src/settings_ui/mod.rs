@@ -4,6 +4,7 @@
 
 mod appearance;
 mod games;
+mod general;
 mod hotkeys;
 mod overlay;
 mod preview;
@@ -18,6 +19,7 @@ use std::rc::Rc;
 use crate::hotkey::Hotkey;
 use crate::settings::Settings;
 use crate::settings_edit::SettingsChange;
+use crate::startup_task::StartupState;
 use crate::ui::{
     id, theme, Cmd, HotkeyCapture, Hsv, Id, Pt, Rect, Rgba, SidebarItem, TextEdit, TextStyle, Ui,
 };
@@ -26,10 +28,11 @@ use crate::update::{UpdateState, Version};
 /// Sidebar sections under the static "Settings" header, in page order.
 pub const NAV_OVERLAY: usize = 0;
 pub const NAV_APPEARANCE: usize = 1;
-pub const NAV_HOTKEYS: usize = 2;
-pub const NAV_UPDATES: usize = 3;
-pub const NAV_GAMES: usize = 4;
-const SECTIONS: usize = 5;
+pub const NAV_GENERAL: usize = 2;
+pub const NAV_HOTKEYS: usize = 3;
+pub const NAV_UPDATES: usize = 4;
+pub const NAV_GAMES: usize = 5;
+const SECTIONS: usize = 6;
 
 /// Smallest window (width, height) in DIPs the page is laid out for.
 pub const MIN_WINDOW_DIP: (f32, f32) = (720.0, 520.0);
@@ -95,6 +98,8 @@ pub enum UiAction {
     OpenReleasePage,
     /// "Restart now": start the already installed new version and quit this one.
     RestartToUpdate,
+    /// The "Start with Windows" switch: create (true) or delete the logon task.
+    SetStartup(bool),
 }
 
 /// What the Updates section shows: the app's update state and this build's version.
@@ -102,6 +107,21 @@ pub enum UiAction {
 pub struct UpdatesInput<'a> {
     pub state: &'a UpdateState,
     pub current: Version,
+}
+
+/// What the General section shows: the startup task's state and whether Lite Bar runs as
+/// administrator (if not, changing it asks for admin once).
+#[derive(Clone, Copy, Debug)]
+pub struct StartupInput<'a> {
+    pub state: &'a StartupState,
+    pub elevated: bool,
+}
+
+/// What the app feeds the page besides the settings.
+#[derive(Clone, Copy, Debug)]
+pub struct PageInput<'a> {
+    pub updates: UpdatesInput<'a>,
+    pub startup: StartupInput<'a>,
 }
 
 /// A game's name field. The text stays here while it is edited and is only emitted
@@ -169,6 +189,11 @@ pub struct SettingsView {
     restored: bool,
     /// The preview stage's background, generated once.
     stage_bg: Option<Rc<Vec<u8>>>,
+    /// The Start with Windows switch's last real state (On or Off), kept for while the
+    /// state is busy or a change failed.
+    startup_shown: bool,
+    /// The value a click asked for, shown while the change runs.
+    startup_target: Option<bool>,
 }
 
 impl Default for SettingsView {
@@ -189,6 +214,8 @@ impl Default for SettingsView {
             nav_scroll: None,
             restored: false,
             stage_bg: None,
+            startup_shown: false,
+            startup_target: None,
         }
     }
 }
@@ -206,7 +233,7 @@ impl SettingsView {
 
 /// Builds the whole window: sidebar, pinned header with the preview, scrolling sections.
 /// `save_error` (lines split by `\n`) shows pinned above the sections while saving fails.
-/// `updates` feeds the Updates section.
+/// `input` feeds the Updates and General sections.
 pub fn settings_frame(
     ui: &mut Ui,
     view: &mut SettingsView,
@@ -214,7 +241,7 @@ pub fn settings_frame(
     games: &[GameRow],
     hotkey_status: Option<&str>,
     save_error: Option<&str>,
-    updates: UpdatesInput,
+    input: PageInput,
 ) -> Vec<UiAction> {
     let mut out = Vec::new();
     let area = ui.available();
@@ -240,7 +267,7 @@ pub fn settings_frame(
     let mut new_h = content_h;
     ui.region(body, |ui| {
         ui.scroll_area(scroll_id(), body.h, content_h, |ui| {
-            new_h = content(ui, view, settings, games, hotkey_status, updates, &mut out);
+            new_h = content(ui, view, settings, games, hotkey_status, input, &mut out);
         });
     });
     let scroll = ui.scroll_offset(scroll_id());
@@ -339,6 +366,7 @@ fn sidebar(ui: &mut Ui, view: &mut SettingsView, side: Rect) -> bool {
         let items = [
             item("Overlay"),
             item("Appearance"),
+            item("General"),
             item("Hotkeys"),
             item("Updates"),
             item("Game names"),
@@ -400,7 +428,7 @@ fn content(
     settings: &Settings,
     games: &[GameRow],
     hotkey_status: Option<&str>,
-    updates: UpdatesInput,
+    input: PageInput,
     out: &mut Vec<UiAction>,
 ) -> f32 {
     let top = ui.available();
@@ -415,12 +443,14 @@ fn content(
         ui.space(SCROLL_PAD_TOP);
         let first = heading(ui, "OVERLAY", 2.0);
         overlay::section(ui, &settings.overlay, out);
-        view.headings[1] = heading(ui, "APPEARANCE", 16.0) - first;
+        view.headings[NAV_APPEARANCE] = heading(ui, "APPEARANCE", 16.0) - first;
         appearance::section(ui, view, settings, out);
-        view.headings[2] = heading(ui, "HOTKEYS", 16.0) - first;
+        view.headings[NAV_GENERAL] = heading(ui, "GENERAL", 16.0) - first;
+        general::section(ui, view, input.startup, out);
+        view.headings[NAV_HOTKEYS] = heading(ui, "HOTKEYS", 16.0) - first;
         hotkeys::section(ui, view, settings, hotkey_status, out);
         view.headings[NAV_UPDATES] = heading(ui, "UPDATES", 16.0) - first;
-        updates::section(ui, settings, updates, out);
+        updates::section(ui, settings, input.updates, out);
         view.headings[NAV_GAMES] = heading(ui, "GAME NAMES", 16.0) - first;
         games::section(ui, view, games, out);
         restore_row(ui, view, out);

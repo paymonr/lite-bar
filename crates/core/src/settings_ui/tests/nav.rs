@@ -71,9 +71,11 @@ fn highlight_follows_the_scroll() {
     let mut p = Page::new(Rect::new(0.0, 0.0, 900.0, MIN_WINDOW_DIP.1));
     let h = p.view.headings;
     for (scroll, want) in [
-        (h[1] - 1.0, NAV_OVERLAY),
-        (h[1], NAV_APPEARANCE),
-        (h[2], NAV_HOTKEYS),
+        (h[NAV_APPEARANCE] - 1.0, NAV_OVERLAY),
+        (h[NAV_APPEARANCE], NAV_APPEARANCE),
+        (h[NAV_GENERAL] - 1.0, NAV_APPEARANCE),
+        (h[NAV_GENERAL], NAV_GENERAL),
+        (h[NAV_HOTKEYS], NAV_HOTKEYS),
         (h[NAV_UPDATES], NAV_UPDATES),
         (0.0, NAV_OVERLAY),
     ] {
@@ -143,4 +145,29 @@ fn updates_nav_scrolls_to_its_heading() {
     p.idle();
     assert_eq!(p.view.selected, NAV_UPDATES);
     assert_eq!(find_text(p.frame(), "UPDATES").unwrap().0.y, top);
+}
+
+#[test]
+fn general_nav_scrolls_to_its_heading() {
+    let mut p = Page::new(Rect::new(0.0, 0.0, 900.0, MIN_WINDOW_DIP.1));
+    let top = find_text(p.frame(), "OVERLAY").unwrap().0.y;
+    p.click_text("General");
+    p.idle();
+    assert_eq!(p.view.selected, NAV_GENERAL);
+    assert_eq!(find_text(p.frame(), "GENERAL").unwrap().0.y, top);
+}
+
+#[test]
+fn nav_order_matches_the_page() {
+    assert_eq!(
+        [
+            NAV_OVERLAY,
+            NAV_APPEARANCE,
+            NAV_GENERAL,
+            NAV_HOTKEYS,
+            NAV_UPDATES,
+            NAV_GAMES
+        ],
+        [0, 1, 2, 3, 4, 5]
+    );
 }

@@ -1113,7 +1113,6 @@ impl UiWindow {
         self.shared.close(self.hwnd);
     }
 
-    #[cfg(test)]
     pub fn hwnd(&self) -> HWND {
         self.hwnd
     }

@@ -28,6 +28,8 @@ mod settings_window;
 #[cfg(windows)]
 mod single_instance;
 #[cfg(windows)]
+mod startup;
+#[cfg(windows)]
 mod stats_files;
 #[cfg(all(windows, test))]
 mod test_util;
@@ -72,6 +74,7 @@ mod app {
     };
     use lite_bar_core::settings::{Settings, StatsLayout};
     use lite_bar_core::settings_edit::SettingsChange;
+    use lite_bar_core::startup_task::StartupState;
     use lite_bar_core::update::{
         current_version, ReleaseInfo, UpdateSchedule, UpdateState, Version,
     };
@@ -91,6 +94,7 @@ mod app {
     };
 
     mod settings;
+    mod startup;
     mod updates;
 
     use crate::elevation::{is_elevated, relaunch_as_admin};
@@ -109,6 +113,7 @@ mod app {
     use crate::single_instance::{
         acquire_single_instance, wait_for, InstanceGuard, UPDATED_POLL, UPDATED_WAIT,
     };
+    use crate::startup::{StartupResult, WM_STARTUP_RESULT};
     use crate::stats_files::{list_games, local_now, StatsWriter};
     use crate::tray::{MenuItem, Tray, TrayMenuState, WM_TRAY};
     use crate::updater::{fetch_latest, take_result, CheckResult, LATEST_URL, WM_UPDATE_RESULT};
@@ -139,6 +144,8 @@ mod app {
         static PENDING_UPDATE: RefCell<Option<CheckResult>> = const { RefCell::new(None) };
         /// A finished update download, until the app can apply it.
         static PENDING_INSTALL: RefCell<Option<InstallResult>> = const { RefCell::new(None) };
+        /// A startup-task job's result, until the app can apply it.
+        static PENDING_STARTUP: RefCell<Option<StartupResult>> = const { RefCell::new(None) };
     }
 
     /// Runs `f` on the app state, if it exists and is not already borrowed (re-entrancy).
@@ -257,6 +264,17 @@ mod app {
         installing: Option<ReleaseInfo>,
         /// The version now on disk after a swap, while this older instance still runs.
         installed_version: Option<Version>,
+        /// The startup task's state, as the Settings window shows it.
+        startup: StartupState,
+        /// The state before the change in progress (restored when UAC is declined).
+        startup_before: StartupState,
+        /// Whether this process runs as administrator.
+        elevated: bool,
+        /// Runs on a worker thread to query the task (`startup::query_now`).
+        startup_query: fn() -> StartupState,
+        /// Runs on a worker thread to change it: (on, elevated, parent window) →
+        /// `startup::change`.
+        startup_change: fn(bool, bool, usize) -> StartupResult,
     }
 
     impl App {
@@ -268,6 +286,9 @@ mod app {
                 if self.on_install_result(result) {
                     quit();
                 }
+            }
+            if let Some(result) = PENDING_STARTUP.take() {
+                self.on_startup_result(result);
             }
         }
 
@@ -802,6 +823,13 @@ mod app {
                 with_app(|_| ());
                 return LRESULT(0);
             }
+            WM_STARTUP_RESULT => {
+                // SAFETY: posted by `startup::spawn`; each message is taken once.
+                let result = unsafe { crate::startup::take_result(lparam) };
+                PENDING_STARTUP.set(Some(result));
+                with_app(|_| ());
+                return LRESULT(0);
+            }
             WM_SETTINGS_ACTIONS => {
                 // `with_app` drains the window's queue.
                 with_app(|_| ());
@@ -865,13 +893,14 @@ mod app {
 
     /// Whether the panic hook stops the ETW trace. A panic inside the settings window's frame
     /// is caught by its host (the window closes, the app carries on), and one on an update
-    /// check, download or cleanup thread (`thread` is the panicking thread's name) by that
+    /// check, download, cleanup or startup-task thread (`thread` is the panicking thread's name) by that
     /// worker, so the trace must stay.
     fn panic_stops_trace(in_ui_frame: bool, thread: Option<&str>) -> bool {
         let workers = [
             crate::updater::WORKER_THREAD,
             crate::installer::WORKER_THREAD,
             crate::installer::CLEANUP_THREAD,
+            crate::startup::WORKER_THREAD,
         ];
         !in_ui_frame && !thread.is_some_and(|t| workers.contains(&t))
     }
@@ -898,6 +927,12 @@ mod app {
         let dir = app_dir();
         log::init(&dir);
         install_panic_hook();
+
+        // The elevated helper a non-elevated Lite Bar starts for "Start with Windows": no
+        // mutex, tray, overlay or capture; it changes the task and exits.
+        if let Some(flag) = crate::startup::parse_flag(std::env::args().skip(1)) {
+            std::process::exit(crate::startup::run_mode(flag));
+        }
 
         let updated = is_updated_launch(std::env::args().skip(1));
         let acquired = if updated {
@@ -993,6 +1028,11 @@ mod app {
             relaunch,
             installing: None,
             installed_version: None,
+            startup: StartupState::Unknown,
+            startup_before: StartupState::Unknown,
+            elevated: is_elevated(),
+            startup_query: crate::startup::query_now,
+            startup_change: crate::startup::change,
         };
         app.arm_update_timer();
         app.register_hotkey();
@@ -1091,6 +1131,14 @@ mod app {
                 relaunch: |_| Err("tests never relaunch".into()),
                 installing: None,
                 installed_version: None,
+                startup: StartupState::Unknown,
+                startup_before: StartupState::Unknown,
+                elevated: true,
+                // Tests never touch the real scheduled task.
+                startup_query: || StartupState::Off,
+                startup_change: |_, _, _| {
+                    StartupResult::State(StartupState::Error("tests never change it".into()))
+                },
             };
             (app, owner)
         }
@@ -2310,6 +2358,130 @@ mod app {
                 Some("Couldn't restore Ctrl+Alt+Shift+F20 — another app took it")
             );
             hotkeys::unregister(thief.0, HotkeyId::ToggleOverlay);
+        }
+
+        /// Waits up to `timeout` for a `WM_STARTUP_RESULT` posted to `hwnd` and removes it.
+        fn wait_startup_msg(hwnd: HWND, timeout: Duration) -> Option<MSG> {
+            use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_REMOVE};
+            let end = Instant::now() + timeout;
+            let mut msg = MSG::default();
+            while Instant::now() < end {
+                let got = unsafe {
+                    PeekMessageW(
+                        &mut msg,
+                        Some(hwnd),
+                        WM_STARTUP_RESULT,
+                        WM_STARTUP_RESULT,
+                        PM_REMOVE,
+                    )
+                };
+                if got.as_bool() {
+                    return Some(msg);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None
+        }
+
+        /// Applies the next startup result posted to the app's window.
+        fn apply_startup_result(app: &mut App) {
+            let msg = wait_startup_msg(app.hwnd, Duration::from_secs(5)).expect("a result");
+            app.on_startup_result(unsafe { crate::startup::take_result(msg.lParam) });
+        }
+
+        fn shown_startup(app: &App) -> StartupState {
+            app.settings_ui.as_ref().unwrap().startup_state()
+        }
+
+        #[test]
+        fn opening_settings_queries_the_startup_task_off_the_ui_thread() {
+            let dir = TempDir::new("startup-open");
+            let (mut app, _owner) = test_app(dir.path());
+            app.startup_query = || {
+                assert_eq!(
+                    std::thread::current().name(),
+                    Some(crate::startup::WORKER_THREAD)
+                );
+                StartupState::On
+            };
+            app.open_settings_hidden();
+            assert_eq!(shown_startup(&app), StartupState::Unknown);
+            let hwnd = app.hwnd;
+            APP.with(|slot| *slot.borrow_mut() = Some(app));
+            let msg = wait_startup_msg(hwnd, Duration::from_secs(5)).unwrap();
+            unsafe { window_proc(hwnd, msg.message, msg.wParam, msg.lParam) };
+            let shown = with_app(|app| (app.startup.clone(), shown_startup(app))).unwrap();
+            assert_eq!(shown, (StartupState::On, StartupState::On));
+            APP.with(|slot| slot.borrow_mut().take());
+        }
+
+        static ELEVATED_CALLS: Mutex<Vec<(bool, bool)>> = Mutex::new(Vec::new());
+
+        #[test]
+        fn elevated_switch_changes_the_task_on_a_worker_then_shows_it() {
+            let dir = TempDir::new("startup-elevated");
+            let (mut app, _owner) = test_app(dir.path());
+            app.elevated = true;
+            app.startup_change = |on, elevated, _| {
+                ELEVATED_CALLS.lock().unwrap().push((on, elevated));
+                StartupResult::State(if on {
+                    StartupState::On
+                } else {
+                    StartupState::Off
+                })
+            };
+            app.open_settings_hidden();
+            apply_startup_result(&mut app);
+            assert_eq!(shown_startup(&app), StartupState::Off);
+
+            app.apply_ui_action(UiAction::SetStartup(true));
+            assert_eq!(app.startup, StartupState::Busy);
+            assert_eq!(shown_startup(&app), StartupState::Busy);
+            // Ignored while the first change runs.
+            app.apply_ui_action(UiAction::SetStartup(false));
+            apply_startup_result(&mut app);
+            assert_eq!(shown_startup(&app), StartupState::On);
+            assert_eq!(*ELEVATED_CALLS.lock().unwrap(), vec![(true, true)]);
+            assert!(wait_startup_msg(app.hwnd, Duration::from_millis(200)).is_none());
+        }
+
+        static UAC_CALLS: Mutex<Vec<(bool, bool)>> = Mutex::new(Vec::new());
+
+        #[test]
+        fn declining_uac_puts_the_switch_back_without_an_error() {
+            let dir = TempDir::new("startup-declined");
+            let (mut app, _owner) = test_app(dir.path());
+            app.elevated = false;
+            app.startup_query = || StartupState::On;
+            app.startup_change = |on, elevated, _| {
+                UAC_CALLS.lock().unwrap().push((on, elevated));
+                StartupResult::Declined
+            };
+            app.open_settings_hidden();
+            apply_startup_result(&mut app);
+            app.apply_ui_action(UiAction::SetStartup(false));
+            assert_eq!(app.startup, StartupState::Busy);
+            apply_startup_result(&mut app);
+            assert_eq!(app.startup, StartupState::On);
+            assert_eq!(shown_startup(&app), StartupState::On);
+            assert_eq!(*UAC_CALLS.lock().unwrap(), vec![(false, false)]);
+        }
+
+        #[test]
+        fn the_window_learns_whether_lite_bar_is_elevated() {
+            let dir = TempDir::new("startup-elevated-flag");
+            let (mut app, _owner) = test_app(dir.path());
+            app.elevated = true;
+            app.open_settings_hidden();
+            assert!(app.settings_ui.as_ref().unwrap().shows_elevated());
+        }
+
+        #[test]
+        fn startup_worker_panics_keep_the_trace() {
+            assert!(!panic_stops_trace(
+                false,
+                Some(crate::startup::WORKER_THREAD)
+            ));
         }
     }
 }

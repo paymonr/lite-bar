@@ -69,7 +69,9 @@ impl App {
             Ok(ui) => {
                 ui.set_save_error(self.save_error);
                 ui.set_update(&self.update);
+                ui.set_startup(&self.startup, self.elevated);
                 self.settings_ui = Some(ui);
+                self.refresh_startup();
             }
             Err(e) => log::error(&format!("could not open the settings window: {e}")),
         }
@@ -145,6 +147,7 @@ impl App {
                     quit();
                 }
             }
+            UiAction::SetStartup(on) => self.set_startup(on),
             UiAction::StartHotkeyCapture => self.start_hotkey_capture(),
             UiAction::CancelHotkeyCapture => {
                 if self.end_hotkey_capture() {
