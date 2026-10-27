@@ -132,6 +132,15 @@ fn as_ui_frame<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
+/// The window size to open at: `wanted`, shrunk to fit `work`, but never below `min`.
+fn opening_size(wanted: (i32, i32), min: (i32, i32), work: RECT) -> (i32, i32) {
+    let fit = |want: i32, room: i32, min: i32| want.min(room).max(min);
+    (
+        fit(wanted.0, work.right - work.left, min.0),
+        fit(wanted.1, work.bottom - work.top, min.1),
+    )
+}
+
 /// Top-left corner that centres a `size` window in `work`, kept inside it when too big.
 fn centered_in(work: RECT, size: (i32, i32)) -> (i32, i32) {
     let x = work.left + ((work.right - work.left - size.0) / 2).max(0);
@@ -949,6 +958,7 @@ impl UiWindow {
         let title = HSTRING::from(title);
         let (work, monitor_dpi) = cursor_monitor();
         let (create_w, create_h) = window_size_for_client(size_dip, monitor_dpi);
+        let min_client = (min_dip.0.min(size_dip.0), min_dip.1.min(size_dip.1));
         // SAFETY: plain FFI; the window is destroyed by PendingWindow on every error path.
         unsafe {
             // Created on the cursor's monitor so it gets that monitor's DPI.
@@ -969,11 +979,13 @@ impl UiWindow {
             let pending = PendingWindow(hwnd);
             let dpi = GetDpiForWindow(hwnd);
             // Usually the same DPI; only recomputed when the window landed elsewhere.
-            let (w, h) = if dpi == monitor_dpi {
+            let wanted = if dpi == monitor_dpi {
                 (create_w, create_h)
             } else {
                 window_size_for_client(size_dip, dpi)
             };
+            let min = window_size_for_client(min_client, dpi);
+            let (w, h) = opening_size(wanted, min, work);
             let (x, y) = centered_in(work, (w, h));
             SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE)?;
             let dark = BOOL(1);
@@ -1015,7 +1027,7 @@ impl UiWindow {
                 failed: Cell::new(false),
                 close_pending: Cell::new(false),
                 destroyed: Cell::new(false),
-                min_client_dip: (min_dip.0.min(size_dip.0), min_dip.1.min(size_dip.1)),
+                min_client_dip: min_client,
             });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::into_raw(shared.clone()) as isize);
             std::mem::forget(pending);
@@ -1154,6 +1166,53 @@ mod tests {
         assert_eq!(centered_in(work, (900, 660)), (1920 + 510, 190));
         // Bigger than the work area: pinned to its top-left corner.
         assert_eq!(centered_in(work, (2000, 1200)), (1920, 0));
+    }
+
+    #[test]
+    fn opening_size_fits_the_work_area_but_not_below_the_minimum() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1280,
+            bottom: 600,
+        };
+        assert_eq!(opening_size((900, 660), (720, 520), work), (900, 600));
+        assert_eq!(
+            opening_size(
+                (900, 660),
+                (720, 520),
+                RECT {
+                    right: 800,
+                    bottom: 500,
+                    ..work
+                }
+            ),
+            (800, 520)
+        );
+        assert_eq!(
+            opening_size(
+                (900, 660),
+                (720, 520),
+                RECT {
+                    right: 640,
+                    bottom: 480,
+                    ..work
+                }
+            ),
+            (720, 520)
+        );
+        assert_eq!(
+            opening_size(
+                (900, 660),
+                (720, 520),
+                RECT {
+                    right: 1920,
+                    bottom: 1040,
+                    ..work
+                }
+            ),
+            (900, 660)
+        );
     }
 
     #[test]
