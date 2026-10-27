@@ -40,8 +40,10 @@ use crate::log;
 
 /// 1 DIP dashes: 4 on, 3 off, in stroke widths.
 const DASHES: [f32; 2] = [4.0, 3.0];
-/// Most text measurements kept; the cache is emptied when it would grow past this.
-const MEASURE_CACHE_CAP: usize = 64;
+/// Text measurements the overlay keeps (it shows a handful of strings).
+pub const OVERLAY_MEASURE_CACHE: usize = 64;
+/// Text measurements the settings window keeps: more than one frame's distinct strings.
+pub const WINDOW_MEASURE_CACHE: usize = 1024;
 
 /// Premultiplied RGBA to premultiplied BGRA, for `DXGI_FORMAT_B8G8R8A8_UNORM`.
 fn rgba_to_bgra(rgba: &[u8]) -> Vec<u8> {
@@ -133,10 +135,13 @@ struct Fonts {
     formats: RefCell<HashMap<(u32, bool, bool), IDWriteTextFormat>>,
     /// A measuring failure has been logged (logged once, not every frame).
     measure_failed: Cell<bool>,
-    /// `measure` results in DIPs, at most `MEASURE_CACHE_CAP` entries.
-    measures: RefCell<HashMap<(String, StyleKey), (f32, f32)>>,
-    /// `baseline` results in DIPs, at most `MEASURE_CACHE_CAP` entries.
-    baselines: RefCell<HashMap<StyleKey, f32>>,
+    /// `measure` results in DIPs.
+    measures: RefCell<Lru<(String, StyleKey), (f32, f32)>>,
+    /// `baseline` results in DIPs.
+    baselines: RefCell<Lru<StyleKey, f32>>,
+    /// Text layouts created, for tests that check the cache.
+    #[cfg(test)]
+    layouts_made: Cell<usize>,
 }
 
 /// A text style at one scale: (size bits, bold, mono, scale bits).
@@ -151,25 +156,70 @@ fn style_key(style: TextStyle, scale: f32) -> StyleKey {
     )
 }
 
-/// Inserts into a cache that is emptied whenever it is full, so it never exceeds the cap.
-fn insert_bounded<K: std::hash::Hash + Eq, V>(cache: &RefCell<HashMap<K, V>>, key: K, value: V) {
-    let mut cache = cache.borrow_mut();
-    if cache.len() >= MEASURE_CACHE_CAP {
-        cache.clear();
+/// A map of at most `cap` entries that drops the least recently used one when full.
+struct Lru<K, V> {
+    cap: usize,
+    /// Value and the tick it was last used at.
+    map: HashMap<K, (V, u64)>,
+    tick: u64,
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V: Copy> Lru<K, V> {
+    fn new(cap: usize) -> Lru<K, V> {
+        Lru {
+            cap: cap.max(1),
+            map: HashMap::new(),
+            tick: 0,
+        }
     }
-    cache.insert(key, value);
+
+    fn get<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(key).map(|(v, used)| {
+            *used = tick;
+            *v
+        })
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if self.map.len() >= self.cap && !self.map.contains_key(&key) {
+            // A linear scan: misses are rare once the cache holds a frame's strings.
+            let oldest = self
+                .map
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                self.map.remove(&oldest);
+            }
+        }
+        self.tick += 1;
+        self.map.insert(key, (value, self.tick));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 impl Fonts {
-    fn new() -> windows::core::Result<Fonts> {
+    fn new(measure_cap: usize) -> windows::core::Result<Fonts> {
         // SAFETY: plain COM call.
         let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }?;
         Ok(Fonts {
             dwrite,
             formats: RefCell::new(HashMap::new()),
             measure_failed: Cell::new(false),
-            measures: RefCell::new(HashMap::new()),
-            baselines: RefCell::new(HashMap::new()),
+            measures: RefCell::new(Lru::new(measure_cap)),
+            baselines: RefCell::new(Lru::new(measure_cap)),
+            #[cfg(test)]
+            layouts_made: Cell::new(0),
         })
     }
 
@@ -216,6 +266,8 @@ impl Fonts {
         scale: f32,
     ) -> windows::core::Result<IDWriteTextLayout> {
         let format = self.format(style, scale)?;
+        #[cfg(test)]
+        self.layouts_made.set(self.layouts_made.get() + 1);
         let wide: Vec<u16> = text.encode_utf16().collect();
         // SAFETY: plain COM call with valid arguments.
         unsafe { self.dwrite.CreateTextLayout(&wide, &format, 1.0e6, 1.0e6) }
@@ -229,7 +281,7 @@ impl Fonts {
         scale: f32,
     ) -> windows::core::Result<(f32, f32)> {
         let key = (text.to_owned(), style_key(style, scale));
-        if let Some(&size) = self.measures.borrow().get(&key) {
+        if let Some(size) = self.measures.borrow_mut().get(&key) {
             return Ok(size);
         }
         let layout = self.layout(text, style, scale)?;
@@ -237,14 +289,14 @@ impl Fonts {
         // SAFETY: valid out-parameter.
         unsafe { layout.GetMetrics(&mut m) }?;
         let size = (m.widthIncludingTrailingWhitespace / scale, m.height / scale);
-        insert_bounded(&self.measures, key, size);
+        self.measures.borrow_mut().insert(key, size);
         Ok(size)
     }
 
     /// Top of the line to the baseline in DIPs, from the font's line metrics at `scale`.
     fn baseline(&self, style: TextStyle, scale: f32) -> windows::core::Result<f32> {
         let key = style_key(style, scale);
-        if let Some(&b) = self.baselines.borrow().get(&key) {
+        if let Some(b) = self.baselines.borrow_mut().get(&key) {
             return Ok(b);
         }
         let layout = self.layout("0", style, scale)?;
@@ -253,7 +305,7 @@ impl Fonts {
         // SAFETY: valid out-parameters; `lines` has room for the single line.
         unsafe { layout.GetLineMetrics(Some(&mut lines), &mut count) }?;
         let b = lines[0].baseline / scale;
-        insert_bounded(&self.baselines, key, b);
+        self.baselines.borrow_mut().insert(key, b);
         Ok(b)
     }
 }
@@ -277,9 +329,11 @@ pub struct Painter {
 }
 
 impl Painter {
-    pub fn new() -> windows::core::Result<Painter> {
+    /// `measure_cap`: how many text measurements to keep (`OVERLAY_MEASURE_CACHE`,
+    /// `WINDOW_MEASURE_CACHE`).
+    pub fn new(measure_cap: usize) -> windows::core::Result<Painter> {
         Ok(Painter {
-            fonts: Fonts::new()?,
+            fonts: Fonts::new(measure_cap)?,
             images: HashMap::new(),
             dashed: None,
             target: None,
@@ -534,6 +588,11 @@ impl Painter {
     #[cfg(test)]
     fn cached_measures(&self) -> usize {
         self.fonts.measures.borrow().len()
+    }
+
+    #[cfg(test)]
+    fn layouts_made(&self) -> usize {
+        self.fonts.layouts_made.get()
     }
 }
 
@@ -839,7 +898,7 @@ mod win_tests {
 
     #[test]
     fn font_pixel_sizes_are_rounded() {
-        let p = Painter::new().unwrap();
+        let p = Painter::new(OVERLAY_MEASURE_CACHE).unwrap();
         let style = TextStyle {
             size: 18.0,
             bold: true,
@@ -858,7 +917,7 @@ mod win_tests {
 
     #[test]
     fn measurements_are_cached_and_the_cache_stays_bounded() {
-        let p = Painter::new().unwrap();
+        let p = Painter::new(OVERLAY_MEASURE_CACHE).unwrap();
         let m = p.measurer(1.0);
         let first = m.measure("FPS", TextStyle::BODY);
         assert_eq!(p.cached_measures(), 1);
@@ -870,14 +929,45 @@ mod win_tests {
         assert_eq!(p.cached_measures(), 3);
         for i in 0..500 {
             m.measure(&i.to_string(), TextStyle::BODY);
-            assert!(p.cached_measures() <= MEASURE_CACHE_CAP);
+            assert!(p.cached_measures() <= OVERLAY_MEASURE_CACHE);
         }
         assert_eq!(m.measure("FPS", TextStyle::BODY), first);
     }
 
     #[test]
+    fn a_frame_of_100_distinct_strings_does_not_thrash() {
+        let p = Painter::new(WINDOW_MEASURE_CACHE).unwrap();
+        let m = p.measurer(1.0);
+        let texts: Vec<String> = (0..100).map(|i| format!("label {i}")).collect();
+        for _frame in 0..3 {
+            for t in &texts {
+                m.measure(t, TextStyle::BODY);
+            }
+        }
+        assert_eq!(p.layouts_made(), 100, "every string laid out once");
+    }
+
+    #[test]
+    fn measure_cache_evicts_the_least_recently_used() {
+        let p = Painter::new(3).unwrap();
+        let m = p.measurer(1.0);
+        for t in ["a", "b", "c"] {
+            m.measure(t, TextStyle::BODY);
+        }
+        m.measure("a", TextStyle::BODY); // a is now the most recent
+        m.measure("d", TextStyle::BODY); // evicts b
+        assert_eq!(p.cached_measures(), 3);
+        let before = p.layouts_made();
+        m.measure("a", TextStyle::BODY);
+        m.measure("c", TextStyle::BODY);
+        assert_eq!(p.layouts_made(), before, "a and c stayed");
+        m.measure("b", TextStyle::BODY);
+        assert_eq!(p.layouts_made(), before + 1, "b was evicted");
+    }
+
+    #[test]
     fn measure_matches_directwrite() {
-        let p = Painter::new().unwrap();
+        let p = Painter::new(OVERLAY_MEASURE_CACHE).unwrap();
         let (w, h) = p.measurer(1.0).measure("Hello", TextStyle::BODY);
         let dwrite: IDWriteFactory =
             unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.unwrap();
@@ -922,7 +1012,7 @@ mod win_tests {
 
     #[test]
     fn baseline_matches_directwrite() {
-        let p = Painter::new().unwrap();
+        let p = Painter::new(OVERLAY_MEASURE_CACHE).unwrap();
         let style = TextStyle {
             size: 18.0,
             bold: true,
@@ -959,7 +1049,7 @@ mod win_tests {
 
     #[test]
     fn painter_fills_and_clips() {
-        let mut p = Painter::new().unwrap();
+        let mut p = Painter::new(OVERLAY_MEASURE_CACHE).unwrap();
         let mut c = new_canvas();
         let cmds = [
             fill(Rect::new(0.0, 0.0, 20.0, 20.0), RED),
@@ -977,7 +1067,7 @@ mod win_tests {
 
     #[test]
     fn painter_scales_dips_to_pixels() {
-        let mut p = Painter::new().unwrap();
+        let mut p = Painter::new(OVERLAY_MEASURE_CACHE).unwrap();
         let mut c = new_canvas();
         let cmds = [
             fill(Rect::new(0.0, 0.0, 20.0, 20.0), RED),
@@ -990,7 +1080,7 @@ mod win_tests {
 
     #[test]
     fn image_bitmaps_are_cached_while_rc_alive() {
-        let mut p = Painter::new().unwrap();
+        let mut p = Painter::new(OVERLAY_MEASURE_CACHE).unwrap();
         let mut c = new_canvas();
         // 2x2 opaque red, RGBA.
         let rgba = Rc::new([255u8, 0, 0, 255].repeat(4));
@@ -1012,7 +1102,7 @@ mod win_tests {
 
     #[test]
     fn painter_handles_every_cmd() {
-        let mut p = Painter::new().unwrap();
+        let mut p = Painter::new(OVERLAY_MEASURE_CACHE).unwrap();
         let mut c = new_canvas();
         let r = Rect::new(2.0, 2.0, 16.0, 16.0);
         let cmds = [
@@ -1054,7 +1144,7 @@ mod win_tests {
 
     #[test]
     fn axis_aligned_lines_are_pixel_snapped() {
-        let mut p = Painter::new().unwrap();
+        let mut p = Painter::new(OVERLAY_MEASURE_CACHE).unwrap();
         let mut c = new_canvas();
         let line = |from: Pt, to: Pt| Cmd::Line {
             from,
@@ -1080,7 +1170,7 @@ mod win_tests {
 
     #[test]
     fn stroke_stays_inside_its_rect() {
-        let mut p = Painter::new().unwrap();
+        let mut p = Painter::new(OVERLAY_MEASURE_CACHE).unwrap();
         let mut c = new_canvas();
         let cmds = [
             fill(Rect::new(0.0, 0.0, 20.0, 20.0), RED),

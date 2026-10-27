@@ -50,7 +50,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::log;
-use crate::ui_paint::{d2d_color, Canvas, Painter};
+use crate::ui_paint::{d2d_color, Canvas, Painter, WINDOW_MEASURE_CACHE};
 
 /// DIP to pixel scale for a monitor DPI.
 fn scale_for_dpi(dpi: u32) -> f32 {
@@ -371,6 +371,11 @@ struct Host {
     blink_on: bool,
     /// Whether `TrackMouseEvent` is armed for the next `WM_MOUSELEAVE`.
     tracking: bool,
+    /// The last frame drew something else than the one before (commands or cursor).
+    changed: bool,
+    /// `InvalidateRect` calls after input and timer frames, for tests.
+    #[cfg(test)]
+    invalidations: u32,
 }
 
 impl Host {
@@ -402,9 +407,23 @@ impl Host {
                 // Show the new cursor without waiting for the next WM_SETCURSOR.
                 SetCursor(Some(cursor_handle(self.cursor)));
             }
-            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+        if !ok || self.changed {
+            self.invalidate();
         }
         ok
+    }
+
+    /// Repaints the last frame.
+    fn invalidate(&mut self) {
+        // SAFETY: plain FFI on our own window.
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+        #[cfg(test)]
+        {
+            self.invalidations += 1;
+        }
     }
 
     /// Runs `UiApp::frame` and keeps its commands. Returns false if the frame panicked.
@@ -433,6 +452,8 @@ impl Host {
             log::error("settings window: a frame panicked; closing the window");
             return false;
         };
+        // Most pointer moves change nothing; painting is the expensive part.
+        self.changed = frame.cmds != self.cmds || frame.cursor != self.cursor;
         self.cmds = frame.cmds;
         self.cursor = frame.cursor;
         self.capturing_keys = frame.capturing_keys;
@@ -809,8 +830,8 @@ fn handle(shared: &Shared, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let _ = unsafe { KillTimer(Some(hwnd), REDRAW_TIMER) };
                 }
                 let ok = h.idle_frame();
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
+                if !ok || h.changed {
+                    h.invalidate();
                 }
                 ok
             });
@@ -973,7 +994,7 @@ impl UiWindow {
                 input: InputState::default(),
                 clipboard: WinClipboard { hwnd },
                 canvas: Canvas::opaque(&d2d)?,
-                painter: Painter::new()?,
+                painter: Painter::new(WINDOW_MEASURE_CACHE)?,
                 _d2d: d2d,
                 scale: scale_for_dpi(dpi),
                 opened: Instant::now(),
@@ -983,6 +1004,9 @@ impl UiWindow {
                 keys: KeysDown::default(),
                 blink_on: false,
                 tracking: false,
+                changed: true,
+                #[cfg(test)]
+                invalidations: 0,
             };
             let shared = Rc::new(Shared {
                 host: RefCell::new(Some(host)),
@@ -1071,6 +1095,11 @@ impl UiWindow {
     #[cfg(test)]
     pub fn scale(&self) -> f32 {
         self.shared.with_host(|h| h.scale).unwrap_or(0.0)
+    }
+
+    #[cfg(test)]
+    fn invalidations(&self) -> u32 {
+        self.shared.with_host(|h| h.invalidations).unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -1370,6 +1399,26 @@ mod win_tests {
 
     fn at(x: i32, y: i32) -> isize {
         ((y as isize) << 16) | (x as isize & 0xFFFF)
+    }
+
+    #[test]
+    fn mouse_move_over_empty_space_does_not_repaint() {
+        let (w, frames, _) = open_test(RED);
+        send(&w, WM_PAINT, 0, 0);
+        let s = w.scale();
+        let px = |x: f32, y: f32| at((x * s) as i32, (y * s) as i32);
+        send(&w, WM_MOUSEMOVE, 0, px(250.0, 150.0));
+        let base = w.invalidations();
+        let ran = frames.get();
+        send(&w, WM_MOUSEMOVE, 0, px(260.0, 160.0));
+        send(&w, WM_MOUSEMOVE, 0, px(200.0, 120.0));
+        assert!(frames.get() > ran, "frames still run on every move");
+        assert_eq!(w.invalidations(), base, "nothing changed on screen");
+        // Hovering the button changes its look and is painted.
+        send(&w, WM_MOUSEMOVE, 0, px(10.0, 30.0));
+        send(&w, WM_MOUSEMOVE, 0, px(11.0, 30.0));
+        assert!(w.invalidations() > base);
+        w.close();
     }
 
     #[test]

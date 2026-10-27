@@ -24,7 +24,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
-use crate::ui_paint::{Canvas, Painter};
+use crate::ui_paint::{Canvas, Painter, OVERLAY_MEASURE_CACHE};
 
 const CLASS_NAME: PCWSTR = w!("LiteBarOverlay");
 /// Placeholder shown until the first `update`.
@@ -124,7 +124,7 @@ impl Overlay {
 
             Ok(Overlay {
                 window,
-                painter: Painter::new()?,
+                painter: Painter::new(OVERLAY_MEASURE_CACHE)?,
                 canvas: Canvas::transparent(&d2d)?,
                 settings: settings.clone(),
                 text: INITIAL_TEXT.to_owned(),
