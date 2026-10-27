@@ -72,7 +72,9 @@ mod app {
     };
     use lite_bar_core::settings::{Settings, StatsLayout};
     use lite_bar_core::settings_edit::SettingsChange;
-    use lite_bar_core::update::{current_version, ReleaseInfo, UpdateSchedule, UpdateState};
+    use lite_bar_core::update::{
+        current_version, ReleaseInfo, UpdateSchedule, UpdateState, Version,
+    };
     use windows::core::{w, HSTRING};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -97,8 +99,8 @@ mod app {
     use crate::game_lookup::resolve_name;
     use crate::hotkeys::{self, HotkeyId, Registration};
     use crate::installer::{
-        download_release, is_updated_launch, relaunch, spawn_cleanup, InstallResult,
-        WM_INSTALL_RESULT,
+        download_release, is_updated_launch, relaunch, shell_execute_result, spawn_cleanup,
+        InstallResult, WM_INSTALL_RESULT,
     };
     use crate::overlay::Overlay;
     use crate::paths::{app_dir, load_or_create_settings};
@@ -253,6 +255,8 @@ mod app {
         relaunch: fn(&Path) -> Result<(), String>,
         /// The release Update now last started on (its page stays reachable on failure).
         installing: Option<ReleaseInfo>,
+        /// The version now on disk after a swap, while this older instance still runs.
+        installed_version: Option<Version>,
     }
 
     impl App {
@@ -627,11 +631,8 @@ mod app {
         let path = HSTRING::from(target.as_ref());
         // SAFETY: valid NUL-terminated strings for the duration of the call.
         let result = unsafe { ShellExecuteW(None, w!("open"), &path, None, None, SW_SHOWNORMAL) };
-        if result.0 as usize <= 32 {
-            log::error(&format!(
-                "could not open {what}: {}",
-                windows::core::Error::from_thread()
-            ));
+        if let Err(e) = shell_execute_result(result.0 as usize) {
+            log::error(&format!("could not open {what}: {e}"));
         }
     }
 
@@ -922,9 +923,10 @@ mod app {
 
         if updated {
             log::info(&format!("updated to v{}", current_version()));
-            if let Some(exe) = own_exe() {
-                spawn_cleanup(exe);
-            }
+        }
+        // Also after a run that crashed or was killed between the swap and the cleanup.
+        if let Some(exe) = own_exe() {
+            spawn_cleanup(exe);
         }
 
         let (settings, warnings) = load_or_create_settings(&dir);
@@ -990,6 +992,7 @@ mod app {
             download: download_release,
             relaunch,
             installing: None,
+            installed_version: None,
         };
         app.arm_update_timer();
         app.register_hotkey();
@@ -1080,9 +1083,14 @@ mod app {
                 fetch: fetch_latest,
                 // Tests never touch the real exe, GitHub or the shell.
                 exe_path: None,
-                download: |_, _| Err("tests never download".into()),
+                download: |_, _| {
+                    Err(crate::installer::InstallError::Io(
+                        "tests never download".into(),
+                    ))
+                },
                 relaunch: |_| Err("tests never relaunch".into()),
                 installing: None,
+                installed_version: None,
             };
             (app, owner)
         }
@@ -2026,7 +2034,7 @@ mod app {
 
         /// The real download pipeline, minus the GitHub-only URL check (the stub is local).
         fn download_from_stub(r: &ReleaseInfo, exe: &Path) -> InstallResult {
-            crate::installer::fetch_and_stage(r, exe, |_| true).map_err(|e| e.to_string())
+            crate::installer::fetch_and_stage(r, exe, |_| true)
         }
 
         #[test]
@@ -2062,7 +2070,7 @@ mod app {
                 "one download"
             );
             assert!(!app.on_install_result(result), "keeps running");
-            let UpdateState::Failed(why) = &app.update else {
+            let UpdateState::Failed { why, .. } = &app.update else {
                 panic!("{:?}", app.update);
             };
             assert!(why.contains("checksum"), "{why}");
@@ -2071,6 +2079,68 @@ mod app {
             assert!(!crate::installer::new_path(&exe).exists());
             // The release page stays reachable for a manual download.
             assert_eq!(app.release_page(), Some(r.page_url.as_str()));
+
+            // A corrupted download may be a one-off: Try again downloads the same release.
+            assert!(matches!(
+                app.update,
+                UpdateState::Failed { retry: true, .. }
+            ));
+            app.install_update();
+            assert_eq!(app.update, UpdateState::Downloading(r.clone()));
+            let result = wait_install_result(app.hwnd, Duration::from_secs(10)).expect("result");
+            app.on_install_result(result);
+            assert!(matches!(
+                app.update,
+                UpdateState::Failed { retry: true, .. }
+            ));
+        }
+
+        #[test]
+        fn an_unwritable_folder_offers_no_retry() {
+            let dir = TempDir::new("install-app-unwritable");
+            let (mut app, _owner) = test_app(dir.path());
+            with_temp_exe(&mut app, dir.path());
+            app.update = UpdateState::Downloading(release("99.0.0"));
+            app.installing = Some(release("99.0.0"));
+            app.on_install_result(Err(crate::installer::InstallError::Unwritable));
+            let failed = UpdateState::Failed {
+                why: crate::installer::UNWRITABLE.into(),
+                retry: false,
+            };
+            assert_eq!(app.update, failed);
+            app.download = |_, _| panic!("must not download");
+            app.install_update();
+            assert_eq!(app.update, failed);
+            assert!(app.release_page().is_some());
+        }
+
+        #[test]
+        fn without_its_exe_path_the_release_page_still_opens() {
+            let dir = TempDir::new("install-app-no-exe");
+            let (mut app, _owner) = test_app(dir.path());
+            app.download = |_, _| panic!("must not download");
+            app.update = UpdateState::Available(release("99.0.0"));
+            app.install_update();
+            assert!(
+                matches!(app.update, UpdateState::Failed { retry: false, .. }),
+                "{:?}",
+                app.update
+            );
+            assert_eq!(
+                app.release_page(),
+                Some(release("99.0.0").page_url.as_str())
+            );
+        }
+
+        #[test]
+        fn an_installed_version_is_not_offered_again() {
+            let dir = TempDir::new("install-app-installed");
+            let (mut app, _owner) = test_app(dir.path());
+            app.installed_version = Some("99.0.0".parse().unwrap());
+            app.on_update_result(Ok(release("99.0.0")));
+            assert_eq!(app.update, UpdateState::UpToDate);
+            app.on_update_result(Ok(release("99.0.1")));
+            assert_eq!(app.update, UpdateState::Available(release("99.0.1")));
         }
 
         #[test]
@@ -2138,11 +2208,34 @@ mod app {
             let (mut app, _owner, exe, new) = staged_app(dir.path());
             app.relaunch = |_| Err("no shell".into());
             assert!(!app.on_install_result(Ok(new)), "keeps running");
-            assert_eq!(
-                app.update,
-                UpdateState::Failed(crate::installer::RESTART_TO_FINISH.into())
-            );
+            assert_eq!(app.update, UpdateState::RestartRequired);
             assert_eq!(std::fs::read(&exe).unwrap(), NEW_EXE, "installed");
+            assert_eq!(app.installed_version, Some("99.0.0".parse().unwrap()));
+
+            // The installed release is never offered again, by a check or Check now.
+            app.on_update_result(Ok(release("99.0.0")));
+            assert_eq!(app.update, UpdateState::RestartRequired);
+            app.check_for_updates_now();
+            assert_eq!(app.update, UpdateState::RestartRequired);
+            assert_eq!(app.menu_state().update_available, None);
+
+            // Restart now tries again: failing, it still waits for a restart...
+            assert!(!app.restart_to_update());
+            assert_eq!(app.update, UpdateState::RestartRequired);
+            // ...and once the new exe starts, this one quits.
+            app.relaunch = fake_relaunch;
+            assert!(app.restart_to_update());
+            assert_eq!(RELAUNCHED.with(|r| r.borrow().clone()), vec![exe]);
+        }
+
+        #[test]
+        fn restart_now_does_nothing_without_an_installed_update() {
+            let dir = TempDir::new("install-app-restart-idle");
+            let (mut app, _owner) = test_app(dir.path());
+            with_temp_exe(&mut app, dir.path());
+            app.relaunch = |_| panic!("must not relaunch");
+            assert!(!app.restart_to_update());
+            assert_eq!(app.update, UpdateState::Idle);
         }
 
         #[test]
@@ -2153,7 +2246,7 @@ mod app {
             std::fs::remove_file(&new).unwrap(); // the second rename has nothing to move
             assert!(!app.on_install_result(Ok(new)));
             assert!(
-                matches!(app.update, UpdateState::Failed(_)),
+                matches!(app.update, UpdateState::Failed { .. }),
                 "{:?}",
                 app.update
             );

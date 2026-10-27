@@ -10,7 +10,7 @@ use lite_bar_core::settings_ui::{GameRow, UiAction};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
-use super::{shell_open, App, SAVE_TIMER_ID, SETTINGS_FILE};
+use super::{quit, shell_open, App, SAVE_TIMER_ID, SETTINGS_FILE};
 use crate::hotkeys::{self, HotkeyId, Registration};
 use crate::log;
 use crate::settings_window::{switch_hotkey, Drained, HotkeyDecision, SettingsUi, SAVE_DELAY};
@@ -140,6 +140,11 @@ impl App {
             UiAction::CheckForUpdates => self.check_for_updates_now(),
             UiAction::InstallUpdate => self.install_update(),
             UiAction::OpenReleasePage => self.open_release_page(),
+            UiAction::RestartToUpdate => {
+                if self.restart_to_update() {
+                    quit();
+                }
+            }
             UiAction::StartHotkeyCapture => self.start_hotkey_capture(),
             UiAction::CancelHotkeyCapture => {
                 if self.end_hotkey_capture() {

@@ -138,7 +138,14 @@ pub enum UpdateState {
     UpToDate,
     Available(ReleaseInfo),
     Downloading(ReleaseInfo),
-    Failed(String),
+    /// Update now failed; `retry` when trying again may work (a network error, a cut-off
+    /// or corrupted download), not when it can't (an unwritable folder).
+    Failed {
+        why: String,
+        retry: bool,
+    },
+    /// The new exe is in place but this (old) instance is still running.
+    RestartRequired,
     CheckFailed,
 }
 
@@ -150,7 +157,8 @@ impl UpdateState {
             UpdateState::UpToDate => format!("You're up to date (v{current})"),
             UpdateState::Available(r) => format!("Update available: v{}", r.version),
             UpdateState::Downloading(r) => format!("Downloading v{}…", r.version),
-            UpdateState::Failed(why) => format!("Update failed: {why}"),
+            UpdateState::Failed { why, .. } => format!("Update failed: {why}"),
+            UpdateState::RestartRequired => "Update installed — restart Lite Bar to finish".into(),
             UpdateState::CheckFailed => "Couldn't check for updates".into(),
         }
     }
@@ -493,8 +501,15 @@ mod tests {
             "Downloading v0.5.0…"
         );
         assert_eq!(
-            t(UpdateState::Failed("checksum mismatch".into())),
+            t(UpdateState::Failed {
+                why: "checksum mismatch".into(),
+                retry: true
+            }),
             "Update failed: checksum mismatch"
+        );
+        assert_eq!(
+            t(UpdateState::RestartRequired),
+            "Update installed — restart Lite Bar to finish"
         );
         assert_eq!(t(UpdateState::CheckFailed), "Couldn't check for updates");
         assert_eq!(t(UpdateState::Checking), "Checking…");

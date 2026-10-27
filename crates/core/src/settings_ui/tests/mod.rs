@@ -364,7 +364,15 @@ fn all_update_states() -> Vec<UpdateState> {
         UpdateState::UpToDate,
         UpdateState::Available(release()),
         UpdateState::Downloading(release()),
-        UpdateState::Failed("Can't update in this folder — download it from GitHub".into()),
+        UpdateState::Failed {
+            why: "Can't update in this folder — download it from GitHub".into(),
+            retry: false,
+        },
+        UpdateState::Failed {
+            why: "download failed (download took too long)".into(),
+            retry: true,
+        },
+        UpdateState::RestartRequired,
         UpdateState::CheckFailed,
     ]
 }

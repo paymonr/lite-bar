@@ -45,8 +45,6 @@ pub const UPDATED_FLAG: &str = "--updated";
 
 /// Shown when the exe's folder can't be written (e.g. Program Files without elevation).
 pub const UNWRITABLE: &str = "Can't update in this folder — download it from GitHub";
-/// Shown when the new exe is in place but could not be started.
-pub const RESTART_TO_FINISH: &str = "Update installed — restart Lite Bar to finish";
 
 /// What a download that panicked reports.
 const PANICKED: &str = "update download failed unexpectedly";
@@ -59,8 +57,8 @@ const TRUSTED_HOSTS: [&str; 4] = [
     "github-releases.githubusercontent.com",
 ];
 
-/// `<exe>.new` (staged, verified) or the failure shown in Settings.
-pub type InstallResult = Result<PathBuf, String>;
+/// `<exe>.new` (staged, verified) or why not.
+pub type InstallResult = Result<PathBuf, InstallError>;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum InstallError {
@@ -80,6 +78,8 @@ pub enum InstallError {
         old: PathBuf,
         why: String,
     },
+    /// The download thread panicked.
+    Unexpected(String),
 }
 
 impl fmt::Display for InstallError {
@@ -94,6 +94,7 @@ impl fmt::Display for InstallError {
             InstallError::Unwritable => f.write_str(UNWRITABLE),
             InstallError::Io(e) => write!(f, "couldn't write the update ({e})"),
             InstallError::RolledBack(e) => write!(f, "couldn't replace Lite Bar ({e})"),
+            InstallError::Unexpected(e) => f.write_str(e),
             InstallError::RollbackFailed { old, .. } => write!(
                 f,
                 "Lite Bar was left at {} — rename it back to {}",
@@ -107,8 +108,19 @@ impl fmt::Display for InstallError {
 }
 
 impl InstallError {
-    /// An error writing into the exe's folder: access denied means the folder is not ours
-    /// to write.
+    /// Whether trying again may work (Settings then offers Try again).
+    pub fn retryable(&self) -> bool {
+        !matches!(
+            self,
+            InstallError::Unwritable
+                | InstallError::Untrusted(_)
+                | InstallError::RollbackFailed { .. }
+        )
+    }
+
+    /// An error writing the new exe into the exe's folder: access denied means the folder
+    /// is not ours to write. (Only for that write: a refused rename or delete is about one
+    /// file, which may just be in use.)
     fn staging(e: io::Error) -> InstallError {
         if e.kind() == io::ErrorKind::PermissionDenied {
             InstallError::Unwritable
@@ -176,7 +188,7 @@ pub fn fetch_and_stage(
 
 /// The production download: GitHub URLs only.
 pub fn download_release(release: &ReleaseInfo, exe: &Path) -> InstallResult {
-    fetch_and_stage(release, exe, is_trusted_download_url).map_err(|e| e.to_string())
+    fetch_and_stage(release, exe, is_trusted_download_url)
 }
 
 /// Checks `bytes` against `expected` and writes them to `<exe>.new` (fsynced), replacing a
@@ -191,7 +203,12 @@ pub fn stage_update(
     }
     let new = new_path(exe);
     match std::fs::remove_file(&new) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(InstallError::staging(e)),
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            return Err(InstallError::Io(format!(
+                "can't remove the old {}: {e}",
+                new.display()
+            )))
+        }
         _ => {}
     }
     write_atomic(&new, bytes).map_err(InstallError::staging)?;
@@ -210,7 +227,7 @@ fn swap_with(
     mut mv: impl FnMut(&Path, &Path) -> io::Result<()>,
 ) -> Result<(), InstallError> {
     let old = old_path(exe);
-    mv(exe, &old).map_err(InstallError::staging)?;
+    mv(exe, &old).map_err(|e| InstallError::RolledBack(e.to_string()))?;
     let Err(e) = mv(new, exe) else {
         return Ok(());
     };
@@ -242,8 +259,8 @@ fn move_file(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// Tries this many times to remove `<exe>.old` (the old process may still be exiting).
-pub const CLEANUP_TRIES: u32 = 5;
-pub const CLEANUP_DELAY: Duration = Duration::from_millis(500);
+pub const CLEANUP_TRIES: u32 = 10;
+pub const CLEANUP_DELAY: Duration = Duration::from_secs(1);
 
 /// Removes `<exe>.old`: `Ok(true)` when removed, `Ok(false)` when there was none.
 pub fn cleanup_old(exe: &Path) -> Result<bool, String> {
@@ -271,8 +288,8 @@ fn cleanup_old_with(
     Err(format!("could not remove {}: {last}", old.display()))
 }
 
-/// After an update: removes `<exe>.old` on its own thread (with retries, so the tray is
-/// never held up) and logs how it went.
+/// At every start: removes a `<exe>.old` an update left (the old process may still be
+/// exiting) on its own thread, with retries, so the tray is never held up.
 pub fn spawn_cleanup(exe: PathBuf) -> Option<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name(CLEANUP_THREAD.into())
@@ -281,7 +298,7 @@ pub fn spawn_cleanup(exe: PathBuf) -> Option<std::thread::JoinHandle<()>> {
                 .unwrap_or_else(|_| Err("cleanup failed unexpectedly".into()));
             match result {
                 Ok(true) => log::info(&format!("removed {}", old_path(&exe).display())),
-                Ok(false) => log::info("no previous exe to clean up"),
+                Ok(false) => {} // nothing to clean, the usual case
                 Err(e) => log::warn(&e),
             }
         })
@@ -292,6 +309,14 @@ pub fn spawn_cleanup(exe: PathBuf) -> Option<std::thread::JoinHandle<()>> {
 /// Whether the command line (without the program name) asks for the post-update start.
 pub fn is_updated_launch(mut args: impl Iterator<Item = String>) -> bool {
     args.any(|a| a == UPDATED_FLAG)
+}
+
+/// `ShellExecuteW`'s result: its return value is above 32 on success, else an error code.
+pub fn shell_execute_result(code: usize) -> Result<(), String> {
+    if code <= 32 {
+        return Err(format!("ShellExecuteW failed (code {code})"));
+    }
+    Ok(())
 }
 
 /// Starts `exe --updated`. An elevated caller's child is elevated too.
@@ -310,10 +335,7 @@ pub fn relaunch(exe: &Path) -> Result<(), String> {
             SW_SHOWNORMAL,
         )
     };
-    if result.0 as usize <= 32 {
-        return Err(windows::core::Error::from_thread().to_string());
-    }
-    Ok(())
+    shell_execute_result(result.0 as usize)
 }
 
 /// Starts a download on a new thread: `download` runs there and its result, or a failure
@@ -327,7 +349,7 @@ pub fn spawn_download(
         .name(WORKER_THREAD.into())
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(download))
-                .unwrap_or_else(|_| Err(PANICKED.to_string()));
+                .unwrap_or_else(|_| Err(InstallError::Unexpected(PANICKED.into())));
             post_boxed(
                 HWND(raw as *mut std::ffi::c_void),
                 WM_INSTALL_RESULT,
@@ -648,7 +670,7 @@ mod tests {
             hold = None;
         });
         assert_eq!(got, Ok(true));
-        assert_eq!(sleeps, vec![Duration::from_millis(500)]);
+        assert_eq!(sleeps, vec![CLEANUP_DELAY]);
         assert!(!old_path(&exe).exists());
 
         // Still in use after every try: gives up after 5.
@@ -661,6 +683,65 @@ mod tests {
         let mut tries = 0;
         assert!(cleanup_old_with(&exe, 5, CLEANUP_DELAY, |_| tries += 1).is_err());
         assert_eq!(tries, 4, "waits between the 5 tries");
+    }
+
+    #[test]
+    fn cleanup_budget_is_ten_tries_a_second_apart() {
+        assert_eq!(CLEANUP_TRIES, 10);
+        assert_eq!(CLEANUP_DELAY, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn transient_failures_can_be_retried() {
+        for e in [
+            InstallError::Download("download took too long".into()),
+            InstallError::BadChecksumFile,
+            InstallError::ChecksumMismatch,
+            InstallError::Io("disk full".into()),
+            InstallError::RolledBack("in use".into()),
+            InstallError::Unexpected("boom".into()),
+        ] {
+            assert!(e.retryable(), "{e:?}");
+        }
+        for e in [
+            InstallError::Unwritable,
+            InstallError::Untrusted("https://evil.com/x".into()),
+            InstallError::RollbackFailed {
+                old: "lite-bar.exe.old".into(),
+                why: "x".into(),
+            },
+        ] {
+            assert!(!e.retryable(), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn access_denied_during_the_swap_is_not_an_unwritable_folder() {
+        let (_dir, exe) = exe_dir("install-swap-denied");
+        let new = stage_update(&exe, NEW_EXE, &sha256(NEW_EXE)).unwrap();
+        // Moving the running exe aside is refused (e.g. antivirus holding it).
+        let got = swap_with(&exe, &new, |_, _| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        });
+        assert!(matches!(got, Err(InstallError::RolledBack(_))), "{got:?}");
+        assert_eq!(std::fs::read(&exe).unwrap(), OLD_EXE);
+    }
+
+    #[test]
+    fn a_stale_new_that_cannot_be_removed_is_not_an_unwritable_folder() {
+        let (_dir, exe) = exe_dir("install-stale-stuck");
+        std::fs::create_dir(new_path(&exe)).unwrap();
+        let got = stage_update(&exe, NEW_EXE, &sha256(NEW_EXE));
+        assert!(matches!(got, Err(InstallError::Io(_))), "{got:?}");
+        assert_eq!(std::fs::read(&exe).unwrap(), OLD_EXE);
+    }
+
+    #[test]
+    fn shell_execute_failures_report_its_return_code() {
+        assert_eq!(shell_execute_result(42), Ok(()));
+        let e = shell_execute_result(2).unwrap_err();
+        assert!(e.contains("code 2"), "{e}");
+        assert!(shell_execute_result(32).is_err());
     }
 
     #[test]
@@ -704,7 +785,12 @@ mod tests {
             if got.as_bool() {
                 // SAFETY: posted by `spawn_download`, taken once.
                 let r = unsafe { take_result(msg.lParam) };
-                assert_eq!(r, Err("update download failed unexpectedly".to_string()));
+                assert_eq!(
+                    r,
+                    Err(InstallError::Unexpected(
+                        "update download failed unexpectedly".into()
+                    ))
+                );
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));

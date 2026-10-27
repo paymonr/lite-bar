@@ -93,6 +93,8 @@ pub enum UiAction {
     InstallUpdate,
     /// Open the available release's page on GitHub.
     OpenReleasePage,
+    /// "Restart now": start the already installed new version and quit this one.
+    RestartToUpdate,
 }
 
 /// What the Updates section shows: the app's update state and this build's version.

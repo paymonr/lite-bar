@@ -4,12 +4,12 @@
 use std::path::Path;
 use std::time::Duration;
 
-use lite_bar_core::update::{current_version, newer_release, CheckStart, UpdateState};
+use lite_bar_core::update::{current_version, newer_release, CheckStart, UpdateState, Version};
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
 use super::{acquire_guard, shell_open, App, UPDATE_TIMER_ID};
 use crate::hotkeys::{self, HotkeyId};
-use crate::installer::{spawn_download, swap, InstallError, InstallResult, RESTART_TO_FINISH};
+use crate::installer::{spawn_download, swap, InstallError, InstallResult};
 use crate::log;
 use crate::updater::{is_web_url, next_state, spawn_check, CheckResult};
 
@@ -58,9 +58,13 @@ impl App {
     }
 
     /// "Check now": runs even with checks off, and shows "Checking…" (except over an
-    /// available update, which keeps its Update now until a check says otherwise).
+    /// available update, which keeps its Update now until a check says otherwise). Does
+    /// nothing while downloading or once an update waits for a restart.
     pub(super) fn check_for_updates_now(&mut self) {
-        if matches!(self.update, UpdateState::Downloading(_)) {
+        if matches!(
+            self.update,
+            UpdateState::Downloading(_) | UpdateState::RestartRequired
+        ) {
             return;
         }
         if self.update_schedule.check_now() == CheckStart::Started {
@@ -84,7 +88,7 @@ impl App {
     /// beyond the Settings status line.
     pub(super) fn on_update_result(&mut self, result: CheckResult) {
         self.update_schedule.finished(self.clock.elapsed());
-        let current = current_version();
+        let current = self.version_on_disk();
         match &result {
             Err(e) => log::warn(&format!("update check failed: {e}")),
             Ok(r) if newer_release(&current, r) => {
@@ -97,6 +101,12 @@ impl App {
         self.arm_update_timer();
     }
 
+    /// The version updates are compared with: an installed update's once the swap is done
+    /// (it is never offered again), else this build's.
+    fn version_on_disk(&self) -> Version {
+        self.installed_version.unwrap_or_else(current_version)
+    }
+
     pub(super) fn set_update_state(&mut self, state: UpdateState) {
         self.update = state;
         if let Some(ui) = &self.settings_ui {
@@ -104,29 +114,38 @@ impl App {
         }
     }
 
-    /// Update now (Settings or the tray): downloads the available release on a worker
-    /// thread and shows Downloading meanwhile. Only an available release newer than this
-    /// build is installed, and only from its own URLs; a click while downloading is ignored.
+    /// Update now (Settings or the tray), or Try again after a failure that may pass:
+    /// downloads the release on a worker thread and shows Downloading meanwhile. Only a
+    /// release newer than the exe on disk is installed, and only from its own URLs; a click
+    /// while downloading is ignored.
     pub(super) fn install_update(&mut self) {
-        let UpdateState::Available(r) = &self.update else {
-            return;
+        let r = match (&self.update, &self.installing) {
+            (UpdateState::Available(r), _) => r.clone(),
+            (UpdateState::Failed { retry: true, .. }, Some(r)) => r.clone(),
+            _ => return,
         };
-        let r = r.clone();
-        if !newer_release(&current_version(), &r) {
+        if !newer_release(&self.version_on_disk(), &r) {
             log::warn(&format!("not installing v{}: not newer", r.version));
             return;
         }
+        // Before anything can fail, so the release page stays reachable.
+        self.installing = Some(r.clone());
         let Some(exe) = self.exe_path.clone() else {
-            self.set_update_state(UpdateState::Failed(NO_EXE.into()));
+            self.set_update_state(UpdateState::Failed {
+                why: NO_EXE.into(),
+                retry: false,
+            });
             return;
         };
         log::info(&format!("downloading v{}", r.version));
-        self.installing = Some(r.clone());
         self.set_update_state(UpdateState::Downloading(r.clone()));
         let download = self.download;
         if !spawn_download(self.hwnd, move || download(&r, &exe)) {
             log::error("could not start the update download thread");
-            self.set_update_state(UpdateState::Failed(NO_THREAD.into()));
+            self.set_update_state(UpdateState::Failed {
+                why: NO_THREAD.into(),
+                retry: true,
+            });
         }
     }
 
@@ -139,14 +158,20 @@ impl App {
         };
         let version = r.version;
         let (new, Some(exe)) = (result, self.exe_path.clone()) else {
-            self.set_update_state(UpdateState::Failed(NO_EXE.into()));
+            self.set_update_state(UpdateState::Failed {
+                why: NO_EXE.into(),
+                retry: false,
+            });
             return false;
         };
         let new = match new {
             Ok(new) => new,
-            Err(why) => {
-                log::warn(&format!("update to v{version} failed: {why}"));
-                self.set_update_state(UpdateState::Failed(why));
+            Err(e) => {
+                log::warn(&format!("update to v{version} failed: {e}"));
+                self.set_update_state(UpdateState::Failed {
+                    why: e.to_string(),
+                    retry: e.retryable(),
+                });
                 return false;
             }
         };
@@ -159,10 +184,14 @@ impl App {
                 )),
                 e => log::error(&format!("update to v{version} not installed: {e:?}")),
             }
-            self.set_update_state(UpdateState::Failed(e.to_string()));
+            self.set_update_state(UpdateState::Failed {
+                why: e.to_string(),
+                retry: e.retryable(),
+            });
             return false;
         }
         log::info(&format!("installed v{version}; restarting"));
+        self.installed_version = Some(version);
         self.relaunch_updated(&exe)
     }
 
@@ -193,17 +222,29 @@ impl App {
                 if was_on {
                     self.start_overlay();
                 }
-                self.set_update_state(UpdateState::Failed(RESTART_TO_FINISH.into()));
+                self.set_update_state(UpdateState::RestartRequired);
                 false
             }
         }
+    }
+
+    /// Restart now: starts the installed update again (after an earlier relaunch failed).
+    /// Returns true when it started and this instance should quit.
+    pub(super) fn restart_to_update(&mut self) -> bool {
+        if self.update != UpdateState::RestartRequired {
+            return false;
+        }
+        let Some(exe) = self.exe_path.clone() else {
+            return false;
+        };
+        self.relaunch_updated(&exe)
     }
 
     /// The page of the release shown in Settings, or of the one a failed install was for.
     pub(super) fn release_page(&self) -> Option<&str> {
         match &self.update {
             UpdateState::Available(r) | UpdateState::Downloading(r) => Some(&r.page_url),
-            UpdateState::Failed(_) => self.installing.as_ref().map(|r| r.page_url.as_str()),
+            UpdateState::Failed { .. } => self.installing.as_ref().map(|r| r.page_url.as_str()),
             _ => None,
         }
     }

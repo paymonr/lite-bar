@@ -110,10 +110,11 @@ pub unsafe fn take_boxed<T>(lparam: LPARAM) -> T {
 
 /// The state after a check: newer release → `Available`, none → `UpToDate`, error →
 /// `CheckFailed`. An `Available` release stays until a later successful check says
-/// otherwise, and a download in progress is never interrupted.
+/// otherwise, a download in progress is never interrupted, and an installed update waiting
+/// for a restart stays.
 pub fn next_state(current: &UpdateState, result: &CheckResult, version: &Version) -> UpdateState {
     match (current, result) {
-        (UpdateState::Downloading(_), _) => current.clone(),
+        (UpdateState::Downloading(_) | UpdateState::RestartRequired, _) => current.clone(),
         (UpdateState::Available(_), Err(_)) => current.clone(),
         (_, Err(_)) => UpdateState::CheckFailed,
         (_, Ok(r)) if newer_release(version, r) => UpdateState::Available(r.clone()),
@@ -367,6 +368,14 @@ mod tests {
             next_state(&avail, &Ok(release("0.4.0")), &cur),
             UpdateState::UpToDate
         );
+    }
+
+    #[test]
+    fn a_pending_restart_is_kept() {
+        let cur: Version = "0.4.0".parse().unwrap();
+        let s = UpdateState::RestartRequired;
+        assert_eq!(next_state(&s, &Ok(release("0.6.0")), &cur), s);
+        assert_eq!(next_state(&s, &Err("x".into()), &cur), s);
     }
 
     #[test]

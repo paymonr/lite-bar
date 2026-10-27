@@ -73,9 +73,14 @@ fn status_line_shows_each_state_in_its_color() {
         (UpdateState::Available(release()), theme::ACCENT),
         (UpdateState::Downloading(release()), theme::MUTED),
         (
-            UpdateState::Failed("download was corrupted".into()),
+            UpdateState::Failed {
+                why: "download was corrupted".into(),
+                retry: true,
+            },
             problem,
         ),
+        // Not a failure: the new version is in place.
+        (UpdateState::RestartRequired, theme::ACCENT),
         (UpdateState::CheckFailed, theme::MUTED),
     ];
     for (state, color) in want {
@@ -101,7 +106,7 @@ fn update_now_shows_only_when_available() {
             "{state:?}"
         );
         // A failed install points to the release page too (download it by hand).
-        let page = available || matches!(state, UpdateState::Failed(_));
+        let page = available || matches!(state, UpdateState::Failed { .. });
         assert_eq!(
             find_text(p.frame(), "Open release page").is_some(),
             page,
@@ -120,14 +125,50 @@ fn update_now_shows_only_when_available() {
 
 #[test]
 fn a_failed_install_offers_the_release_page() {
-    let mut p = with_update(UpdateState::Failed(
-        "Can't update in this folder — download it from GitHub".into(),
-    ));
+    let mut p = with_update(UpdateState::Failed {
+        why: "Can't update in this folder — download it from GitHub".into(),
+        retry: false,
+    });
     assert_eq!(
         p.click_text("Open release page"),
         vec![UiAction::OpenReleasePage]
     );
     assert!(find_text(p.frame(), "Check now").is_some());
+    assert!(find_text(p.frame(), "Try again").is_none(), "not retryable");
+}
+
+#[test]
+fn try_again_shows_only_for_a_retryable_failure() {
+    for state in all_update_states() {
+        let p = with_update(state.clone());
+        let retry = matches!(state, UpdateState::Failed { retry: true, .. });
+        assert_eq!(
+            find_text(p.frame(), "Try again").is_some(),
+            retry,
+            "{state:?}"
+        );
+    }
+    let mut p = with_update(UpdateState::Failed {
+        why: "the download was corrupted (checksum mismatch)".into(),
+        retry: true,
+    });
+    assert_eq!(p.click_text("Try again"), vec![UiAction::InstallUpdate]);
+    assert!(find_text(p.frame(), "Open release page").is_some());
+}
+
+#[test]
+fn restart_now_shows_only_when_a_restart_is_required() {
+    for state in all_update_states() {
+        let p = with_update(state.clone());
+        assert_eq!(
+            find_text(p.frame(), "Restart now").is_some(),
+            state == UpdateState::RestartRequired,
+            "{state:?}"
+        );
+    }
+    let mut p = with_update(UpdateState::RestartRequired);
+    assert_eq!(p.click_text("Restart now"), vec![UiAction::RestartToUpdate]);
+    assert!(find_text(p.frame(), "Update now").is_none());
 }
 
 #[test]
