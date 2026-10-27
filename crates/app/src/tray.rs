@@ -107,7 +107,7 @@ fn icon_pixels() -> Vec<u32> {
 }
 
 /// Builds the icon from `icon_pixels` with a 32-bit ARGB DIB and an all-zero mask.
-fn create_icon() -> windows::core::Result<HICON> {
+pub(crate) fn create_icon() -> windows::core::Result<HICON> {
     let pixels = icon_pixels();
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {

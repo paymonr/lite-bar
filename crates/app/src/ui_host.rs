@@ -609,6 +609,12 @@ impl Shared {
 fn register_window_class() {
     static REGISTER: Once = Once::new();
     REGISTER.call_once(|| {
+        // The tray's icon for the title bar and taskbar; it lives as long as the class (the
+        // process). The system scales it for the small size.
+        let icon = crate::tray::create_icon().unwrap_or_else(|e| {
+            log::warn(&format!("settings window: no icon: {e}"));
+            Default::default()
+        });
         // SAFETY: plain FFI; the class name is a static NUL-terminated string. A failed
         // registration surfaces as a CreateWindowExW error.
         unsafe {
@@ -617,6 +623,8 @@ fn register_window_class() {
                 lpfnWndProc: Some(window_proc),
                 hInstance: GetModuleHandleW(None).unwrap_or_default().into(),
                 hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
+                hIcon: icon,
+                hIconSm: icon,
                 lpszClassName: CLASS_NAME,
                 ..Default::default()
             };
@@ -1670,6 +1678,17 @@ mod win_tests {
         send(&w, WM_CHAR, 0xDD1E, 0);
         send(&w, WM_CHAR, 'i' as usize, 0);
         assert_eq!(edit.borrow().text, "h𝄞i");
+    }
+
+    #[test]
+    fn window_class_has_the_tray_icon() {
+        use windows::Win32::UI::WindowsAndMessaging::{GetClassLongPtrW, GCLP_HICON, GCLP_HICONSM};
+        let (w, _, _) = open_test(RED);
+        let big = unsafe { GetClassLongPtrW(w.hwnd(), GCLP_HICON) };
+        let small = unsafe { GetClassLongPtrW(w.hwnd(), GCLP_HICONSM) };
+        assert_ne!(big, 0, "large icon");
+        assert_ne!(small, 0, "small icon");
+        w.close();
     }
 
     #[test]
