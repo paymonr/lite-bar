@@ -3,6 +3,7 @@ mod color;
 mod hotkey;
 mod location;
 mod nav;
+mod page;
 mod text;
 
 use super::theme::Rgba;

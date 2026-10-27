@@ -152,3 +152,29 @@ fn rejected_shows_the_error_and_click_retries() {
     run(&mut st, &release(10.0, 14.0), &mut cap);
     assert_eq!(cap, HotkeyCapture::Waiting);
 }
+
+#[test]
+fn hotkey_field_width_matches_the_drawn_field() {
+    let mut st = UiState::default();
+    for mut cap in [
+        HotkeyCapture::Idle,
+        HotkeyCapture::Waiting,
+        HotkeyCapture::Error("nope".into()),
+    ] {
+        let mut w = 0.0;
+        let cur = current();
+        let f = frame(&mut st, &Input::default(), |ui| {
+            w = ui.hotkey_field_width(&cur, &cap);
+            ui.hotkey_field(id("hk"), &cur, &mut cap);
+        });
+        let drawn = f
+            .cmds
+            .iter()
+            .find_map(|c| match c {
+                Cmd::Fill { rect, .. } => Some(rect.w),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(w, drawn, "{cap:?}");
+    }
+}

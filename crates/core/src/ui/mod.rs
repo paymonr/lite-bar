@@ -20,7 +20,9 @@ pub use hotkey_capture::{HotkeyCapture, HotkeyFieldEvent};
 pub use input::{Id, Input, KeyPress, UiKey, UiState, WheelCache};
 pub use text_edit::{Clipboard, TextEdit};
 pub use theme::Rgba;
-pub use widgets::{ColorPickerEvent, SidebarItem, TextFieldEvent, PRESET_COLORS};
+pub use widgets::{
+    color_picker_size, ColorPickerEvent, SidebarItem, TextFieldEvent, PRESET_COLORS,
+};
 
 /// Hashes a name to a widget id (FNV-1a, 64 bit).
 pub fn id(name: &str) -> Id {
@@ -276,6 +278,149 @@ impl<'a> Ui<'a> {
         self.input
             .pointer
             .is_some_and(|p| rect.contains(p) && self.clips.last().is_none_or(|c| c.contains(p)))
+    }
+
+    /// The space left in the current layout, in layout space: in a column, from where
+    /// the next item would go (after any pending gap) to the bottom; in a row, from the
+    /// next item to the right edge.
+    pub fn available(&self) -> Rect {
+        let l = self.layouts.last().expect("layout stack is never empty");
+        let gap = if l.gap_pending { theme::GAP } else { 0.0 };
+        if l.row {
+            let x = l.x + gap;
+            Rect::new(x, l.bounds.y, (l.bounds.right() - x).max(0.0), l.bounds.h)
+        } else {
+            let y = l.y + gap;
+            Rect::new(l.bounds.x, y, l.bounds.w, (l.bounds.bottom() - y).max(0.0))
+        }
+    }
+
+    /// Draws `cmd` as given, in layout space (the content offset is applied). It takes
+    /// no layout space and no input; use `clip` rather than a painted `ClipPush` when
+    /// widgets inside must stop reacting outside the clip.
+    pub fn paint(&mut self, cmd: Cmd) {
+        let (dx, dy) = (self.offset.x, self.offset.y);
+        let r = |r: Rect| Rect::new(r.x + dx, r.y + dy, r.w, r.h);
+        let p = |p: Pt| Pt {
+            x: p.x + dx,
+            y: p.y + dy,
+        };
+        let cmd = match cmd {
+            Cmd::Fill {
+                rect,
+                color,
+                radius,
+            } => Cmd::Fill {
+                rect: r(rect),
+                color,
+                radius,
+            },
+            Cmd::Stroke {
+                rect,
+                color,
+                radius,
+                width,
+            } => Cmd::Stroke {
+                rect: r(rect),
+                color,
+                radius,
+                width,
+            },
+            Cmd::Text {
+                pos,
+                text,
+                style,
+                color,
+            } => Cmd::Text {
+                pos: p(pos),
+                text,
+                style,
+                color,
+            },
+            Cmd::Line {
+                from,
+                to,
+                color,
+                width,
+            } => Cmd::Line {
+                from: p(from),
+                to: p(to),
+                color,
+                width,
+            },
+            Cmd::Dashed {
+                rect,
+                color,
+                radius,
+            } => Cmd::Dashed {
+                rect: r(rect),
+                color,
+                radius,
+            },
+            Cmd::Image {
+                rect,
+                width_px,
+                height_px,
+                rgba,
+            } => Cmd::Image {
+                rect: r(rect),
+                width_px,
+                height_px,
+                rgba,
+            },
+            Cmd::ClipPush(rect) => Cmd::ClipPush(r(rect)),
+            Cmd::ClipPop => Cmd::ClipPop,
+        };
+        self.cmds.push(cmd);
+    }
+
+    /// The frame's text measure, for pages that lay out text themselves.
+    pub fn text_measure(&self) -> &'a dyn TextMeasure {
+        self.measure
+    }
+
+    /// Whether the text field `id` has the keyboard focus.
+    pub fn is_focused(&self, id: Id) -> bool {
+        self.state.focused == Some(id)
+    }
+
+    /// Asks the host for one more frame right away, e.g. after the page found its
+    /// layout changed and wants to draw with the new measurements.
+    pub fn request_redraw(&mut self) {
+        self.redraw_at(self.input.now_ms);
+    }
+
+    /// A card: the widgets built by `f` stacked in a column, padded, on a surface-colored
+    /// rounded panel as tall as its content.
+    pub fn card(&mut self, f: impl FnOnce(&mut Ui<'a>)) {
+        let outer = self.available();
+        let inner = Rect::new(
+            outer.x + theme::CARD_PAD_X,
+            outer.y + theme::CARD_PAD_Y,
+            (outer.w - 2.0 * theme::CARD_PAD_X).max(0.0),
+            f32::MAX / 4.0,
+        );
+        let mark = self.cmds.len();
+        let mut bottom = inner.y;
+        self.with_layout(inner, false, |ui| {
+            f(ui);
+            bottom = ui.layouts.last().expect("card layout").y;
+        });
+        let rect = self.alloc(None, bottom - inner.y + 2.0 * theme::CARD_PAD_Y);
+        let back = [
+            Cmd::Fill {
+                rect,
+                color: theme::SURFACE,
+                radius: theme::CARD_RADIUS,
+            },
+            Cmd::Stroke {
+                rect,
+                color: theme::BORDER,
+                radius: theme::CARD_RADIUS,
+                width: 1.0,
+            },
+        ];
+        self.cmds.splice(mark..mark, back);
     }
 
     /// Asks the host for a frame at `now_ms` time `at`, even without input.

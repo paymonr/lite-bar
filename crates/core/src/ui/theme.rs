@@ -49,6 +49,10 @@ pub const SIDEBAR_SELECTED_TEXT: Rgba = Rgba(0xFF, 0xFF, 0xFF, 255);
 /// Muted look (45% opacity) for inactive chips and disabled sidebar items.
 pub const DIM_ALPHA: u8 = 115;
 
+pub const CARD_RADIUS: f32 = 8.0;
+pub const CARD_PAD_X: f32 = 16.0;
+pub const CARD_PAD_Y: f32 = 12.0;
+
 pub const FIELD_RADIUS: f32 = 5.0;
 pub const FIELD_PAD_X: f32 = 8.0;
 pub const SWATCH: f32 = 18.0;

@@ -72,6 +72,12 @@ fn flow(n: usize, avail: f32) -> (Vec<Rect>, f32, f32) {
     (rects, w, h)
 }
 
+/// Size of a `color_picker` with `saved` saved colors given `avail` width.
+pub fn color_picker_size(saved: usize, avail: f32) -> (f32, f32) {
+    let (_, w, h) = flow(PRESET_COLORS.len() + saved, avail);
+    (w, h)
+}
+
 impl Ui<'_> {
     /// Preset swatches, then `saved` (dashed border), then a hex field. Swatches wrap
     /// to more lines when the row is too narrow. `hex` holds the field's text; it

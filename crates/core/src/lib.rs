@@ -11,4 +11,5 @@ pub mod overlay_draw;
 pub mod sessions;
 pub mod settings;
 pub mod settings_edit;
+pub mod settings_ui;
 pub mod ui;

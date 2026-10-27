@@ -33,25 +33,25 @@ fn key_names(h: &Hotkey) -> Vec<String> {
     parts
 }
 
+fn content<'a>(current: &Hotkey, capture: &'a HotkeyCapture) -> Content<'a> {
+    match capture {
+        HotkeyCapture::Idle => Content::Keys(key_names(current)),
+        HotkeyCapture::Waiting => Content::Message(WAITING_TEXT, theme::MUTED),
+        HotkeyCapture::Error(msg) | HotkeyCapture::Retry(msg) => {
+            Content::Message(msg, theme::ERROR)
+        }
+    }
+}
+
 impl Ui<'_> {
-    /// Shows `current` as key caps. Clicking starts capture; the next combination is
-    /// proposed, Esc or a press elsewhere cancels. An invalid combination shows why and
-    /// keeps listening; `HotkeyCapture::Error` shows its
-    /// message until clicked again.
-    pub fn hotkey_field(
-        &mut self,
-        id: Id,
-        current: &Hotkey,
-        capture: &mut HotkeyCapture,
-    ) -> HotkeyFieldEvent {
-        let content = match &*capture {
-            HotkeyCapture::Idle => Content::Keys(key_names(current)),
-            HotkeyCapture::Waiting => Content::Message(WAITING_TEXT, theme::MUTED),
-            HotkeyCapture::Error(msg) | HotkeyCapture::Retry(msg) => {
-                Content::Message(msg, theme::ERROR)
-            }
-        };
-        let inner_w = match &content {
+    /// Width `hotkey_field` takes for `current` in this capture state, for laying it
+    /// out (e.g. right-aligned) before building it.
+    pub fn hotkey_field_width(&self, current: &Hotkey, capture: &HotkeyCapture) -> f32 {
+        self.content_width(&content(current, capture))
+    }
+
+    fn content_width(&self, content: &Content) -> f32 {
+        let inner_w = match content {
             Content::Keys(parts) => {
                 let caps: f32 = parts
                     .iter()
@@ -62,10 +62,21 @@ impl Ui<'_> {
             }
             Content::Message(m, _) => self.measure.measure(m, TextStyle::BODY).0,
         };
-        let rect = self.alloc(
-            Some(inner_w + 2.0 * theme::KEY_PAD_X),
-            theme::CONTROL_HEIGHT,
-        );
+        inner_w + 2.0 * theme::KEY_PAD_X
+    }
+
+    /// Shows `current` as key caps. Clicking starts capture; the next combination is
+    /// proposed, Esc or a press elsewhere cancels. An invalid combination shows why and
+    /// keeps listening; `HotkeyCapture::Error` shows its
+    /// message until clicked again.
+    pub fn hotkey_field(
+        &mut self,
+        id: Id,
+        current: &Hotkey,
+        capture: &mut HotkeyCapture,
+    ) -> HotkeyFieldEvent {
+        let content = content(current, capture);
+        let rect = self.alloc(Some(self.content_width(&content)), theme::CONTROL_HEIGHT);
         let border = match &*capture {
             HotkeyCapture::Idle => theme::BORDER,
             HotkeyCapture::Waiting => theme::ACCENT,

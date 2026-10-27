@@ -10,7 +10,7 @@ mod location;
 mod nav;
 mod text;
 
-pub use color::{ColorPickerEvent, PRESET_COLORS};
+pub use color::{color_picker_size, ColorPickerEvent, PRESET_COLORS};
 pub use nav::SidebarItem;
 pub use text::TextFieldEvent;
 
