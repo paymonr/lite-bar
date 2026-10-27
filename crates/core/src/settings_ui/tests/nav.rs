@@ -73,7 +73,7 @@ fn highlight_follows_the_scroll() {
     for (scroll, want) in [
         (h[1] - 1.0, NAV_OVERLAY),
         (h[1], NAV_APPEARANCE),
-        (h[2] + 5.0, NAV_HOTKEYS),
+        (h[2], NAV_HOTKEYS),
         (0.0, NAV_OVERLAY),
     ] {
         p.st.scroll.insert(id("settings.scroll"), scroll);
@@ -116,4 +116,19 @@ fn settings_header_is_static() {
     assert!(fills(p.frame())
         .iter()
         .any(|(r, c, _)| *c == theme::ACCENT && r.w == 3.0 && r.y <= at.y && r.bottom() >= at.y));
+}
+
+#[test]
+fn scrolling_to_the_bottom_highlights_the_last_section() {
+    let mut p = Page::new(MOCKUP);
+    let mut last = -1.0;
+    while p.scroll() != last {
+        last = p.scroll();
+        p.wheel(-5.0);
+    }
+    assert!(p.scroll() < p.view.headings[NAV_GAMES]);
+    assert_eq!(p.view.selected, NAV_GAMES);
+    // Scrolling back up a little leaves the bottom.
+    p.wheel(1.0);
+    assert_ne!(p.view.selected, NAV_GAMES);
 }

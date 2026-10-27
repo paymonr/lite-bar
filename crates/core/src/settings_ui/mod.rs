@@ -210,13 +210,18 @@ pub fn settings_frame(
     if clicked {
         view.nav_scroll = Some(scroll);
     } else if view.nav_scroll != Some(scroll) {
-        // Scroll-spy: the last section whose heading is at or above the viewport top.
+        // Scroll-spy: the last section whose heading is at or above the viewport top, or
+        // the last section once scrolled to the bottom (its heading may never reach the top).
         view.nav_scroll = None;
-        view.selected = view
-            .headings
-            .iter()
-            .rposition(|h| *h <= scroll + 0.5)
-            .unwrap_or(NAV_OVERLAY);
+        let max = (content_h - body.h).max(0.0);
+        view.selected = if max > 0.0 && scroll >= max - 0.5 {
+            NAV_GAMES
+        } else {
+            view.headings
+                .iter()
+                .rposition(|h| *h <= scroll + 0.5)
+                .unwrap_or(NAV_OVERLAY)
+        };
     }
     if new_h != view.content_h {
         view.content_h = new_h;
