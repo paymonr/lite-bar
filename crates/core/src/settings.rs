@@ -96,7 +96,7 @@ pub struct Settings {
     /// Display names used in the game stats files (`games.csv`, `sessions.csv`). Keys are an
     /// exe file name or a full path.
     pub game_names: BTreeMap<String, String>,
-    /// Colors saved in the settings window's picker, at most `MAX_SAVED_COLORS`.
+    /// Colors saved in the settings window's picker, oldest first, at most `MAX_SAVED_COLORS`.
     pub saved_colors: Vec<Rgb>,
 }
 
@@ -218,12 +218,6 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
     if let Some(entries) = read_field::<Vec<toml::Value>>(&colors, "colors", "saved", &mut warnings)
     {
         for (i, entry) in entries.into_iter().enumerate() {
-            if settings.saved_colors.len() == MAX_SAVED_COLORS {
-                warnings.push(format!(
-                    "colors.saved: more than {MAX_SAVED_COLORS} colors; ignoring the rest"
-                ));
-                break;
-            }
             match entry.try_into::<Rgb>() {
                 Ok(c) => settings.saved_colors.push(c),
                 Err(err) => warnings.push(format!(
@@ -231,6 +225,14 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
                     err.message()
                 )),
             }
+        }
+        let extra = settings.saved_colors.len().saturating_sub(MAX_SAVED_COLORS);
+        if extra > 0 {
+            // New colors are appended: drop the oldest.
+            settings.saved_colors.drain(..extra);
+            warnings.push(format!(
+                "colors.saved: more than {MAX_SAVED_COLORS} colors; keeping the last {MAX_SAVED_COLORS}"
+            ));
         }
     }
 
@@ -481,11 +483,13 @@ mod tests {
     }
 
     #[test]
-    fn saved_colors_cap_at_16() {
+    fn saved_colors_keep_the_last_16() {
         let many: Vec<String> = (0..20).map(|i| format!("\"#0000{i:02X}\"")).collect();
         let (s, w) = parse_settings(&format!("[colors]\nsaved = [{}]\n", many.join(", ")));
         assert_eq!(s.saved_colors.len(), 16);
-        assert_eq!(s.saved_colors[15].to_hex(), "#00000F");
+        // New colors are appended, so the oldest are dropped.
+        assert_eq!(s.saved_colors[0].to_hex(), "#000004");
+        assert_eq!(s.saved_colors[15].to_hex(), "#000013");
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("colors.saved"));
     }

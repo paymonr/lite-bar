@@ -33,6 +33,11 @@ pub enum SettingsChange {
     },
 }
 
+/// The newest `MAX_SAVED_COLORS` of `colors` (new ones are appended, so the oldest go).
+fn last_saved(colors: &[Rgb]) -> &[Rgb] {
+    &colors[colors.len().saturating_sub(MAX_SAVED_COLORS)..]
+}
+
 /// Applies `change` to the in-memory settings.
 pub fn apply_change(settings: &mut Settings, change: &SettingsChange) {
     let o = &mut settings.overlay;
@@ -47,7 +52,7 @@ pub fn apply_change(settings: &mut Settings, change: &SettingsChange) {
         SettingsChange::CounterSize(v) => o.counter_size = *v,
         SettingsChange::TextSize(v) => o.text_size = *v,
         SettingsChange::SavedColors(v) => {
-            settings.saved_colors = v.iter().take(MAX_SAVED_COLORS).copied().collect();
+            settings.saved_colors = last_saved(v).to_vec();
         }
         SettingsChange::RestoreDefaults => {
             let d = Settings::default();
@@ -124,11 +129,7 @@ fn edit_doc(doc: &mut DocumentMut, change: &SettingsChange) -> Result<(), String
         SettingsChange::CounterSize(v) => set(doc, "overlay", "counter_size", i64::from(*v).into()),
         SettingsChange::TextSize(v) => set(doc, "overlay", "text_size", i64::from(*v).into()),
         SettingsChange::SavedColors(v) => {
-            let array: Array = v
-                .iter()
-                .take(MAX_SAVED_COLORS)
-                .map(|c| c.to_hex())
-                .collect();
+            let array: Array = last_saved(v).iter().map(|c| c.to_hex()).collect();
             set(doc, "colors", "saved", array.into())
         }
         SettingsChange::RestoreDefaults => {
@@ -326,6 +327,17 @@ mod tests {
         push_change(&mut pending, SettingsChange::TextSize(14));
         let text = edit_settings_text(&default_settings_toml(), &pending).unwrap();
         assert_eq!(parse_settings(&text).0.overlay.text_size, 14);
+    }
+
+    #[test]
+    fn more_than_16_saved_colors_keep_the_last_16() {
+        let many: Vec<Rgb> = (0..20).map(|i| Rgb { r: 0, g: 0, b: i }).collect();
+        let change = SettingsChange::SavedColors(many.clone());
+        let mut s = Settings::default();
+        apply_change(&mut s, &change);
+        assert_eq!(s.saved_colors, many[4..]);
+        let out = edit_settings_text("", &[change]).unwrap();
+        assert_eq!(parse_settings(&out).0.saved_colors, many[4..]);
     }
 
     #[test]
