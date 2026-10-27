@@ -1,0 +1,74 @@
+//! Draw commands and text measuring. The host renders `Cmd`s with Direct2D.
+
+use super::geom::{Pt, Rect};
+use super::theme::Rgba;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct TextStyle {
+    pub size: f32,
+    pub bold: bool,
+    pub mono: bool,
+}
+
+impl TextStyle {
+    pub const BODY: TextStyle = TextStyle {
+        size: 13.0,
+        bold: false,
+        mono: false,
+    };
+    pub const BOLD: TextStyle = TextStyle {
+        size: 13.0,
+        bold: true,
+        mono: false,
+    };
+}
+
+pub trait TextMeasure {
+    /// Returns (width, height) in DIPs.
+    fn measure(&self, text: &str, style: TextStyle) -> (f32, f32);
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum Cmd {
+    Fill {
+        rect: Rect,
+        color: Rgba,
+        radius: f32,
+    },
+    Stroke {
+        rect: Rect,
+        color: Rgba,
+        radius: f32,
+        width: f32,
+    },
+    /// `pos` is the top-left of the text box.
+    Text {
+        pos: Pt,
+        text: String,
+        style: TextStyle,
+        color: Rgba,
+    },
+    Line {
+        from: Pt,
+        to: Pt,
+        color: Rgba,
+        width: f32,
+    },
+    ClipPush(Rect),
+    ClipPop,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CursorKind {
+    #[default]
+    Arrow,
+    Hand,
+    IBeam,
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Frame {
+    pub cmds: Vec<Cmd>,
+    pub wants_caret_blink: bool,
+    pub cursor: CursorKind,
+}
