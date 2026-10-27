@@ -39,7 +39,9 @@ pub struct OverlaySettings {
     pub background_color: Rgb,
     /// Background opacity in percent, 0-100.
     pub background_opacity: u8,
-    /// Number text size in pixels, 8-72.
+    /// Size of the big FPS number in pixels, 8-72.
+    pub counter_size: u16,
+    /// Size of the "FPS" label and the statistics in pixels, 6-48.
     pub text_size: u16,
 }
 
@@ -61,7 +63,8 @@ impl Default for OverlaySettings {
             },
             background_color: Rgb { r: 0, g: 0, b: 0 },
             background_opacity: 55,
-            text_size: 18,
+            counter_size: 18,
+            text_size: 11,
         }
     }
 }
@@ -93,7 +96,12 @@ pub struct Settings {
     /// Display names used in the game stats files (`games.csv`, `sessions.csv`). Keys are an
     /// exe file name or a full path.
     pub game_names: BTreeMap<String, String>,
+    /// Colors saved in the settings window's picker, oldest first, at most `MAX_SAVED_COLORS`.
+    pub saved_colors: Vec<Rgb>,
 }
+
+/// Most colors kept in `[colors] saved`.
+pub const MAX_SAVED_COLORS: usize = 16;
 
 /// Reads `section.key` as a `T`, pushing a warning and returning `None` when it is
 /// present but invalid. A missing key returns `None` silently.
@@ -194,13 +202,38 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
     ) {
         o.background_opacity = v;
     }
-    if let Some(v) = read_ranged(&overlay, "overlay", "text_size", 8..=72, &mut warnings) {
+    if let Some(v) = read_ranged(&overlay, "overlay", "counter_size", 8..=72, &mut warnings) {
+        o.counter_size = v;
+    }
+    if let Some(v) = read_ranged(&overlay, "overlay", "text_size", 6..=48, &mut warnings) {
         o.text_size = v;
     }
 
     let hotkeys = read_section(&root, "hotkeys", &mut warnings);
     if let Some(v) = read_field(&hotkeys, "hotkeys", "toggle_overlay", &mut warnings) {
         settings.hotkeys.toggle_overlay = v;
+    }
+
+    let colors = read_section(&root, "colors", &mut warnings);
+    if let Some(entries) = read_field::<Vec<toml::Value>>(&colors, "colors", "saved", &mut warnings)
+    {
+        for (i, entry) in entries.into_iter().enumerate() {
+            match entry.try_into::<Rgb>() {
+                Ok(c) => settings.saved_colors.push(c),
+                Err(err) => warnings.push(format!(
+                    "colors.saved[{i}]: {}; skipping this color",
+                    err.message()
+                )),
+            }
+        }
+        let extra = settings.saved_colors.len().saturating_sub(MAX_SAVED_COLORS);
+        if extra > 0 {
+            // New colors are appended: drop the oldest.
+            settings.saved_colors.drain(..extra);
+            warnings.push(format!(
+                "colors.saved: more than {MAX_SAVED_COLORS} colors; keeping the last {MAX_SAVED_COLORS}"
+            ));
+        }
     }
 
     let game_names = read_section(&root, "game_names", &mut warnings);
@@ -243,13 +276,19 @@ background_color = "#000000"
 # Opacity of that panel in percent, 0-100.
 background_opacity = 55
 # Height of the FPS number in pixels, 8-72.
-text_size = 18
+counter_size = 18
+# Height of the "FPS" label and the statistics in pixels, 6-48.
+text_size = 11
 
 [hotkeys]
 # Key that shows or hides the overlay: modifiers joined by "+", then one key,
 # e.g. "Ctrl+Alt+Shift+L" or "Win+F9". A letter or digit needs Ctrl, Alt or Win;
 # Shift alone is only enough for F1-F24.
 toggle_overlay = "Ctrl+Alt+Shift+L"
+
+[colors]
+# Colors saved in the settings window's color picker, as "#RRGGBB" (at most 16).
+saved = []
 
 [game_names]
 # Display names used in the game stats files (games.csv, sessions.csv). The key is an exe
@@ -384,7 +423,9 @@ mod tests {
             "label_color",
             "background_color",
             "background_opacity",
+            "counter_size",
             "text_size",
+            "saved",
             "toggle_overlay",
         ] {
             let at = lines
@@ -410,6 +451,7 @@ mod tests {
         }
         assert!(template.contains("0-100"));
         assert!(template.contains("8-72"));
+        assert!(template.contains("6-48"));
         assert!(lines.contains(&"[game_names]"));
         let example = lines
             .iter()
@@ -424,6 +466,43 @@ mod tests {
                 .any(|l| !l.starts_with('#') && !l.trim().is_empty()),
             "[game_names] must have no active entries"
         );
+    }
+
+    #[test]
+    fn parses_counter_and_text_size() {
+        let d = Settings::default().overlay;
+        assert_eq!((d.counter_size, d.text_size), (18, 11));
+        let (s, w) = parse_settings("[overlay]\ncounter_size = 72\ntext_size = 6\n");
+        assert_eq!((s.overlay.counter_size, s.overlay.text_size), (72, 6));
+        assert!(w.is_empty(), "{w:?}");
+        let (s, w) = parse_settings("[overlay]\ncounter_size = 7\ntext_size = 49\n");
+        assert_eq!((s.overlay.counter_size, s.overlay.text_size), (18, 11));
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].contains("overlay.counter_size"));
+        assert!(w[1].contains("overlay.text_size"));
+    }
+
+    #[test]
+    fn saved_colors_keep_the_last_16() {
+        let many: Vec<String> = (0..20).map(|i| format!("\"#0000{i:02X}\"")).collect();
+        let (s, w) = parse_settings(&format!("[colors]\nsaved = [{}]\n", many.join(", ")));
+        assert_eq!(s.saved_colors.len(), 16);
+        // New colors are appended, so the oldest are dropped.
+        assert_eq!(s.saved_colors[0].to_hex(), "#000004");
+        assert_eq!(s.saved_colors[15].to_hex(), "#000013");
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("colors.saved"));
+    }
+
+    #[test]
+    fn saved_colors_skip_invalid_entries() {
+        let (s, w) = parse_settings("[colors]\nsaved = [\"#112233\", \"nope\", 5, \"#445566\"]\n");
+        let hex: Vec<String> = s.saved_colors.iter().map(|c| c.to_hex()).collect();
+        assert_eq!(hex, ["#112233", "#445566"]);
+        assert_eq!(w.len(), 2, "{w:?}");
+        let (s, w) = parse_settings("[colors]\nsaved = 3\n");
+        assert!(s.saved_colors.is_empty());
+        assert_eq!(w.len(), 1);
     }
 
     #[test]

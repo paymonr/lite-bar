@@ -435,22 +435,31 @@ pub fn pick_name(c: &NameCandidates) -> String {
         .unwrap_or_else(|| exe_stem(&c.exe_path))
 }
 
-/// User override by full path, then by exe file name (both case-insensitive), else the stored name.
-pub fn display_name(
-    stored_name: &str,
+/// The user override for `exe_path` as (its key in `overrides`, the name): by full path, then by
+/// exe file name, both case-insensitive and with either slash.
+pub fn find_override<'a>(
+    overrides: &'a BTreeMap<String, String>,
     exe_path: &str,
-    overrides: &BTreeMap<String, String>,
-) -> String {
+) -> Option<(&'a str, &'a str)> {
     let lookup = |wanted: &str| {
         let wanted = normalize_path(wanted);
         overrides
             .iter()
             .find(|(key, _)| normalize_path(key) == wanted)
-            .map(|(_, value)| value.clone())
+            .map(|(key, value)| (key.as_str(), value.as_str()))
     };
-    lookup(exe_path)
-        .or_else(|| lookup(file_name(exe_path)))
-        .unwrap_or_else(|| stored_name.to_string())
+    lookup(exe_path).or_else(|| lookup(file_name(exe_path)))
+}
+
+/// User override (see `find_override`), else the stored name.
+pub fn display_name(
+    stored_name: &str,
+    exe_path: &str,
+    overrides: &BTreeMap<String, String>,
+) -> String {
+    find_override(overrides, exe_path)
+        .map_or(stored_name, |(_, name)| name)
+        .to_string()
 }
 
 #[cfg(test)]
@@ -971,5 +980,24 @@ mod tests {
             display_name("Stored", r"D:\Other\Game.exe", &BTreeMap::new()),
             "Stored"
         );
+    }
+
+    // ---- find_override ----
+
+    #[test]
+    fn case_differing_full_path_matches() {
+        assert_eq!(
+            find_override(&overrides(), r"c:/games/GAME.EXE"),
+            Some((r"C:\Games\Game.exe", "By Path"))
+        );
+    }
+
+    #[test]
+    fn find_override_falls_back_to_the_file_name_key() {
+        assert_eq!(
+            find_override(&overrides(), r"D:\Other\GAME.exe"),
+            Some(("game.exe", "By File"))
+        );
+        assert_eq!(find_override(&overrides(), r"D:\Other\Different.exe"), None);
     }
 }

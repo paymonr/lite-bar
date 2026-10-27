@@ -14,8 +14,8 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
-    PostMessageW, SetForegroundWindow, TrackPopupMenu, HICON, ICONINFO, MF_SEPARATOR, MF_STRING,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_NULL,
+    PostMessageW, SetForegroundWindow, SetMenuDefaultItem, TrackPopupMenu, HICON, ICONINFO,
+    MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_NULL,
 };
 
 /// Callback message the shell sends to the owner window. Uses `NOTIFYICON_VERSION_4`
@@ -27,6 +27,7 @@ const TOOLTIP: &str = "Lite Bar";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuItem {
+    OpenSettings,
     ToggleOverlay,
     OpenSettingsFile,
     OpenGameStats,
@@ -42,6 +43,13 @@ pub struct TrayMenuState {
     pub needs_admin: bool,
 }
 
+/// Index of the bold default entry (Settings…), the one a double-click opens.
+pub fn default_item(labels: &[(MenuItem, String)]) -> Option<usize> {
+    labels
+        .iter()
+        .position(|(m, _)| *m == MenuItem::OpenSettings)
+}
+
 /// The menu entries in display order (separators are added by `Tray::show_menu`).
 pub fn menu_labels(state: &TrayMenuState) -> Vec<(MenuItem, String)> {
     let action = if state.overlay_visible {
@@ -55,6 +63,7 @@ pub fn menu_labels(state: &TrayMenuState) -> Vec<(MenuItem, String)> {
         format!("{action}\t({} unavailable)", state.toggle_hotkey)
     };
     let mut items = vec![
+        (MenuItem::OpenSettings, "Settings…".to_owned()),
         (MenuItem::ToggleOverlay, toggle),
         (MenuItem::OpenSettingsFile, "Open settings file".to_owned()),
         (MenuItem::OpenGameStats, "Open game stats".to_owned()),
@@ -98,7 +107,7 @@ fn icon_pixels() -> Vec<u32> {
 }
 
 /// Builds the icon from `icon_pixels` with a 32-bit ARGB DIB and an all-zero mask.
-fn create_icon() -> windows::core::Result<HICON> {
+pub(crate) fn create_icon() -> windows::core::Result<HICON> {
     let pixels = icon_pixels();
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
@@ -164,6 +173,16 @@ impl Tray {
             ));
         }
         Ok(tray)
+    }
+
+    /// A tray whose icon is never added (tests).
+    #[cfg(test)]
+    pub fn new_hidden(hwnd: HWND) -> windows::core::Result<Tray> {
+        Ok(Tray {
+            hwnd,
+            icon: create_icon()?,
+            added: Cell::new(false),
+        })
     }
 
     fn data(&self) -> NOTIFYICONDATAW {
@@ -232,6 +251,10 @@ impl Tray {
                     separator(menu);
                 }
             }
+            if let Some(i) = default_item(&labels) {
+                // Bold: what a double-click on the icon does.
+                let _ = SetMenuDefaultItem(menu, (i + 1) as u32, 0);
+            }
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             // Without this the menu does not close when the user clicks elsewhere.
@@ -281,8 +304,10 @@ mod tests {
             needs_admin: false,
         };
         let l = menu_labels(&s);
+        assert_eq!(l[0], (MenuItem::OpenSettings, "Settings…".into()));
+        assert_eq!(default_item(&l), Some(0));
         assert_eq!(
-            l[0],
+            l[1],
             (
                 MenuItem::ToggleOverlay,
                 "Hide FPS overlay\tCtrl+Alt+Shift+L".into()
@@ -302,7 +327,7 @@ mod tests {
             needs_admin: true,
         };
         let l = menu_labels(&s);
-        assert_eq!(l[0].1, "Show FPS overlay\t(Ctrl+Alt+Shift+L unavailable)");
+        assert_eq!(l[1].1, "Show FPS overlay\t(Ctrl+Alt+Shift+L unavailable)");
         assert!(l.contains(&(
             MenuItem::RestartAsAdmin,
             "Restart as administrator to show FPS".into()
@@ -321,6 +346,7 @@ mod tests {
         assert_eq!(
             items,
             vec![
+                MenuItem::OpenSettings,
                 MenuItem::ToggleOverlay,
                 MenuItem::OpenSettingsFile,
                 MenuItem::OpenGameStats,

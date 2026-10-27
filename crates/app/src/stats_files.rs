@@ -13,6 +13,8 @@ use lite_bar_core::history::{
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
+use lite_bar_core::settings_ui::GameRow;
+
 use crate::log;
 
 const GAMES_TOML: &str = "games.toml";
@@ -301,6 +303,35 @@ impl StatsWriter {
     }
 }
 
+/// The games in `games.toml` under `stats_dir`, sorted by name, for the settings window's
+/// rename list. Only reads: a missing or unreadable store is an empty list and is never moved
+/// aside or rewritten. `override_name` is left `None` (the caller fills it from the settings).
+pub fn list_games(stats_dir: &Path) -> Vec<GameRow> {
+    let Ok(text) = std::fs::read_to_string(stats_dir.join(GAMES_TOML)) else {
+        return Vec::new();
+    };
+    let Ok((store, _)) = GameStore::parse(text.strip_prefix(CSV_BOM).unwrap_or(&text)) else {
+        return Vec::new();
+    };
+    let mut rows: Vec<GameRow> = store
+        .games
+        .into_values()
+        .map(|g| GameRow {
+            exe_path: g.exe_path,
+            stored_name: g.name,
+            override_name: None,
+            override_key: None,
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        a.stored_name
+            .to_lowercase()
+            .cmp(&b.stored_name.to_lowercase())
+            .then_with(|| a.exe_path.cmp(&b.exe_path))
+    });
+    rows
+}
+
 /// Moves an unreadable file to the first free `.bad`, `.bad2`, ... name. Returns whether it
 /// worked; the file must not be overwritten otherwise.
 fn move_aside(path: &Path, name: &str, reason: &str) -> bool {
@@ -342,7 +373,7 @@ fn free_backup_path(path: &Path) -> PathBuf {
 
 /// Writes `<path>.tmp`, flushes it to disk, then renames it over `path` (which replaces an
 /// existing file), so a crash or power loss leaves either the old or the complete new file.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = with_suffix(path, ".tmp");
     let write = || -> std::io::Result<()> {
         let mut file = File::create(&tmp)?;
@@ -395,6 +426,68 @@ mod tests {
 
     fn read(dir: &Path, file: &str) -> String {
         std::fs::read_to_string(dir.join(file)).unwrap()
+    }
+
+    /// Every file in `dir` with its bytes.
+    fn snapshot(dir: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(e.path()).unwrap(),
+                )
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    #[test]
+    fn list_games_reads_store_without_writing() {
+        let dir = TempDir::new("list-games");
+        let mut w = StatsWriter::new(dir.path().to_path_buf());
+        w.record(
+            &session("b", "Zelda", time(10, 0), time(10, 5)),
+            &no_overrides(),
+        );
+        w.record(
+            &session("a", "Minecraft", time(11, 0), time(11, 5)),
+            &no_overrides(),
+        );
+        let before = snapshot(dir.path());
+        let rows = list_games(dir.path());
+        assert_eq!(
+            rows,
+            vec![
+                GameRow {
+                    exe_path: r"C:\Games\Minecraft.exe".to_string(),
+                    stored_name: "Minecraft".to_string(),
+                    override_name: None,
+                    override_key: None,
+                },
+                GameRow {
+                    exe_path: r"C:\Games\Zelda.exe".to_string(),
+                    stored_name: "Zelda".to_string(),
+                    override_name: None,
+                    override_key: None,
+                },
+            ]
+        );
+        assert_eq!(snapshot(dir.path()), before, "nothing written");
+    }
+
+    #[test]
+    fn list_games_leaves_a_corrupt_store_in_place() {
+        let dir = TempDir::new("list-games-bad");
+        std::fs::write(dir.path().join(GAMES_TOML), "not [[ toml").unwrap();
+        assert!(list_games(dir.path()).is_empty());
+        assert_eq!(
+            snapshot(dir.path()),
+            vec![(GAMES_TOML.to_string(), b"not [[ toml".to_vec())]
+        );
+        assert!(list_games(&dir.path().join("missing")).is_empty());
     }
 
     #[test]
