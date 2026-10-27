@@ -74,6 +74,7 @@ impl App {
             }
             if drained.closed {
                 self.settings_ui = None;
+                self.end_hotkey_capture();
                 self.flush_settings_save();
             }
         }
@@ -96,15 +97,48 @@ impl App {
                 self.apply_ui_action(action);
             }
         }
+        self.end_hotkey_capture();
         self.flush_settings_save();
     }
 
     pub(super) fn apply_ui_action(&mut self, action: UiAction) {
         match action {
             UiAction::Change(change) => self.apply_settings_change(change),
-            UiAction::ProposeHotkey(hk) => self.propose_hotkey(hk),
+            UiAction::ProposeHotkey(hk) => {
+                self.end_hotkey_capture();
+                self.propose_hotkey(hk);
+            }
             UiAction::OpenStatsFolder => self.open_stats_folder(),
-            UiAction::CancelHotkeyCapture => self.set_hotkey_status(None),
+            UiAction::StartHotkeyCapture => self.start_hotkey_capture(),
+            UiAction::CancelHotkeyCapture => {
+                self.end_hotkey_capture();
+                self.set_hotkey_status(None);
+            }
+        }
+    }
+
+    /// Releases the toggle hotkey while the capture field listens, so pressing the current
+    /// combination reaches the field (and becomes "keep") instead of toggling the overlay.
+    fn start_hotkey_capture(&mut self) {
+        if !self.hotkey_released {
+            hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
+            self.hotkey_released = true;
+        }
+    }
+
+    /// Takes the toggle hotkey back after capture (a proposal, a cancel, the window closing).
+    fn end_hotkey_capture(&mut self) {
+        if std::mem::take(&mut self.hotkey_released) {
+            let hk = self.settings.hotkeys.toggle_overlay;
+            self.hotkey_ok = matches!(
+                hotkeys::register(self.hwnd, HotkeyId::ToggleOverlay, hk),
+                Registration::Ok
+            );
+            if !self.hotkey_ok {
+                log::warn(&format!(
+                    "hotkey {hk} was taken while the settings window had it released"
+                ));
+            }
         }
     }
 

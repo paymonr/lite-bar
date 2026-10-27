@@ -25,6 +25,7 @@ pub(super) fn section(
             w,
             |ui| match ui.hotkey_field(id("settings.hotkey"), current, &mut view.hotkey) {
                 HotkeyFieldEvent::Proposed(h) => out.push(UiAction::ProposeHotkey(h)),
+                HotkeyFieldEvent::Started => out.push(UiAction::StartHotkeyCapture),
                 HotkeyFieldEvent::Cancelled => out.push(UiAction::CancelHotkeyCapture),
                 HotkeyFieldEvent::None | HotkeyFieldEvent::Invalid(_) => {}
             },

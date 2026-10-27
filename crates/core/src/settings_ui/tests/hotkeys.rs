@@ -39,3 +39,9 @@ fn hotkey_status_shows_under_the_field() {
     let (_, _, color) = find_text(p.frame(), "Already used by another app").unwrap();
     assert_eq!(color, Rgba(0xFF, 0x8A, 0x80, 255));
 }
+
+#[test]
+fn starting_capture_asks_the_app_to_free_the_hotkey() {
+    let mut p = Page::new(TALL);
+    assert_eq!(p.click_text("Ctrl"), vec![UiAction::StartHotkeyCapture]);
+}

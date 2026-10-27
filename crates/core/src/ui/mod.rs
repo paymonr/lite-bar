@@ -16,7 +16,7 @@ mod tests;
 pub use color::{wheel_pixels, Hsv};
 pub use draw::{Cmd, CursorKind, Frame, TextMeasure, TextStyle};
 pub use geom::{Pt, Rect};
-pub use hotkey_capture::{HotkeyCapture, HotkeyFieldEvent};
+pub use hotkey_capture::{capture_key_up, HotkeyCapture, HotkeyFieldEvent, Modifiers};
 pub use input::{Id, Input, KeyPress, UiKey, UiState, WheelCache};
 pub use text_edit::{Clipboard, TextEdit};
 pub use theme::Rgba;
@@ -95,6 +95,8 @@ pub struct Ui<'a> {
     focusables: Vec<Id>,
     /// Tab (true) or Shift+Tab (false) moved focus away from the focused widget.
     tab: Option<bool>,
+    /// A hotkey field is listening for a combination.
+    capturing_keys: bool,
     /// Earliest `now_ms` at which a widget needs a frame without input.
     redraw_at: Option<u64>,
     #[cfg(test)]
@@ -130,6 +132,7 @@ impl<'a> Ui<'a> {
             caret_seen: false,
             focusables: Vec::new(),
             tab: None,
+            capturing_keys: false,
             redraw_at: None,
             #[cfg(test)]
             hits: Vec::new(),
@@ -505,6 +508,7 @@ impl<'a> Ui<'a> {
             cmds: self.cmds,
             wants_caret_blink: self.caret_seen && self.state.focused.is_some(),
             cursor: self.cursor,
+            capturing_keys: self.capturing_keys,
             redraw_after_ms: self.redraw_at,
             #[cfg(test)]
             hits: self.hits,

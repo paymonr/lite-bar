@@ -1,7 +1,34 @@
 //! State machine behind `Ui::hotkey_field`: click, press a combination, Esc cancels.
 
+use std::collections::HashSet;
+
 use super::input::{KeyPress, UiKey};
 use crate::hotkey::{Hotkey, Key};
+
+/// The modifier keys held at some moment.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Modifiers {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub win: bool,
+}
+
+/// While capturing: a key-up of a non-modifier key whose key-down never arrived (another
+/// app's `RegisterHotKey` took it) counts as pressing it with the modifiers held at key-up.
+/// `pressed` holds the keys whose key-down this window saw.
+pub fn capture_key_up(pressed: &HashSet<u16>, vk: u16, mods: Modifiers) -> Option<KeyPress> {
+    if is_modifier_vk(vk) || pressed.contains(&vk) {
+        return None;
+    }
+    Some(KeyPress {
+        key: UiKey::Other(vk),
+        ctrl: mods.ctrl,
+        alt: mods.alt,
+        shift: mods.shift,
+        win: mods.win,
+    })
+}
 
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub enum HotkeyCapture {
@@ -18,6 +45,9 @@ pub enum HotkeyCapture {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum HotkeyFieldEvent {
     None,
+    /// Capture began (a click, or Tab into the field). The host should release its own
+    /// hotkey until capture ends, so pressing it reaches the field.
+    Started,
     /// A valid combination was pressed; the host should try to register it and call
     /// `HotkeyCapture::rejected` if that fails.
     Proposed(Hotkey),
@@ -88,6 +118,53 @@ impl HotkeyCapture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CTRL_ALT: Modifiers = Modifiers {
+        ctrl: true,
+        alt: true,
+        shift: false,
+        win: false,
+    };
+
+    #[test]
+    fn key_up_without_its_key_down_is_a_press() {
+        // Another app's RegisterHotKey ate the key-down of Ctrl+Alt+K.
+        let pressed: HashSet<u16> = [0x11, 0x12].into_iter().collect();
+        assert_eq!(
+            capture_key_up(&pressed, 0x4B, CTRL_ALT),
+            Some(KeyPress {
+                key: UiKey::Other(0x4B),
+                ctrl: true,
+                alt: true,
+                shift: false,
+                win: false,
+            })
+        );
+    }
+
+    #[test]
+    fn key_up_after_its_key_down_is_nothing() {
+        let pressed: HashSet<u16> = [0x11, 0x12, 0x4B].into_iter().collect();
+        assert_eq!(capture_key_up(&pressed, 0x4B, CTRL_ALT), None);
+    }
+
+    #[test]
+    fn modifier_key_up_is_nothing() {
+        let pressed = HashSet::new();
+        for vk in [0x10, 0x11, 0x12, 0x5B, 0xA0, 0xA5] {
+            assert_eq!(capture_key_up(&pressed, vk, CTRL_ALT), None, "{vk:#x}");
+        }
+    }
+
+    #[test]
+    fn key_up_press_proposes_through_feed() {
+        let mut c = HotkeyCapture::Waiting;
+        let k = capture_key_up(&HashSet::new(), 0x4B, CTRL_ALT).unwrap();
+        assert_eq!(
+            c.feed(&k),
+            HotkeyFieldEvent::Proposed("Ctrl+Alt+K".parse().unwrap())
+        );
+    }
 
     fn kp(key: UiKey, ctrl: bool, alt: bool, shift: bool) -> KeyPress {
         KeyPress {

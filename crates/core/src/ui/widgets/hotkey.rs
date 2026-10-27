@@ -94,6 +94,7 @@ impl Ui<'_> {
             self.state.focused == Some(id) && std::mem::take(&mut self.state.focus_fresh);
         if tabbed_in && !capture.is_listening() {
             capture.start();
+            ev = HotkeyFieldEvent::Started;
         } else if capture.is_listening() {
             if self.input.pressed && !hot {
                 *capture = HotkeyCapture::Idle;
@@ -117,7 +118,9 @@ impl Ui<'_> {
             capture.start();
             self.state.focused = Some(id);
             self.focus_seen = true;
+            ev = HotkeyFieldEvent::Started;
         }
+        self.capturing_keys |= capture.is_listening();
         if !capture.is_listening() && self.state.focused == Some(id) {
             self.state.focused = None;
         }

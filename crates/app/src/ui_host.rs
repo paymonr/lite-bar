@@ -1,6 +1,7 @@
 //! Direct2D software host for the core immediate-mode UI toolkit.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use std::sync::Once;
@@ -9,7 +10,8 @@ use std::time::Instant;
 use lite_bar_core::layout::Size;
 use lite_bar_core::ui::theme::{self, CARET_BLINK_MS};
 use lite_bar_core::ui::{
-    Clipboard, Cmd, CursorKind, Input, KeyPress, Pt, Rect, Ui, UiKey, UiState,
+    capture_key_up, Clipboard, Cmd, CursorKind, Input, KeyPress, Modifiers, Pt, Rect, Ui, UiKey,
+    UiState,
 };
 use windows::core::{w, BOOL, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -41,9 +43,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA, HCURSOR, HTCLIENT, IDC_ARROW,
     IDC_HAND, IDC_IBEAM, MINMAXINFO, SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, SW_SHOW,
     WINDOW_EX_STYLE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE,
-    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
+    WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 
 use crate::log;
@@ -134,6 +137,43 @@ fn centered_in(work: RECT, size: (i32, i32)) -> (i32, i32) {
     let x = work.left + ((work.right - work.left - size.0) / 2).max(0);
     let y = work.top + ((work.bottom - work.top - size.1) / 2).max(0);
     (x, y)
+}
+
+/// Keys whose key-down this window saw and whose key-up has not arrived yet.
+#[derive(Default)]
+struct KeysDown(HashSet<u16>);
+
+impl KeysDown {
+    fn down(&mut self, vk: u16) {
+        self.0.insert(vk);
+    }
+
+    /// A key went up. While a hotkey field captures, a key-up without its key-down (another
+    /// app's `RegisterHotKey` took that) is returned as the press it stands for.
+    fn up(&mut self, vk: u16, capturing: bool, mods: Modifiers) -> Option<KeyPress> {
+        let press = capturing
+            .then(|| capture_key_up(&self.0, vk, mods))
+            .flatten();
+        self.0.remove(&vk);
+        press
+    }
+
+    /// Focus left the window: key-ups may arrive elsewhere.
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// The modifier keys held now, as this thread's input state sees them.
+fn modifiers_now() -> Modifiers {
+    // SAFETY: plain FFI reading this thread's key state.
+    let down = |vk: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(vk.0)) } < 0;
+    Modifiers {
+        ctrl: down(VK_CONTROL),
+        alt: down(VK_MENU),
+        shift: down(VK_SHIFT),
+        win: down(VK_LWIN) || down(VK_RWIN),
+    }
 }
 
 /// One Win32 input message, already converted to DIPs.
@@ -325,6 +365,9 @@ struct Host {
     /// Commands of the last frame, painted by `WM_PAINT`.
     cmds: Vec<Cmd>,
     cursor: CursorKind,
+    /// The last frame had a hotkey field listening (`Frame::capturing_keys`).
+    capturing_keys: bool,
+    keys: KeysDown,
     blink_on: bool,
     /// Whether `TrackMouseEvent` is armed for the next `WM_MOUSELEAVE`.
     tracking: bool,
@@ -392,6 +435,7 @@ impl Host {
         };
         self.cmds = frame.cmds;
         self.cursor = frame.cursor;
+        self.capturing_keys = frame.capturing_keys;
         // SAFETY (timers and cursor): plain FFI on our own window.
         unsafe {
             if frame.wants_caret_blink != self.blink_on {
@@ -705,20 +749,46 @@ fn handle(shared: &Shared, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             LRESULT(0)
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
-            let down = |vk: VIRTUAL_KEY| unsafe { GetKeyState(i32::from(vk.0)) } < 0;
+            let vk = wparam.0 as u16;
+            let capturing = shared.with_host(|h| {
+                h.keys.down(vk);
+                h.capturing_keys
+            });
+            let m = modifiers_now();
             shared.event(Event::Key(KeyPress {
-                key: vk_to_key(wparam.0 as u16),
-                ctrl: down(VK_CONTROL),
-                alt: down(VK_MENU),
-                shift: down(VK_SHIFT),
-                win: down(VK_LWIN) || down(VK_RWIN),
+                key: vk_to_key(vk),
+                ctrl: m.ctrl,
+                alt: m.alt,
+                shift: m.shift,
+                win: m.win,
             }));
-            if msg == WM_SYSKEYDOWN {
-                // Alt+F4 and the system menu.
+            if msg == WM_SYSKEYDOWN && capturing != Some(true) {
+                // Alt+F4 and the system menu, except while a hotkey is being captured.
                 default()
             } else {
                 LRESULT(0)
             }
+        }
+        WM_KEYUP | WM_SYSKEYUP => {
+            let vk = wparam.0 as u16;
+            let m = modifiers_now();
+            let found =
+                shared.with_host(|h| (h.keys.up(vk, h.capturing_keys, m), h.capturing_keys));
+            let (press, capturing) = found.unwrap_or((None, false));
+            if let Some(k) = press {
+                shared.event(Event::Key(k));
+            }
+            if msg == WM_SYSKEYUP && !capturing {
+                default()
+            } else {
+                LRESULT(0)
+            }
+        }
+        // While capturing, Alt+letter must not beep or open a menu.
+        WM_SYSCHAR if shared.with_host(|h| h.capturing_keys) == Some(true) => LRESULT(0),
+        WM_KILLFOCUS => {
+            shared.with_host(|h| h.keys.clear());
+            default()
         }
         WM_CHAR => {
             shared.event(Event::Char(wparam.0 as u16));
@@ -909,6 +979,8 @@ impl UiWindow {
                 opened: Instant::now(),
                 cmds: Vec::new(),
                 cursor: CursorKind::Arrow,
+                capturing_keys: false,
+                keys: KeysDown::default(),
                 blink_on: false,
                 tracking: false,
             };
@@ -1062,6 +1134,35 @@ mod tests {
         let r = catch_unwind(|| as_ui_frame(|| panic!("frame bug")));
         assert!(r.is_err());
         assert!(!in_ui_frame());
+    }
+
+    #[test]
+    fn key_up_without_down_is_a_press_only_while_capturing() {
+        let mods = Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Modifiers::default()
+        };
+        let mut keys = KeysDown::default();
+        // Not capturing: key-ups are not presses.
+        assert_eq!(keys.up(0x4B, false, mods), None);
+        // A key-down this window saw: its key-up is not a second press.
+        keys.down(0x4B);
+        assert_eq!(keys.up(0x4B, true, mods), None);
+        // Another app took the key-down.
+        assert_eq!(
+            keys.up(0x4B, true, mods),
+            Some(KeyPress {
+                key: UiKey::Other(0x4B),
+                ctrl: true,
+                alt: true,
+                shift: false,
+                win: false,
+            })
+        );
+        keys.down(0x4C);
+        keys.clear();
+        assert!(keys.up(0x4C, true, mods).is_some(), "cleared on focus loss");
     }
 
     #[test]

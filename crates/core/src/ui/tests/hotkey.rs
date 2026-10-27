@@ -178,3 +178,22 @@ fn hotkey_field_width_matches_the_drawn_field() {
         assert_eq!(w, drawn, "{cap:?}");
     }
 }
+
+#[test]
+fn click_reports_capture_start_and_frame_says_capturing() {
+    let mut st = UiState::default();
+    let mut cap = HotkeyCapture::Idle;
+    for input in [hover(10.0, 14.0), hover(10.0, 14.0), press(10.0, 14.0)] {
+        let (ev, f) = run(&mut st, &input, &mut cap);
+        assert_eq!(ev, HotkeyFieldEvent::None);
+        assert!(!f.capturing_keys);
+    }
+    let (ev, f) = run(&mut st, &release(10.0, 14.0), &mut cap);
+    assert_eq!(ev, HotkeyFieldEvent::Started);
+    assert!(f.capturing_keys);
+    let (ev, f) = run(&mut st, &Input::default(), &mut cap);
+    assert_eq!(ev, HotkeyFieldEvent::None, "reported once");
+    assert!(f.capturing_keys);
+    let (_, f) = run(&mut st, &with_keys(vec![key(UiKey::Esc)]), &mut cap);
+    assert!(!f.capturing_keys);
+}

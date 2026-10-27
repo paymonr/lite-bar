@@ -77,6 +77,9 @@ pub enum UiAction {
     /// `HotkeyCapture::rejected(..)`.
     ProposeHotkey(Hotkey),
     OpenStatsFolder,
+    /// Hotkey capture began: release the toggle hotkey until capture ends
+    /// (`ProposeHotkey`, `CancelHotkeyCapture` or the window closing).
+    StartHotkeyCapture,
     CancelHotkeyCapture,
 }
 

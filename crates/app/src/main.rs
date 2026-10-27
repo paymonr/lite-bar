@@ -206,6 +206,8 @@ mod app {
         save: SaveDebounce,
         /// Changes not yet written to the settings file, in order.
         unsaved: Vec<SettingsChange>,
+        /// The toggle hotkey is unregistered while the window's capture field listens.
+        hotkey_released: bool,
     }
 
     impl App {
@@ -842,6 +844,7 @@ mod app {
             settings_ui: None,
             save: SaveDebounce::default(),
             unsaved: Vec::new(),
+            hotkey_released: false,
         };
         app.register_hotkey();
         if start_visible {
@@ -874,6 +877,7 @@ mod app {
     mod tests {
         use super::*;
         use crate::test_util::TempDir;
+        use lite_bar_core::hotkey::Hotkey;
         use lite_bar_core::settings_ui::UiAction;
         use std::time::Duration;
 
@@ -920,6 +924,7 @@ mod app {
                 settings_ui: None,
                 save: SaveDebounce::default(),
                 unsaved: Vec::new(),
+                hotkey_released: false,
             };
             (app, owner)
         }
@@ -1442,6 +1447,98 @@ mod app {
             unsafe {
                 let _ = DestroyWindow(hwnd);
             }
+        }
+
+        /// Whether another window could register `hk` right now (it is released again).
+        fn hotkey_is_free(hk: Hotkey) -> bool {
+            let probe = create_owner_window().unwrap();
+            let free = matches!(
+                hotkeys::register(probe.0, HotkeyId::ToggleOverlay, hk),
+                Registration::Ok
+            );
+            hotkeys::unregister(probe.0, HotkeyId::ToggleOverlay);
+            free
+        }
+
+        #[test]
+        fn hotkey_capture_releases_the_toggle_hotkey_until_it_ends() {
+            let dir = TempDir::new("settings-capture");
+            let (mut app, _owner) = test_app(dir.path());
+            let hk: Hotkey = "Ctrl+Alt+Shift+F22".parse().unwrap();
+            app.settings.hotkeys.toggle_overlay = hk;
+            app.register_hotkey();
+            assert!(app.hotkey_ok && !hotkey_is_free(hk));
+            app.open_settings_hidden();
+
+            let ends = [UiAction::CancelHotkeyCapture, UiAction::ProposeHotkey(hk)];
+            for end in ends {
+                app.apply_ui_action(UiAction::StartHotkeyCapture);
+                assert!(hotkey_is_free(hk), "released while capturing");
+                app.apply_ui_action(end.clone());
+                assert!(!hotkey_is_free(hk), "held again after {end:?}");
+                assert!(app.hotkey_ok);
+            }
+            app.apply_ui_action(UiAction::StartHotkeyCapture);
+            app.close_settings_window();
+            assert!(!hotkey_is_free(hk), "held again after close");
+            hotkeys::unregister(app.hwnd, HotkeyId::ToggleOverlay);
+        }
+
+        #[test]
+        fn hotkey_capture_ends_when_the_window_is_closed_with_x() {
+            let dir = TempDir::new("settings-capture-x");
+            let (mut app, _owner) = test_app(dir.path());
+            let hk: Hotkey = "Ctrl+Alt+Shift+F21".parse().unwrap();
+            app.settings.hotkeys.toggle_overlay = hk;
+            app.register_hotkey();
+            app.open_settings_hidden();
+            app.apply_ui_action(UiAction::StartHotkeyCapture);
+            app.settings_ui.as_ref().unwrap().send_close();
+            app.drain_settings_actions();
+            assert!(!hotkey_is_free(hk));
+            hotkeys::unregister(app.hwnd, HotkeyId::ToggleOverlay);
+        }
+
+        #[test]
+        fn capture_takes_a_key_up_whose_key_down_never_arrived() {
+            use windows::Win32::UI::WindowsAndMessaging::{
+                WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+            };
+            const NEEDS_MODIFIER: &str =
+                "Add Ctrl, Alt or Win (Shift alone only works with F-keys)";
+            let error = lite_bar_core::ui::theme::ERROR;
+            let dir = TempDir::new("settings-keyup");
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            let ui = app.settings_ui.as_ref().unwrap();
+            ui.paint();
+            let s = ui.scale();
+            // F5 alone (no modifier) is refused with a message, which shows it was taken.
+            ui.send_msg(WM_KEYUP, 0x74, 0);
+            ui.paint();
+            assert!(
+                ui.find_text_px(NEEDS_MODIFIER, error).is_none(),
+                "not capturing"
+            );
+            let mid = at((450.0 * s) as i32, (400.0 * s) as i32);
+            ui.send_msg(WM_MOUSEMOVE, 0, mid);
+            let cap = |ui: &SettingsUi| ui.find_text_px("Ctrl", lite_bar_core::ui::theme::TEXT);
+            for _ in 0..40 {
+                if cap(ui).is_some_and(|(_, y)| y > (200.0 * s) as i32 && y < (600.0 * s) as i32) {
+                    break;
+                }
+                ui.send_msg(WM_MOUSEWHEEL, ((-120i16) as u16 as usize) << 16, mid);
+                ui.paint();
+            }
+            let (x, y) = cap(ui).expect("the hotkey field");
+            ui.send_msg(WM_MOUSEMOVE, 0, at(x, y));
+            ui.send_msg(WM_LBUTTONDOWN, 1, at(x, y));
+            ui.send_msg(WM_LBUTTONUP, 0, at(x, y));
+            ui.paint();
+            ui.send_msg(WM_KEYUP, 0x74, 0);
+            ui.paint();
+            assert!(ui.find_text_px(NEEDS_MODIFIER, error).is_some());
+            app.close_settings_window();
         }
     }
 }

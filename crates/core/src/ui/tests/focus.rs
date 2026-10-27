@@ -144,3 +144,12 @@ fn a_focused_hotkey_field_does_not_blink() {
     assert!(cap.is_listening());
     assert!(!fr.wants_caret_blink);
 }
+
+#[test]
+fn tab_into_the_hotkey_field_reports_capture_start() {
+    let mut f = Form::new();
+    f.click_a();
+    f.run(&tab(true));
+    let ev = f.run(&Input::default());
+    assert_eq!(ev.hk, HotkeyFieldEvent::Started);
+}
