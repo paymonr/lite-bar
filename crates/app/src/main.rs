@@ -12,6 +12,9 @@ mod game_lookup;
 #[cfg(windows)]
 mod hotkeys;
 #[cfg(windows)]
+#[allow(dead_code)] // wired in Task 3
+mod http;
+#[cfg(windows)]
 mod log;
 #[cfg(windows)]
 mod overlay;

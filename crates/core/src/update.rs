@@ -113,7 +113,7 @@ pub fn newer_release(current: &Version, latest: &ReleaseInfo) -> bool {
 pub fn parse_sha256_file(text: &str) -> Option<[u8; 32]> {
     let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let token = text.split_whitespace().next()?;
-    if token.len() != 64 || !token.is_ascii() {
+    if token.len() != 64 || !token.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     let mut out = [0u8; 32];
@@ -274,6 +274,7 @@ mod tests {
         assert_eq!(parse_sha256_file(&hex[..63]), None);
         assert_eq!(parse_sha256_file(&format!("{hex}0")), None);
         assert_eq!(parse_sha256_file(&hex.replace('b', "g")), None);
+        assert_eq!(parse_sha256_file(&format!("+{}", &hex[1..])), None);
     }
 
     #[test]
