@@ -2,6 +2,8 @@
 
 use std::cell::Cell;
 
+use lite_bar_core::update::Version;
+
 use windows::core::{Error, PCWSTR};
 use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::Graphics::Gdi::{
@@ -33,6 +35,7 @@ pub enum MenuItem {
     OpenGameStats,
     ReloadSettings,
     RestartAsAdmin,
+    InstallUpdate,
     Quit,
 }
 
@@ -41,6 +44,8 @@ pub struct TrayMenuState {
     pub toggle_hotkey: String,
     pub toggle_available: bool,
     pub needs_admin: bool,
+    /// A newer release can be installed.
+    pub update_available: Option<Version>,
 }
 
 /// Index of the bold default entry (Settings…), the one a double-click opens.
@@ -74,6 +79,9 @@ pub fn menu_labels(state: &TrayMenuState) -> Vec<(MenuItem, String)> {
             MenuItem::RestartAsAdmin,
             "Restart as administrator to show FPS".to_owned(),
         ));
+    }
+    if let Some(v) = &state.update_available {
+        items.push((MenuItem::InstallUpdate, format!("Update to v{v}…")));
     }
     items.push((MenuItem::Quit, "Quit".to_owned()));
     items
@@ -302,6 +310,7 @@ mod tests {
             toggle_hotkey: "Ctrl+Alt+Shift+L".into(),
             toggle_available: true,
             needs_admin: false,
+            update_available: None,
         };
         let l = menu_labels(&s);
         assert_eq!(l[0], (MenuItem::OpenSettings, "Settings…".into()));
@@ -325,6 +334,7 @@ mod tests {
             toggle_hotkey: "Ctrl+Alt+Shift+L".into(),
             toggle_available: false,
             needs_admin: true,
+            update_available: None,
         };
         let l = menu_labels(&s);
         assert_eq!(l[1].1, "Show FPS overlay\t(Ctrl+Alt+Shift+L unavailable)");
@@ -341,6 +351,7 @@ mod tests {
             toggle_hotkey: "Ctrl+Alt+Shift+L".into(),
             toggle_available: true,
             needs_admin: true,
+            update_available: None,
         };
         let items: Vec<MenuItem> = menu_labels(&s).into_iter().map(|(m, _)| m).collect();
         assert_eq!(
@@ -355,6 +366,57 @@ mod tests {
                 MenuItem::Quit
             ]
         );
+    }
+
+    fn state_with_update(needs_admin: bool) -> TrayMenuState {
+        TrayMenuState {
+            overlay_visible: true,
+            toggle_hotkey: "Ctrl+Alt+Shift+L".into(),
+            toggle_available: true,
+            needs_admin,
+            update_available: Some("0.5.0".parse().unwrap()),
+        }
+    }
+
+    #[test]
+    fn update_note_sits_directly_above_quit() {
+        let l = menu_labels(&state_with_update(false));
+        let n = l.len();
+        assert_eq!(
+            l[n - 2],
+            (MenuItem::InstallUpdate, "Update to v0.5.0…".into())
+        );
+        assert_eq!(l[n - 1].0, MenuItem::Quit);
+    }
+
+    #[test]
+    fn menu_order_with_an_update() {
+        let items: Vec<MenuItem> = menu_labels(&state_with_update(true))
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
+        assert_eq!(
+            items,
+            vec![
+                MenuItem::OpenSettings,
+                MenuItem::ToggleOverlay,
+                MenuItem::OpenSettingsFile,
+                MenuItem::OpenGameStats,
+                MenuItem::ReloadSettings,
+                MenuItem::RestartAsAdmin,
+                MenuItem::InstallUpdate,
+                MenuItem::Quit
+            ]
+        );
+    }
+
+    #[test]
+    fn no_update_note_without_an_update() {
+        let mut s = state_with_update(true);
+        s.update_available = None;
+        assert!(!menu_labels(&s)
+            .iter()
+            .any(|(m, _)| *m == MenuItem::InstallUpdate));
     }
 
     #[test]

@@ -80,7 +80,14 @@ fn check(f: &Frame, w: f32, h: f32, scroll: f32) {
 
 /// Scrolls through the whole page, checking every frame.
 fn check_size(w: f32, h: f32) {
+    for state in all_update_states() {
+        check_size_with(w, h, state);
+    }
+}
+
+fn check_size_with(w: f32, h: f32, update: UpdateState) {
     let mut p = Page::with_measure(Rect::new(0.0, 0.0, w, h), &CONSERVATIVE);
+    p.update = update;
     p.games.push(game(
         "C:\\Games\\Some Very Long Game Folder\\a-game-with-a-really-long-name.exe",
         "A Game With A Really Quite Long Name",
@@ -91,6 +98,7 @@ fn check_size(w: f32, h: f32) {
     let max = (p.view.content_h - (h - 150.0)).max(0.0) + 200.0;
     let mut scroll = 0.0;
     let mut seen_restore = false;
+    let mut seen_updates = false;
     while scroll <= max {
         p.st.scroll.insert(id("settings.scroll"), scroll);
         p.idle();
@@ -98,9 +106,11 @@ fn check_size(w: f32, h: f32) {
         assert!(!f.hits.is_empty());
         check(f, w, h, scroll);
         seen_restore |= find_text(f, "Restore defaults").is_some();
+        seen_updates |= find_text(f, "Check now").is_some();
         scroll += 60.0;
     }
     assert!(seen_restore);
+    assert!(seen_updates);
 }
 
 #[test]

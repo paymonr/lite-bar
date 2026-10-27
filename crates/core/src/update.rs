@@ -2,6 +2,7 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::time::Duration;
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -128,8 +129,10 @@ pub fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub enum UpdateState {
+    /// No check has finished yet.
+    #[default]
     Idle,
     Checking,
     UpToDate,
@@ -149,6 +152,98 @@ impl UpdateState {
             UpdateState::Downloading(r) => format!("Downloading v{}…", r.version),
             UpdateState::Failed(why) => format!("Update failed: {why}"),
             UpdateState::CheckFailed => "Couldn't check for updates".into(),
+        }
+    }
+}
+
+/// The first automatic check runs this long after start (or after checks are turned on).
+pub const FIRST_CHECK_DELAY: Duration = Duration::from_secs(30);
+/// Then one every this long.
+pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckStart {
+    /// Start a check now.
+    Started,
+    /// A check is already running; its result answers this one too.
+    AlreadyRunning,
+}
+
+/// When update checks run. Times are any monotonic clock (`now` since some start). Pure:
+/// the app arms a timer for `next_due` and calls `poll` when it fires.
+#[derive(Clone, Debug)]
+pub struct UpdateSchedule {
+    enabled: bool,
+    /// The next automatic check, while checks are on and none runs.
+    next_due: Option<Duration>,
+    running: bool,
+    /// An automatic check came due while a check ran: that check served it, so the
+    /// schedule restarts from its end.
+    served_due: bool,
+}
+
+impl UpdateSchedule {
+    pub fn new(enabled: bool, now: Duration) -> Self {
+        UpdateSchedule {
+            enabled,
+            next_due: enabled.then(|| now + FIRST_CHECK_DELAY),
+            running: false,
+            served_due: false,
+        }
+    }
+
+    /// The `[updates] check` setting changed (or was set again, which changes nothing).
+    pub fn set_enabled(&mut self, enabled: bool, now: Duration) {
+        if enabled == self.enabled {
+            return;
+        }
+        self.enabled = enabled;
+        self.served_due = false;
+        self.next_due = enabled.then(|| now + FIRST_CHECK_DELAY);
+    }
+
+    pub fn next_due(&self) -> Option<Duration> {
+        if self.running {
+            None
+        } else {
+            self.next_due
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.running
+    }
+
+    /// Returns whether an automatic check should start now.
+    pub fn poll(&mut self, now: Duration) -> bool {
+        let due = self.enabled && self.next_due.is_some_and(|at| now >= at);
+        if !due {
+            return false;
+        }
+        self.next_due = None;
+        if self.running {
+            self.served_due = true;
+            return false;
+        }
+        self.running = true;
+        self.served_due = true;
+        true
+    }
+
+    /// "Check now": runs whether or not checks are on, and leaves the schedule alone.
+    pub fn check_now(&mut self) -> CheckStart {
+        if self.running {
+            return CheckStart::AlreadyRunning;
+        }
+        self.running = true;
+        CheckStart::Started
+    }
+
+    /// The running check ended (with any result).
+    pub fn finished(&mut self, now: Duration) {
+        self.running = false;
+        if std::mem::take(&mut self.served_due) && self.enabled {
+            self.next_due = Some(now + CHECK_INTERVAL);
         }
     }
 }
@@ -284,6 +379,103 @@ mod tests {
             hex,
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    const DAY: u64 = 24 * 60 * 60;
+
+    #[test]
+    fn first_check_is_30s_after_start_then_daily() {
+        let mut s = UpdateSchedule::new(true, secs(0));
+        assert_eq!(s.next_due(), Some(secs(30)));
+        assert!(!s.poll(secs(29)));
+        assert!(s.poll(secs(30)));
+        assert_eq!(s.next_due(), None, "nothing is due while it runs");
+        s.finished(secs(32));
+        assert_eq!(s.next_due(), Some(secs(32 + DAY)));
+        assert!(!s.poll(secs(31 + DAY)));
+        assert!(s.poll(secs(32 + DAY)));
+    }
+
+    #[test]
+    fn toggle_off_means_no_automatic_check() {
+        let mut s = UpdateSchedule::new(false, secs(0));
+        assert_eq!(s.next_due(), None);
+        assert!(!s.poll(secs(30)));
+        assert!(!s.poll(secs(10 * DAY)));
+        // Turned off before the first check: cancelled.
+        let mut s = UpdateSchedule::new(true, secs(0));
+        s.set_enabled(false, secs(10));
+        assert_eq!(s.next_due(), None);
+        assert!(!s.poll(secs(30)));
+    }
+
+    #[test]
+    fn turning_checks_on_schedules_one_30s_later() {
+        let mut s = UpdateSchedule::new(false, secs(0));
+        s.set_enabled(true, secs(100));
+        assert_eq!(s.next_due(), Some(secs(130)));
+        assert!(s.poll(secs(130)));
+    }
+
+    #[test]
+    fn setting_the_same_value_keeps_the_schedule() {
+        let mut s = UpdateSchedule::new(true, secs(0));
+        assert!(s.poll(secs(30)));
+        s.finished(secs(30));
+        s.set_enabled(true, secs(500));
+        assert_eq!(s.next_due(), Some(secs(30 + DAY)));
+    }
+
+    #[test]
+    fn check_now_always_runs_and_ignores_the_schedule() {
+        let mut s = UpdateSchedule::new(false, secs(0));
+        assert_eq!(s.check_now(), CheckStart::Started);
+        s.finished(secs(5));
+        assert_eq!(s.next_due(), None, "still off");
+        let mut s = UpdateSchedule::new(true, secs(0));
+        assert_eq!(s.check_now(), CheckStart::Started);
+        s.finished(secs(5));
+        assert_eq!(s.next_due(), Some(secs(30)), "the schedule is untouched");
+    }
+
+    #[test]
+    fn only_one_check_at_a_time() {
+        let mut s = UpdateSchedule::new(true, secs(0));
+        assert!(s.poll(secs(30)));
+        assert_eq!(s.check_now(), CheckStart::AlreadyRunning);
+        assert!(!s.poll(secs(40)));
+        s.finished(secs(41));
+        assert_eq!(s.check_now(), CheckStart::Started);
+        assert_eq!(s.check_now(), CheckStart::AlreadyRunning);
+    }
+
+    #[test]
+    fn a_check_due_during_check_now_is_served_by_it() {
+        let mut s = UpdateSchedule::new(true, secs(0));
+        assert_eq!(s.check_now(), CheckStart::Started);
+        assert!(!s.poll(secs(30)), "no second check");
+        s.finished(secs(33));
+        assert_eq!(s.next_due(), Some(secs(33 + DAY)));
+    }
+
+    #[test]
+    fn turned_off_while_running_schedules_nothing() {
+        let mut s = UpdateSchedule::new(true, secs(0));
+        assert!(s.poll(secs(30)));
+        s.set_enabled(false, secs(31));
+        s.finished(secs(32));
+        assert_eq!(s.next_due(), None);
+        // On again while a check runs: the next one is 30 s after turning on.
+        let mut s = UpdateSchedule::new(false, secs(0));
+        assert_eq!(s.check_now(), CheckStart::Started);
+        s.set_enabled(true, secs(10));
+        assert!(!s.poll(secs(40)), "busy");
+        s.finished(secs(41));
+        assert_eq!(s.next_due(), Some(secs(41 + DAY)));
     }
 
     #[test]

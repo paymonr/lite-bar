@@ -20,8 +20,11 @@ use lite_bar_core::game_name::find_override;
 use lite_bar_core::hotkey::Hotkey;
 use lite_bar_core::settings::Settings;
 use lite_bar_core::settings_edit::apply_change;
-use lite_bar_core::settings_ui::{settings_frame, GameRow, SettingsView, UiAction, MIN_WINDOW_DIP};
+use lite_bar_core::settings_ui::{
+    settings_frame, GameRow, SettingsView, UiAction, UpdatesInput, MIN_WINDOW_DIP,
+};
 use lite_bar_core::ui::{HotkeyCapture, Ui};
+use lite_bar_core::update::{current_version, UpdateState};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
@@ -173,6 +176,8 @@ struct WindowState {
     save_error: Option<String>,
     /// A rejected hotkey proposal, put into the capture field by the next frame.
     reject: Option<String>,
+    /// What the Updates section shows.
+    update: UpdateState,
     queue: ActionQueue,
 }
 
@@ -208,6 +213,10 @@ impl UiApp for SettingsPage {
             &games,
             st.status.as_deref(),
             st.save_error.as_deref(),
+            UpdatesInput {
+                state: &st.update,
+                current: current_version(),
+            },
         );
         // The page shows its own changes right away; the app applies them for real.
         for a in &actions {
@@ -348,6 +357,22 @@ impl SettingsUi {
         st.save_error = msg.map(str::to_string);
         drop(st);
         self.window.request_redraw();
+    }
+
+    /// Shows the update state in the Updates section.
+    pub fn set_update(&self, state: &UpdateState) {
+        let mut st = self.state.borrow_mut();
+        if st.update == *state {
+            return;
+        }
+        st.update = state.clone();
+        drop(st);
+        self.window.request_redraw();
+    }
+
+    #[cfg(test)]
+    pub fn update_state(&self) -> UpdateState {
+        self.state.borrow().update.clone()
     }
 
     /// Shows a refused hotkey in the capture field and the status line.

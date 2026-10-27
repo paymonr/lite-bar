@@ -12,7 +12,6 @@ mod game_lookup;
 #[cfg(windows)]
 mod hotkeys;
 #[cfg(windows)]
-#[allow(dead_code)] // wired in Task 3
 mod http;
 #[cfg(windows)]
 mod log;
@@ -36,6 +35,8 @@ mod tray;
 mod ui_host;
 #[cfg(windows)]
 mod ui_paint;
+#[cfg(windows)]
+mod updater;
 
 #[cfg(windows)]
 use app::run;
@@ -54,10 +55,11 @@ mod app {
     use std::any::Any;
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     use lite_bar_core::fps::{FocusClock, FpsTracker};
     use lite_bar_core::game_name::{display_name, is_known_non_game};
@@ -68,6 +70,7 @@ mod app {
     };
     use lite_bar_core::settings::{Settings, StatsLayout};
     use lite_bar_core::settings_edit::SettingsChange;
+    use lite_bar_core::update::{UpdateSchedule, UpdateState};
     use windows::core::{w, HSTRING};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -84,6 +87,7 @@ mod app {
     };
 
     mod settings;
+    mod updates;
 
     use crate::elevation::{is_elevated, relaunch_as_admin};
     use crate::etw::{anchored_focus_clock, offers_admin, CaptureError, PresentCapture};
@@ -97,6 +101,7 @@ mod app {
     use crate::single_instance::{acquire_single_instance, InstanceGuard};
     use crate::stats_files::{list_games, local_now, StatsWriter};
     use crate::tray::{MenuItem, Tray, TrayMenuState, WM_TRAY};
+    use crate::updater::{take_result, CheckResult, LATEST_URL, WM_UPDATE_RESULT};
     use crate::{log, tray};
 
     const MUTEX_NAME: &str = "Local\\LiteBar.SingleInstance";
@@ -104,6 +109,8 @@ mod app {
     const TIMER_MS: u32 = 250;
     /// Owner-window timer that writes the settings file once the save debounce is due.
     const SAVE_TIMER_ID: usize = 2;
+    /// Owner-window timer for the next automatic update check.
+    const UPDATE_TIMER_ID: usize = 3;
     const SETTINGS_FILE: &str = "settings.toml";
     /// Subfolder of the app dir holding `games.toml`, `games.csv` and `sessions.csv`.
     const STATS_DIR: &str = "stats";
@@ -118,16 +125,23 @@ mod app {
         static MENU_OPEN: Cell<bool> = const { Cell::new(false) };
         /// Id of the registered "TaskbarCreated" broadcast.
         static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
+        /// An update check result taken from its message, until the app can apply it.
+        static PENDING_UPDATE: RefCell<Option<CheckResult>> = const { RefCell::new(None) };
     }
 
     /// Runs `f` on the app state, if it exists and is not already borrowed (re-entrancy).
-    /// Afterwards applies whatever the settings window queued, so a nudge that arrived while
-    /// the app was busy is never lost.
+    /// Afterwards applies whatever the settings window queued and an update check result
+    /// that is waiting, so a nudge or a result that arrived while the app was busy is never
+    /// lost.
     fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
         APP.with(|app| {
             let mut guard = app.try_borrow_mut().ok()?;
             let app = guard.as_mut()?;
+            // Before `f`, so it sees the latest state, and after, for one that arrived
+            // while `f` pumped messages.
+            app.apply_pending_update();
             let r = f(app);
+            app.apply_pending_update();
             app.drain_settings_actions();
             Some(r)
         })
@@ -213,15 +227,31 @@ mod app {
         hotkey_released: bool,
         /// Why the last settings save failed (shown in the window), until one works.
         save_error: Option<&'static str>,
+        /// What the last update check found (shown in the tray and the window).
+        update: UpdateState,
+        /// When update checks run; times are `clock.elapsed()`.
+        update_schedule: UpdateSchedule,
+        /// Where checks ask for the latest release (a local stub in tests).
+        latest_url: String,
     }
 
     impl App {
+        fn apply_pending_update(&mut self) {
+            if let Some(result) = PENDING_UPDATE.take() {
+                self.on_update_result(result);
+            }
+        }
+
         fn menu_state(&self) -> TrayMenuState {
             TrayMenuState {
                 overlay_visible: self.overlay_on,
                 toggle_hotkey: self.settings.hotkeys.toggle_overlay.to_string(),
                 toggle_available: self.hotkey_ok,
                 needs_admin: self.needs_admin,
+                update_available: match &self.update {
+                    UpdateState::Available(r) => Some(r.version),
+                    _ => None,
+                },
             }
         }
 
@@ -456,6 +486,7 @@ mod app {
             self.overlay.set_settings(&settings.overlay);
             self.overlay.redraw();
             self.settings = settings;
+            self.sync_update_schedule();
             self.writer.flush(&self.settings.game_names);
             if let Some(ui) = &self.settings_ui {
                 ui.set_games(list_games(self.writer.stats_dir()));
@@ -464,7 +495,7 @@ mod app {
         }
 
         fn open_settings_file(&self) {
-            shell_open(&self.dir.join("settings.toml"), "settings file");
+            shell_open(self.dir.join("settings.toml"), "settings file");
         }
 
         fn open_game_stats(&self) {
@@ -519,6 +550,7 @@ mod app {
                         quit();
                     }
                 }
+                MenuItem::InstallUpdate => self.install_update(),
                 MenuItem::Quit => {
                     self.close_settings_window();
                     quit();
@@ -565,9 +597,9 @@ mod app {
         }
     }
 
-    /// Opens `path` (a file or a folder) in its default program.
-    fn shell_open(path: &Path, what: &str) {
-        let path = HSTRING::from(path.as_os_str());
+    /// Opens `target` (a file, a folder or a web page) in its default program.
+    fn shell_open(target: impl AsRef<OsStr>, what: &str) {
+        let path = HSTRING::from(target.as_ref());
         // SAFETY: valid NUL-terminated strings for the duration of the call.
         let result = unsafe { ShellExecuteW(None, w!("open"), &path, None, None, SW_SHOWNORMAL) };
         if result.0 as usize <= 32 {
@@ -698,6 +730,18 @@ mod app {
                 with_app(|app| app.on_save_timer(Instant::now()));
                 return LRESULT(0);
             }
+            WM_TIMER if wparam.0 == UPDATE_TIMER_ID => {
+                with_app(|app| app.on_update_timer(app.clock.elapsed()));
+                return LRESULT(0);
+            }
+            WM_UPDATE_RESULT => {
+                // SAFETY: posted by `updater::post_result`; each message is taken once.
+                let result = unsafe { take_result(lparam) };
+                // Applied by `with_app`, now or after whatever has the app borrowed.
+                PENDING_UPDATE.set(Some(result));
+                with_app(|_| ());
+                return LRESULT(0);
+            }
             WM_SETTINGS_ACTIONS => {
                 // `with_app` drains the window's queue.
                 with_app(|_| ());
@@ -824,6 +868,7 @@ mod app {
         let overlay = Overlay::new(&settings.overlay)?;
 
         let start_visible = settings.overlay.visible;
+        let update_checks = settings.updates.check;
         let mut writer = StatsWriter::new(dir.join(STATS_DIR));
         // Writes what an earlier run saved in pending.toml.
         writer.flush(&settings.game_names);
@@ -852,7 +897,11 @@ mod app {
             unsaved: Vec::new(),
             hotkey_released: false,
             save_error: None,
+            update: UpdateState::Idle,
+            update_schedule: UpdateSchedule::new(update_checks, Duration::ZERO),
+            latest_url: LATEST_URL.to_string(),
         };
+        app.arm_update_timer();
         app.register_hotkey();
         if start_visible {
             app.start_overlay();
@@ -884,9 +933,11 @@ mod app {
     mod tests {
         use super::*;
         use crate::test_util::TempDir;
+        use crate::updater::post_result;
         use lite_bar_core::hotkey::Hotkey;
         use lite_bar_core::settings_ui::UiAction;
-        use std::time::Duration;
+        use lite_bar_core::update::ReleaseInfo;
+        use std::path::Path;
 
         #[test]
         fn panic_message_formats_str_payload_and_location() {
@@ -908,6 +959,7 @@ mod app {
             let owner = create_owner_window().unwrap();
             let (settings, _) = load_or_create_settings(dir);
             let overlay = Overlay::new(&settings.overlay).unwrap();
+            let checks = settings.updates.check;
             let app = App {
                 hwnd: owner.0,
                 dir: dir.to_path_buf(),
@@ -933,6 +985,10 @@ mod app {
                 unsaved: Vec::new(),
                 hotkey_released: false,
                 save_error: None,
+                update: UpdateState::Idle,
+                update_schedule: UpdateSchedule::new(checks, Duration::ZERO),
+                // A closed local port: tests never ask GitHub.
+                latest_url: "http://127.0.0.1:1/".to_string(),
             };
             (app, owner)
         }
@@ -1649,6 +1705,150 @@ mod app {
             app.close_settings_window_for_exit();
             assert!(app.settings_ui.is_none());
             assert!(hotkey_is_free(hk), "the new instance can register it");
+        }
+
+        fn release(version: &str) -> ReleaseInfo {
+            ReleaseInfo {
+                version: version.parse().unwrap(),
+                page_url: format!("https://github.com/paymonr/lite-bar/releases/tag/v{version}"),
+                exe_url: "e".into(),
+                sha_url: "s".into(),
+            }
+        }
+
+        /// Waits up to `timeout` for a `WM_UPDATE_RESULT` posted to `hwnd` and removes it.
+        fn wait_update_msg(hwnd: HWND, timeout: Duration) -> Option<MSG> {
+            use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_REMOVE};
+            let end = Instant::now() + timeout;
+            let mut msg = MSG::default();
+            while Instant::now() < end {
+                let got = unsafe {
+                    PeekMessageW(
+                        &mut msg,
+                        Some(hwnd),
+                        WM_UPDATE_RESULT,
+                        WM_UPDATE_RESULT,
+                        PM_REMOVE,
+                    )
+                };
+                if got.as_bool() {
+                    return Some(msg);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None
+        }
+
+        fn wait_update_result(hwnd: HWND, timeout: Duration) -> Option<CheckResult> {
+            wait_update_msg(hwnd, timeout).map(|m| unsafe { take_result(m.lParam) })
+        }
+
+        #[test]
+        fn fake_update_result_message_moves_the_state() {
+            let dir = TempDir::new("update-msg");
+            let (app, _owner) = test_app(dir.path());
+            let hwnd = app.hwnd;
+            APP.with(|slot| *slot.borrow_mut() = Some(app));
+            assert!(post_result(hwnd, Ok(release("99.0.0"))));
+            let msg = wait_update_msg(hwnd, Duration::from_secs(1)).unwrap();
+            unsafe { window_proc(hwnd, msg.message, msg.wParam, msg.lParam) };
+            let state = with_app(|app| app.update.clone()).unwrap();
+            assert_eq!(state, UpdateState::Available(release("99.0.0")));
+
+            // Arriving while the app is busy, it waits for the next `with_app`.
+            assert!(post_result(hwnd, Ok(release("0.0.1"))));
+            let msg = wait_update_msg(hwnd, Duration::from_secs(1)).unwrap();
+            APP.with(|slot| {
+                let _busy = slot.borrow_mut();
+                unsafe { window_proc(hwnd, msg.message, msg.wParam, msg.lParam) };
+            });
+            let state = with_app(|app| app.update.clone()).unwrap();
+            assert_eq!(state, UpdateState::UpToDate);
+            APP.with(|slot| slot.borrow_mut().take());
+        }
+
+        #[test]
+        fn update_state_shows_in_the_tray_and_the_window() {
+            let dir = TempDir::new("update-shown");
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            app.on_update_result(Ok(release("99.0.0")));
+            let avail = UpdateState::Available(release("99.0.0"));
+            assert_eq!(app.update, avail);
+            assert_eq!(
+                app.menu_state().update_available,
+                Some("99.0.0".parse().unwrap())
+            );
+            assert_eq!(app.settings_ui.as_ref().unwrap().update_state(), avail);
+            // A failed check keeps the note.
+            app.on_update_result(Err("offline".into()));
+            assert_eq!(app.update, avail);
+            app.on_update_result(Ok(release("0.0.1")));
+            assert_eq!(app.update, UpdateState::UpToDate);
+            assert_eq!(app.menu_state().update_available, None);
+            assert_eq!(
+                app.settings_ui.as_ref().unwrap().update_state(),
+                UpdateState::UpToDate
+            );
+            // A window opened later shows the state too.
+            app.close_settings_window();
+            app.on_update_result(Ok(release("99.0.0")));
+            app.open_settings_hidden();
+            assert_eq!(app.settings_ui.as_ref().unwrap().update_state(), avail);
+        }
+
+        #[test]
+        fn check_now_runs_with_checks_off_and_shows_checking() {
+            let dir = TempDir::new("update-check-now");
+            let (mut app, _owner) = test_app(dir.path());
+            app.apply_settings_change(SettingsChange::CheckUpdates(false));
+            app.apply_ui_action(UiAction::CheckForUpdates);
+            assert_eq!(app.update, UpdateState::Checking);
+            assert!(app.update_schedule.is_running());
+            // A second click starts no second check.
+            app.apply_ui_action(UiAction::CheckForUpdates);
+            // The worker asks a closed local port, so it fails.
+            let r = wait_update_result(app.hwnd, Duration::from_secs(10)).expect("a result");
+            assert!(r.is_err());
+            assert!(wait_update_result(app.hwnd, Duration::from_secs(3)).is_none());
+            app.on_update_result(r);
+            assert_eq!(app.update, UpdateState::CheckFailed);
+            assert!(!app.update_schedule.is_running());
+            assert_eq!(app.update_schedule.next_due(), None, "still off");
+        }
+
+        #[test]
+        fn background_check_keeps_the_shown_state() {
+            let dir = TempDir::new("update-background");
+            let (mut app, _owner) = test_app(dir.path());
+            let avail = UpdateState::Available(release("99.0.0"));
+            app.update = avail.clone();
+            app.on_update_timer(Duration::from_secs(29));
+            assert!(!app.update_schedule.is_running(), "not due yet");
+            app.on_update_timer(Duration::from_secs(31));
+            assert!(app.update_schedule.is_running());
+            assert_eq!(app.update, avail, "no Checking for a background check");
+            let r = wait_update_result(app.hwnd, Duration::from_secs(10)).expect("a result");
+            app.on_update_result(r);
+            assert_eq!(app.update, avail);
+            assert!(
+                app.update_schedule.next_due().is_some(),
+                "next one in a day"
+            );
+        }
+
+        #[test]
+        fn toggling_checks_schedules_and_cancels() {
+            let dir = TempDir::new("update-toggle");
+            let (mut app, _owner) = test_app(dir.path());
+            assert!(app.settings.updates.check);
+            assert!(app.update_schedule.next_due().is_some());
+            app.apply_settings_change(SettingsChange::CheckUpdates(false));
+            assert_eq!(app.update_schedule.next_due(), None);
+            app.apply_settings_change(SettingsChange::CheckUpdates(true));
+            let due = app.update_schedule.next_due().expect("scheduled");
+            let now = app.clock.elapsed();
+            assert!(due > now + Duration::from_secs(29) && due <= now + Duration::from_secs(30));
         }
 
         #[test]

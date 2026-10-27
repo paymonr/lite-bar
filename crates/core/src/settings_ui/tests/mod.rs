@@ -7,6 +7,7 @@ mod overlay;
 mod preview;
 mod restore;
 mod status;
+mod updates;
 
 use super::*;
 use crate::color::Rgb;
@@ -15,6 +16,7 @@ use crate::settings::{Location, StatsLayout, MAX_SAVED_COLORS};
 use crate::settings_edit::apply_change;
 use crate::ui::{id, theme, Cmd, Frame, Input, KeyPress, Pt, Rect, Rgba, TextMeasure, TextStyle};
 use crate::ui::{UiKey, UiState, PRESET_COLORS};
+use crate::update::{current_version, ReleaseInfo, UpdateState};
 
 /// Fixed-width text: `char_w` per char, lines `line` × the font size tall.
 struct Fake {
@@ -78,6 +80,7 @@ struct Page {
     games: Vec<GameRow>,
     status: Option<String>,
     save_error: Option<String>,
+    update: UpdateState,
     area: Rect,
     now: u64,
     last: Option<Frame>,
@@ -100,6 +103,7 @@ impl Page {
             ],
             status: None,
             save_error: None,
+            update: UpdateState::Idle,
             area,
             now: 0,
             last: None,
@@ -124,6 +128,10 @@ impl Page {
             &self.games,
             self.status.as_deref(),
             self.save_error.as_deref(),
+            UpdatesInput {
+                state: &self.update,
+                current: current_version(),
+            },
         );
         self.last = Some(ui.finish());
         for a in &actions {
@@ -335,4 +343,28 @@ fn click_field(p: &mut Page, shown: &str) {
         x: pos.x + 2.0,
         y: pos.y + 4.0,
     });
+}
+
+/// A release newer than this build.
+fn release() -> ReleaseInfo {
+    ReleaseInfo {
+        version: "0.5.0".parse().unwrap(),
+        page_url: "https://github.com/paymonr/lite-bar/releases/tag/v0.5.0".into(),
+        exe_url: "https://github.com/paymonr/lite-bar/releases/download/v0.5.0/lite-bar.exe".into(),
+        sha_url: "https://github.com/paymonr/lite-bar/releases/download/v0.5.0/lite-bar.exe.sha256"
+            .into(),
+    }
+}
+
+/// Every state the Updates section can show.
+fn all_update_states() -> Vec<UpdateState> {
+    vec![
+        UpdateState::Idle,
+        UpdateState::Checking,
+        UpdateState::UpToDate,
+        UpdateState::Available(release()),
+        UpdateState::Downloading(release()),
+        UpdateState::Failed("Can't update in this folder — download it from GitHub".into()),
+        UpdateState::CheckFailed,
+    ]
 }

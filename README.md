@@ -44,6 +44,7 @@ The tray menu, top to bottom:
 - **Open game stats** (see [Stats and history](#stats-and-history)).
 - **Reload settings** re-reads the settings file (and refreshes the settings window if it is open), keeping the current on/off state of the overlay.
 - **Restart as administrator to show FPS**, only when capture needs it.
+- **Update to v…**, only while a newer release is available (see [Updates](#updates)).
 - **Quit** (closes the settings window first, which saves its last changes).
 
 The overlay toggles with `Ctrl+Alt+Shift+L` by default.
@@ -55,10 +56,17 @@ The overlay toggles with `Ctrl+Alt+Shift+L` by default.
 - **Overlay**: show or hide the counter, its location on screen, and the statistics layout.
 - **Appearance**: number, text and background colors (hex fields, a color wheel, default chips and up to 16 saved colors; right-click a saved color to remove it), background opacity, counter size and text size.
 - **Hotkeys**: click the field and press the new combination; Esc cancels. A combination another app already holds is refused with "Already used by another app" and the old hotkey stays.
+- **Updates**: the **Check for updates** switch, **Check now** and the update status (see [Updates](#updates)).
 - **Game names**: rename any game you've played. The name is saved under `[game_names]` and `games.csv` is regenerated; **Open stats folder** opens the stats folder.
 - **Restore defaults** (click twice) puts every overlay setting and the hotkey back to how Lite Bar ships. Game names and saved colors are kept.
 
 The window takes about 10–20 MB while open; closing it frees all of it.
+
+### Updates
+
+Lite Bar asks GitHub whether a newer release exists. That request to `api.github.com` (the latest release of `paymonr/lite-bar`) is its only network traffic. It runs on a background thread about 30 s after Lite Bar starts and then every 24 h while it runs, only while **Check for updates** is on (`[updates] check`). Turning the switch on checks 30 s later; turning it off cancels the next check. **Check now** checks right away, even with the switch off.
+
+When a newer release is out, Settings shows "Update available: v…" with an **Update now** button and an **Open release page** link, and the tray menu gets **Update to v…** above **Quit**. Nothing pops up and nothing is downloaded or installed until you click **Update now** (installing arrives in the next update). A failed check is only logged; Settings shows "Couldn't check for updates" and the next scheduled check tries again.
 
 ### Files
 

@@ -93,6 +93,29 @@ impl Ui<'_> {
         self.styled_button(id, text, true)
     }
 
+    /// Text in the accent color that clicks like a button, underlined while hovered.
+    pub fn link(&mut self, id: Id, text: &str) -> bool {
+        let style = TextStyle::BODY;
+        let (tw, th) = self.measure.measure(text, style);
+        let rect = self.alloc(Some(tw), theme::CONTROL_HEIGHT);
+        let (hot, clicked) = self.interact(id, rect);
+        let color = if hot {
+            theme::ACCENT_HOT
+        } else {
+            theme::ACCENT
+        };
+        self.text_centered(rect, text, style, color);
+        if hot {
+            let y = rect.y + (rect.h + th) / 2.0;
+            self.cmds.push(Cmd::Fill {
+                rect: Rect::new(rect.x, y, tw, 1.0),
+                color,
+                radius: 0.0,
+            });
+        }
+        clicked
+    }
+
     fn styled_button(&mut self, id: Id, text: &str, accent: bool) -> bool {
         let style = if accent {
             TextStyle::BOLD

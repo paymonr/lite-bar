@@ -68,6 +68,7 @@ impl App {
         match open(self.hwnd, self.shown_settings(), games) {
             Ok(ui) => {
                 ui.set_save_error(self.save_error);
+                ui.set_update(&self.update);
                 self.settings_ui = Some(ui);
             }
             Err(e) => log::error(&format!("could not open the settings window: {e}")),
@@ -136,6 +137,9 @@ impl App {
                 }
             }
             UiAction::OpenStatsFolder => self.open_stats_folder(),
+            UiAction::CheckForUpdates => self.check_for_updates_now(),
+            UiAction::InstallUpdate => self.install_update(),
+            UiAction::OpenReleasePage => self.open_release_page(),
             UiAction::StartHotkeyCapture => self.start_hotkey_capture(),
             UiAction::CancelHotkeyCapture => {
                 if self.end_hotkey_capture() {
@@ -188,6 +192,9 @@ impl App {
             SettingsChange::GameName { .. } => {
                 self.writer.mark_games_csv_dirty();
                 self.writer.flush(&self.settings.game_names);
+            }
+            SettingsChange::CheckUpdates(_) | SettingsChange::RestoreDefaults => {
+                self.sync_update_schedule()
             }
             _ => {}
         }
