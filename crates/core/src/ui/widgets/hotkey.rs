@@ -92,6 +92,9 @@ impl Ui<'_> {
         }
         let tabbed_in =
             self.state.focused == Some(id) && std::mem::take(&mut self.state.focus_fresh);
+        if tabbed_in {
+            self.tab_focus_rect = Some(rect);
+        }
         if tabbed_in && !capture.is_listening() {
             capture.start();
             ev = HotkeyFieldEvent::Started;

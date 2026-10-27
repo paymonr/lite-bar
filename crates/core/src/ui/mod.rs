@@ -97,6 +97,9 @@ pub struct Ui<'a> {
     tab: Option<bool>,
     /// A hotkey field is listening for a combination.
     capturing_keys: bool,
+    /// Screen rect of the widget that took focus by Tab this frame; the scroll area around
+    /// it scrolls it into view.
+    tab_focus_rect: Option<Rect>,
     /// Earliest `now_ms` at which a widget needs a frame without input.
     redraw_at: Option<u64>,
     #[cfg(test)]
@@ -133,6 +136,7 @@ impl<'a> Ui<'a> {
             focusables: Vec::new(),
             tab: None,
             capturing_keys: false,
+            tab_focus_rect: None,
             redraw_at: None,
             #[cfg(test)]
             hits: Vec::new(),

@@ -96,6 +96,7 @@ impl Ui<'_> {
             self.focus_seen = true;
             if std::mem::take(&mut self.state.focus_fresh) {
                 self.state.focus_revert = Some(edit.text.clone());
+                self.tab_focus_rect = Some(rect);
             }
             let before = edit.text.clone();
             if !self.input.text.is_empty() || !self.input.keys.is_empty() {

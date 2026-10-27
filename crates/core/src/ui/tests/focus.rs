@@ -153,3 +153,44 @@ fn tab_into_the_hotkey_field_reports_capture_start() {
     let ev = f.run(&Input::default());
     assert_eq!(ev.hk, HotkeyFieldEvent::Started);
 }
+
+#[test]
+fn tab_scrolls_the_focused_field_into_view() {
+    let mut st = UiState::default();
+    let (mut a, mut b) = (TextEdit::new("a"), TextEdit::new("b"));
+    let mut run = |st: &mut UiState, input: &Input| {
+        frame(st, input, |ui| {
+            ui.scroll_area(id("s"), 60.0, 400.0, |ui| {
+                ui.text_field(id("a"), &mut a, "");
+                ui.space(300.0);
+                ui.text_field(id("b"), &mut b, "");
+            });
+        })
+    };
+    for input in [hover(100.0, 10.0), press(100.0, 10.0), release(100.0, 10.0)] {
+        run(&mut st, &input);
+    }
+    assert_eq!(st.focused, Some(id("a")));
+    run(&mut st, &tab(false));
+    assert_eq!(st.focused, Some(id("b")));
+    let f = run(&mut st, &Input::default());
+    // b sits at 28 + 300 = 328..356; just enough to show its bottom in the 60 tall view.
+    assert_eq!(st.scroll[&id("s")], 356.0 - 60.0);
+    assert!(f.redraw_after_ms.is_some(), "redrawn at the new offset");
+    let f = run(&mut st, &Input::default());
+    let b_y = f
+        .cmds
+        .iter()
+        .find_map(|c| match c {
+            Cmd::Text { text, pos, .. } if text == "b" => Some(pos.y),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        (0.0..60.0).contains(&b_y),
+        "b drawn inside the view at {b_y}"
+    );
+    run(&mut st, &tab(true));
+    run(&mut st, &Input::default());
+    assert_eq!(st.scroll[&id("s")], 0.0, "back up to a");
+}

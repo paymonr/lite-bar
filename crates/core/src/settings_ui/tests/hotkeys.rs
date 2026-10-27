@@ -45,3 +45,13 @@ fn starting_capture_asks_the_app_to_free_the_hotkey() {
     let mut p = Page::new(TALL);
     assert_eq!(p.click_text("Ctrl"), vec![UiAction::StartHotkeyCapture]);
 }
+
+#[test]
+fn hotkey_restore_failure_shows_as_a_problem() {
+    let mut p = Page::new(TALL);
+    let msg = "Couldn't restore Ctrl+Alt+Shift+L — another app took it";
+    p.status = Some(msg.to_string());
+    p.idle();
+    let (_, _, color) = find_text(p.frame(), msg).unwrap();
+    assert_eq!(color, Rgba(0xFF, 0x8A, 0x80, 255));
+}

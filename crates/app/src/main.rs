@@ -223,6 +223,7 @@ mod app {
         }
 
         fn register_hotkey(&mut self) {
+            self.hotkey_released = false;
             hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
             let hk = self.settings.hotkeys.toggle_overlay;
             self.hotkey_ok = matches!(
@@ -484,7 +485,7 @@ mod app {
             self.tray.remove();
             match relaunch_as_admin() {
                 Ok(()) => {
-                    self.close_settings_window();
+                    self.close_settings_window_for_exit();
                     true
                 }
                 Err(e) => {
@@ -1613,6 +1614,68 @@ mod app {
                 app.settings_ui.as_ref().unwrap().save_error().as_deref(),
                 Some(SAVE_FAILED_FILE)
             );
+        }
+
+        #[test]
+        fn capture_end_after_a_re_register_is_not_reported_taken() {
+            let dir = TempDir::new("settings-capture-rereg");
+            let (mut app, _owner) = test_app(dir.path());
+            let hk: Hotkey = "Ctrl+Alt+Shift+F19".parse().unwrap();
+            app.settings.hotkeys.toggle_overlay = hk;
+            app.register_hotkey();
+            app.open_settings_hidden();
+            app.apply_ui_action(UiAction::StartHotkeyCapture);
+            // E.g. a declined restart-as-admin registers the hotkey again mid-capture.
+            app.register_hotkey();
+            app.apply_ui_action(UiAction::CancelHotkeyCapture);
+            assert!(app.hotkey_ok, "no false \"taken\"");
+            assert!(!hotkey_is_free(hk));
+            assert_eq!(app.settings_ui.as_ref().unwrap().status(), None);
+            hotkeys::unregister(app.hwnd, HotkeyId::ToggleOverlay);
+        }
+
+        #[test]
+        fn closing_for_exit_does_not_take_the_hotkey_back() {
+            let dir = TempDir::new("settings-capture-exit");
+            let (mut app, _owner) = test_app(dir.path());
+            let hk: Hotkey = "Ctrl+Alt+Shift+F18".parse().unwrap();
+            app.settings.hotkeys.toggle_overlay = hk;
+            app.register_hotkey();
+            app.open_settings_hidden();
+            app.apply_ui_action(UiAction::StartHotkeyCapture);
+            app.close_settings_window_for_exit();
+            assert!(app.settings_ui.is_none());
+            assert!(hotkey_is_free(hk), "the new instance can register it");
+        }
+
+        #[test]
+        fn hotkey_taken_during_capture_is_reported_in_the_window() {
+            let dir = TempDir::new("settings-capture-taken");
+            let (mut app, _owner) = test_app(dir.path());
+            let hk: Hotkey = "Ctrl+Alt+Shift+F20".parse().unwrap();
+            app.settings.hotkeys.toggle_overlay = hk;
+            app.register_hotkey();
+            app.open_settings_hidden();
+            app.apply_ui_action(UiAction::StartHotkeyCapture);
+            let thief = create_owner_window().unwrap();
+            assert!(matches!(
+                hotkeys::register(thief.0, HotkeyId::ToggleOverlay, hk),
+                Registration::Ok
+            ));
+            app.apply_ui_action(UiAction::CancelHotkeyCapture);
+            assert!(!app.hotkey_ok);
+            assert_eq!(
+                app.settings_ui.as_ref().unwrap().status().as_deref(),
+                Some("Couldn't restore Ctrl+Alt+Shift+F20 — another app took it")
+            );
+            // Proposing the same keys again reports it too, not "kept".
+            app.apply_ui_action(UiAction::StartHotkeyCapture);
+            app.apply_ui_action(UiAction::ProposeHotkey(hk));
+            assert_eq!(
+                app.settings_ui.as_ref().unwrap().status().as_deref(),
+                Some("Couldn't restore Ctrl+Alt+Shift+F20 — another app took it")
+            );
+            hotkeys::unregister(thief.0, HotkeyId::ToggleOverlay);
         }
     }
 }

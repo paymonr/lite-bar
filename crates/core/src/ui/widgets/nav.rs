@@ -153,9 +153,26 @@ impl<'a> Ui<'a> {
         if self.pointer_hits(screen) {
             self.state.scroll_hot_next = Some(id);
         }
+        let outer_focus = self.tab_focus_rect.take();
         self.clip(screen, |ui| {
             ui.region(local, |ui| ui.offset(0.0, -scroll, f));
         });
+        if let Some(r) = self.tab_focus_rect.take() {
+            // A widget inside took focus by Tab: scroll just enough to show it.
+            let mut to = scroll;
+            if r.bottom() > screen.bottom() {
+                to += r.bottom() - screen.bottom();
+            }
+            if r.y < screen.y {
+                to -= screen.y - r.y;
+            }
+            let to = to.clamp(0.0, max);
+            if to != scroll {
+                self.state.scroll.insert(id, to);
+                self.request_redraw();
+            }
+        }
+        self.tab_focus_rect = outer_focus;
         if max > 0.0 {
             let thumb_h = (height * height / content_height)
                 .max(THUMB_MIN_H)

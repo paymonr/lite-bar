@@ -32,7 +32,7 @@ pub(super) fn section(
             ui.request_redraw();
         }
         if let Some(status) = status {
-            let color = if status.starts_with("Already") {
+            let color = if status.starts_with("Already") || status.starts_with("Couldn't") {
                 PROBLEM_TEXT
             } else {
                 theme::MUTED

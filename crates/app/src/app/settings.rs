@@ -23,6 +23,11 @@ pub(super) const SAVE_FAILED_FILE: &str =
 pub(super) const SAVE_FAILED_WRITE: &str =
     "Can't save: the settings file could not be written.\nYour changes are kept and saved with the next change.";
 
+/// Status when the toggle hotkey could not be registered again after capture.
+fn restore_failed(hk: Hotkey) -> String {
+    format!("Couldn't restore {hk} — another app took it")
+}
+
 impl App {
     /// The settings the window shows: the app's, with "Show overlay" following whether
     /// the overlay is on right now (the hotkey toggles it without changing the file).
@@ -111,18 +116,34 @@ impl App {
         self.flush_settings_save();
     }
 
+    /// Closes the window when this process is about to exit (after a successful elevated
+    /// relaunch): a released hotkey stays released so the new instance can register it.
+    pub(super) fn close_settings_window_for_exit(&mut self) {
+        self.hotkey_released = false;
+        self.close_settings_window();
+    }
+
     pub(super) fn apply_ui_action(&mut self, action: UiAction) {
         match action {
             UiAction::Change(change) => self.apply_settings_change(change),
             UiAction::ProposeHotkey(hk) => {
-                self.end_hotkey_capture();
-                self.propose_hotkey(hk);
+                let restored = self.end_hotkey_capture();
+                if !restored && hk == self.settings.hotkeys.toggle_overlay {
+                    // "Keep" would hide that the hotkey no longer works.
+                    self.set_hotkey_status(Some(&restore_failed(hk)));
+                } else {
+                    self.propose_hotkey(hk);
+                }
             }
             UiAction::OpenStatsFolder => self.open_stats_folder(),
             UiAction::StartHotkeyCapture => self.start_hotkey_capture(),
             UiAction::CancelHotkeyCapture => {
-                self.end_hotkey_capture();
-                self.set_hotkey_status(None);
+                if self.end_hotkey_capture() {
+                    self.set_hotkey_status(None);
+                } else {
+                    let hk = self.settings.hotkeys.toggle_overlay;
+                    self.set_hotkey_status(Some(&restore_failed(hk)));
+                }
             }
         }
     }
@@ -137,19 +158,14 @@ impl App {
     }
 
     /// Takes the toggle hotkey back after capture (a proposal, a cancel, the window closing).
-    fn end_hotkey_capture(&mut self) {
-        if std::mem::take(&mut self.hotkey_released) {
-            let hk = self.settings.hotkeys.toggle_overlay;
-            self.hotkey_ok = matches!(
-                hotkeys::register(self.hwnd, HotkeyId::ToggleOverlay, hk),
-                Registration::Ok
-            );
-            if !self.hotkey_ok {
-                log::warn(&format!(
-                    "hotkey {hk} was taken while the settings window had it released"
-                ));
-            }
+    /// Returns false when another app took it in the meantime.
+    fn end_hotkey_capture(&mut self) -> bool {
+        if !self.hotkey_released {
+            return true;
         }
+        // Unregisters first, so a hotkey registered again meanwhile is not "taken".
+        self.register_hotkey();
+        self.hotkey_ok
     }
 
     /// One change from the window: live in memory and on the overlay, saved shortly.
