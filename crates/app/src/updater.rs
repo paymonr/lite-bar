@@ -73,16 +73,24 @@ pub fn spawn_check(owner: HWND, fetch: impl FnOnce() -> CheckResult + Send + 'st
 
 /// Posts `result` to `owner`. Returns false (and frees it) when the post fails.
 pub fn post_result(owner: HWND, result: CheckResult) -> bool {
-    let ptr = Box::into_raw(Box::new(result));
-    // SAFETY: plain FFI; on success the owner window takes the box back in `take_result`.
-    let posted = unsafe {
-        PostMessageW(
-            Some(owner),
-            WM_UPDATE_RESULT,
-            WPARAM(0),
-            LPARAM(ptr as isize),
-        )
-    };
+    post_boxed(owner, WM_UPDATE_RESULT, result)
+}
+
+/// Takes back the result a `WM_UPDATE_RESULT` carries.
+///
+/// # Safety
+/// `lparam` must come from a `WM_UPDATE_RESULT` posted by `post_result`, and is taken once.
+pub unsafe fn take_result(lparam: LPARAM) -> CheckResult {
+    // SAFETY: the caller's guarantee.
+    unsafe { take_boxed(lparam) }
+}
+
+/// Posts `msg` to `owner` with `value` boxed in its `LPARAM`. Returns false (and frees the
+/// box) when the post fails.
+pub fn post_boxed<T>(owner: HWND, msg: u32, value: T) -> bool {
+    let ptr = Box::into_raw(Box::new(value));
+    // SAFETY: plain FFI; on success the owner window takes the box back in `take_boxed`.
+    let posted = unsafe { PostMessageW(Some(owner), msg, WPARAM(0), LPARAM(ptr as isize)) };
     if posted.is_err() {
         // SAFETY: not posted, so nobody else owns it.
         drop(unsafe { Box::from_raw(ptr) });
@@ -91,13 +99,13 @@ pub fn post_result(owner: HWND, result: CheckResult) -> bool {
     true
 }
 
-/// Takes back the result a `WM_UPDATE_RESULT` carries.
+/// Takes back the value `post_boxed` put in a message's `LPARAM`.
 ///
 /// # Safety
-/// `lparam` must come from a `WM_UPDATE_RESULT` posted by `post_result`, and is taken once.
-pub unsafe fn take_result(lparam: LPARAM) -> CheckResult {
-    // SAFETY: the caller guarantees it is the box `post_result` leaked, taken once.
-    *unsafe { Box::from_raw(lparam.0 as *mut CheckResult) }
+/// `lparam` must come from a message `post_boxed` posted with a `T`, and is taken once.
+pub unsafe fn take_boxed<T>(lparam: LPARAM) -> T {
+    // SAFETY: the caller guarantees it is the box `post_boxed` leaked, taken once.
+    *unsafe { Box::from_raw(lparam.0 as *mut T) }
 }
 
 /// The state after a check: newer release → `Available`, none → `UpToDate`, error →

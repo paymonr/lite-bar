@@ -1,5 +1,6 @@
 //! Updates section: the "Check for updates" switch, Check now, and the status line with
-//! Update now while a newer release is available.
+//! Update now while a newer release is available. A failed install keeps the release page
+//! link, so the release can be downloaded by hand.
 
 use super::{
     button_width, end_card, row_line, setting_row, setting_row_colored, UiAction, UpdatesInput,
@@ -37,22 +38,22 @@ pub(super) fn section(
         row_line(ui);
         let (text, color) = status(&updates);
         let available = matches!(updates.state, UpdateState::Available(_));
+        let page = available || matches!(updates.state, UpdateState::Failed(_));
         let mut w = button_width(ui, CHECK_NOW);
+        if page {
+            let m = ui.text_measure();
+            w += m.measure(RELEASE_PAGE, TextStyle::BODY).0 + theme::GAP;
+        }
         if available {
             let m = ui.text_measure();
-            w += m.measure(RELEASE_PAGE, TextStyle::BODY).0
-                + m.measure(UPDATE_NOW, TextStyle::BOLD).0
-                + 2.0 * theme::BUTTON_PAD_X
-                + 2.0 * theme::GAP;
+            w += m.measure(UPDATE_NOW, TextStyle::BOLD).0 + 2.0 * theme::BUTTON_PAD_X + theme::GAP;
         }
         setting_row_colored(ui, theme::CONTROL_HEIGHT, None, &[&text], color, w, |ui| {
-            if available {
-                if ui.link(id("settings.release_page"), RELEASE_PAGE) {
-                    out.push(UiAction::OpenReleasePage);
-                }
-                if ui.button_accent(id("settings.update_now"), UPDATE_NOW) {
-                    out.push(UiAction::InstallUpdate);
-                }
+            if page && ui.link(id("settings.release_page"), RELEASE_PAGE) {
+                out.push(UiAction::OpenReleasePage);
+            }
+            if available && ui.button_accent(id("settings.update_now"), UPDATE_NOW) {
+                out.push(UiAction::InstallUpdate);
             }
             if ui.button(id("settings.check_now"), CHECK_NOW) {
                 out.push(UiAction::CheckForUpdates);

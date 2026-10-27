@@ -9,6 +9,7 @@ pub enum HttpError {
 
 use std::ffi::c_void;
 use std::fmt;
+use std::time::Instant;
 
 impl fmt::Display for HttpError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -82,6 +83,18 @@ pub fn get(
     max_bytes: usize,
     user_agent: &str,
     headers: &[(&str, &str)],
+) -> Result<Vec<u8>, HttpError> {
+    get_with_deadline(url, max_bytes, user_agent, headers, None)
+}
+
+/// `get`, failing once `deadline` passes while the body is still arriving. WinHTTP's
+/// timeouts only bound each operation, so a slow trickle would otherwise never end.
+pub fn get_with_deadline(
+    url: &str,
+    max_bytes: usize,
+    user_agent: &str,
+    headers: &[(&str, &str)],
+    deadline: Option<Instant>,
 ) -> Result<Vec<u8>, HttpError> {
     let scheme = url.split_once("://").map(|(s, _)| s.to_ascii_lowercase());
     if !matches!(scheme.as_deref(), Some("http" | "https")) {
@@ -219,6 +232,9 @@ pub fn get(
             body.truncate(start + read as usize);
             if read == 0 {
                 break;
+            }
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return Err(HttpError::Network("download took too long".into()));
             }
         }
         if declared.is_some_and(|d| body.len() < d) {
@@ -391,6 +407,58 @@ mod tests {
         assert_eq!(
             HttpError::Network("WinHttpConnect failed".into()).to_string(),
             "WinHttpConnect failed"
+        );
+    }
+
+    /// Sends the head of a 100-byte response, then one body byte every 100 ms: each read
+    /// succeeds well within WinHTTP's per-operation timeouts.
+    fn serve_slow_drip() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let Ok((mut s, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let _ =
+                s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n");
+            for _ in 0..100 {
+                if s.write_all(b"x").is_err() {
+                    return;
+                }
+                thread::sleep(std::time::Duration::from_millis(100));
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[test]
+    fn download_deadline_enforced() {
+        use std::time::{Duration, Instant};
+        let base = serve_slow_drip();
+        let start = Instant::now();
+        let got = get_with_deadline(
+            &format!("{base}/slow"),
+            1024,
+            "t",
+            &[],
+            Some(start + Duration::from_secs(1)),
+        );
+        assert!(
+            matches!(got, Err(HttpError::Network(ref m)) if m.contains("too long")),
+            "{got:?}"
+        );
+        let took = start.elapsed();
+        assert!(took < Duration::from_secs(4), "{took:?}");
+    }
+
+    #[test]
+    fn no_deadline_waits_for_the_whole_body() {
+        let base = serve(|_| ok(b"all of it"), 1);
+        assert_eq!(
+            get_with_deadline(&format!("{base}/a"), 1024, "t", &[], None),
+            Ok(b"all of it".to_vec())
         );
     }
 

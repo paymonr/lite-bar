@@ -64,9 +64,18 @@ The window takes about 10–20 MB while open; closing it frees all of it.
 
 ### Updates
 
-Lite Bar asks GitHub whether a newer release exists. That request to `api.github.com` (the latest release of `paymonr/lite-bar`) is its only network traffic. It runs on a background thread about 30 s after Lite Bar starts and then every 24 h while it runs, only while **Check for updates** is on (`[updates] check`). Turning the switch on checks 30 s later; turning it off cancels the next check. **Check now** checks right away, even with the switch off.
+Lite Bar asks GitHub whether a newer release exists. That request to `api.github.com` (the latest release of `paymonr/lite-bar`) is its only network traffic, apart from the download you start with **Update now**. It runs on a background thread about 30 s after Lite Bar starts and then every 24 h while it runs, only while **Check for updates** is on (`[updates] check`). Turning the switch on checks 30 s later; turning it off cancels the next check. **Check now** checks right away, even with the switch off.
 
-When a newer release is out, Settings shows "Update available: v…" with an **Update now** button and an **Open release page** link, and the tray menu gets **Update to v…** above **Quit**. Nothing pops up and nothing is downloaded or installed until you click **Update now** (installing arrives in the next update). A failed check is only logged; Settings shows "Couldn't check for updates" and the next scheduled check tries again.
+When a newer release is out, Settings shows "Update available: v…" with an **Update now** button and an **Open release page** link, and the tray menu gets **Update to v…** above **Quit**. Nothing pops up and nothing is downloaded or installed until you click **Update now**. A failed check is only logged; Settings shows "Couldn't check for updates" and the next scheduled check tries again.
+
+**Update now** (in Settings or the tray) installs the release in place:
+
+1. Settings shows "Downloading v…". A background thread downloads `lite-bar.exe.sha256` and `lite-bar.exe` from GitHub. Only https links on `github.com`, `api.github.com`, `objects.githubusercontent.com` and `github-releases.githubusercontent.com` are used, and the download must finish within 5 minutes. The checksum file may be at most 64 KB and the exe at most 50 MB.
+2. The exe's SHA-256 must match the checksum file. Only then is it written next to the running exe as `lite-bar.exe.new`. Until this point, nothing touches the running `lite-bar.exe`.
+3. The running exe is renamed to `lite-bar.exe.old`, and `lite-bar.exe.new` is renamed to `lite-bar.exe`. If the second rename fails, the first is undone, so the current version stays in place and keeps running. If even that undo fails, the error names where the previous exe is (`lite-bar.exe.old`) and the log has the details. Rename it back by hand.
+4. Lite Bar quits the same way as **Quit**: the open settings are saved and the play sessions are written. It then starts the new `lite-bar.exe --updated`. If Lite Bar was running as administrator, the new instance is too. The new instance waits up to 10 s for the old one to exit, then deletes `lite-bar.exe.old`.
+
+Any failure shows "Update failed: …" in red in Settings, with **Open release page**, and leaves the running version untouched. For example, the checksum may not match, or the download may be cut off or time out. If Lite Bar's folder can't be written to (for example, under Program Files without administrator rights), Settings says "Can't update in this folder — download it from GitHub". In that case, download `lite-bar.exe` from the release page and replace the file yourself. If the new exe is in place but couldn't be started, Settings says "Update installed — restart Lite Bar to finish". The old version keeps running until you quit it and start Lite Bar again.
 
 ### Files
 

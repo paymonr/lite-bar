@@ -14,6 +14,8 @@ mod hotkeys;
 #[cfg(windows)]
 mod http;
 #[cfg(windows)]
+mod installer;
+#[cfg(windows)]
 mod log;
 #[cfg(windows)]
 mod overlay;
@@ -56,7 +58,7 @@ mod app {
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
     use std::ffi::OsStr;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
@@ -70,7 +72,7 @@ mod app {
     };
     use lite_bar_core::settings::{Settings, StatsLayout};
     use lite_bar_core::settings_edit::SettingsChange;
-    use lite_bar_core::update::{UpdateSchedule, UpdateState};
+    use lite_bar_core::update::{current_version, ReleaseInfo, UpdateSchedule, UpdateState};
     use windows::core::{w, HSTRING};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -94,11 +96,17 @@ mod app {
     use crate::foreground::{foreground_window, window_title};
     use crate::game_lookup::resolve_name;
     use crate::hotkeys::{self, HotkeyId, Registration};
+    use crate::installer::{
+        download_release, is_updated_launch, relaunch, spawn_cleanup, InstallResult,
+        WM_INSTALL_RESULT,
+    };
     use crate::overlay::Overlay;
     use crate::paths::{app_dir, load_or_create_settings};
     use crate::process_info::{process_info, process_state, ProcessInfo, ProcessState};
     use crate::settings_window::{SaveDebounce, SettingsUi, WM_SETTINGS_ACTIONS};
-    use crate::single_instance::{acquire_single_instance, InstanceGuard};
+    use crate::single_instance::{
+        acquire_single_instance, wait_for, InstanceGuard, UPDATED_POLL, UPDATED_WAIT,
+    };
     use crate::stats_files::{list_games, local_now, StatsWriter};
     use crate::tray::{MenuItem, Tray, TrayMenuState, WM_TRAY};
     use crate::updater::{fetch_latest, take_result, CheckResult, LATEST_URL, WM_UPDATE_RESULT};
@@ -127,6 +135,8 @@ mod app {
         static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
         /// An update check result taken from its message, until the app can apply it.
         static PENDING_UPDATE: RefCell<Option<CheckResult>> = const { RefCell::new(None) };
+        /// A finished update download, until the app can apply it.
+        static PENDING_INSTALL: RefCell<Option<InstallResult>> = const { RefCell::new(None) };
     }
 
     /// Runs `f` on the app state, if it exists and is not already borrowed (re-entrancy).
@@ -235,12 +245,25 @@ mod app {
         latest_url: String,
         /// Runs on the worker thread for each check (`updater::fetch_latest`).
         fetch: fn(&str) -> CheckResult,
+        /// This process's exe, which an update replaces (a temp file in tests).
+        exe_path: Option<PathBuf>,
+        /// Runs on the worker thread for Update now (`installer::download_release`).
+        download: fn(&ReleaseInfo, &Path) -> InstallResult,
+        /// Starts the updated exe (`installer::relaunch`).
+        relaunch: fn(&Path) -> Result<(), String>,
+        /// The release Update now last started on (its page stays reachable on failure).
+        installing: Option<ReleaseInfo>,
     }
 
     impl App {
         fn apply_pending_update(&mut self) {
             if let Some(result) = PENDING_UPDATE.take() {
                 self.on_update_result(result);
+            }
+            if let Some(result) = PENDING_INSTALL.take() {
+                if self.on_install_result(result) {
+                    quit();
+                }
             }
         }
 
@@ -689,6 +712,33 @@ mod app {
         unsafe { PostQuitMessage(0) };
     }
 
+    /// This process's exe file, or `None` (logged) when Windows can't say.
+    fn own_exe() -> Option<PathBuf> {
+        std::env::current_exe()
+            .inspect_err(|e| log::error(&format!("can't find Lite Bar's exe: {e}")))
+            .ok()
+    }
+
+    /// The single-instance mutex for an instance started by an update: the old one may still
+    /// be exiting, so `acquire` is retried (every 200 ms, up to 10 s) while another instance
+    /// holds it. An unexpected error ends the wait.
+    fn guard_after_update<G>(
+        mut acquire: impl FnMut() -> windows::core::Result<Option<G>>,
+    ) -> windows::core::Result<Option<G>> {
+        let start = Instant::now();
+        wait_for(
+            UPDATED_WAIT,
+            UPDATED_POLL,
+            || start.elapsed(),
+            std::thread::sleep,
+            || match acquire() {
+                Ok(None) => None,
+                other => Some(other),
+            },
+        )
+        .unwrap_or(Ok(None))
+    }
+
     /// Takes the single-instance mutex. Fails open: an unexpected error is logged and the app
     /// runs without a guard. `None` is also returned if another instance holds it.
     fn acquire_guard() -> Option<InstanceGuard> {
@@ -741,6 +791,13 @@ mod app {
                 let result = unsafe { take_result(lparam) };
                 // Applied by `with_app`, now or after whatever has the app borrowed.
                 PENDING_UPDATE.set(Some(result));
+                with_app(|_| ());
+                return LRESULT(0);
+            }
+            WM_INSTALL_RESULT => {
+                // SAFETY: posted by `installer::spawn_download`; each message is taken once.
+                let result = unsafe { crate::installer::take_result(lparam) };
+                PENDING_INSTALL.set(Some(result));
                 with_app(|_| ());
                 return LRESULT(0);
             }
@@ -807,10 +864,15 @@ mod app {
 
     /// Whether the panic hook stops the ETW trace. A panic inside the settings window's frame
     /// is caught by its host (the window closes, the app carries on), and one on an update
-    /// check thread (`thread` is the panicking thread's name) by that worker, so the trace
-    /// must stay.
+    /// check, download or cleanup thread (`thread` is the panicking thread's name) by that
+    /// worker, so the trace must stay.
     fn panic_stops_trace(in_ui_frame: bool, thread: Option<&str>) -> bool {
-        !in_ui_frame && thread != Some(crate::updater::WORKER_THREAD)
+        let workers = [
+            crate::updater::WORKER_THREAD,
+            crate::installer::WORKER_THREAD,
+            crate::installer::CLEANUP_THREAD,
+        ];
+        !in_ui_frame && !thread.is_some_and(|t| workers.contains(&t))
     }
 
     /// A panic in the window procedure would abort at the FFI boundary: the app would vanish
@@ -836,9 +898,20 @@ mod app {
         log::init(&dir);
         install_panic_hook();
 
-        let guard = match acquire_single_instance(MUTEX_NAME) {
+        let updated = is_updated_launch(std::env::args().skip(1));
+        let acquired = if updated {
+            guard_after_update(|| acquire_single_instance(MUTEX_NAME))
+        } else {
+            acquire_single_instance(MUTEX_NAME)
+        };
+        let guard = match acquired {
             Ok(Some(guard)) => Some(guard),
-            Ok(None) => return, // already running: exit silently
+            Ok(None) => {
+                if updated {
+                    log::warn("updated, but the previous Lite Bar is still running; exiting");
+                }
+                return; // already running: exit silently
+            }
             Err(e) => {
                 log::error(&format!(
                     "single-instance check failed, running anyway: {e}"
@@ -846,6 +919,13 @@ mod app {
                 None
             }
         };
+
+        if updated {
+            log::info(&format!("updated to v{}", current_version()));
+            if let Some(exe) = own_exe() {
+                spawn_cleanup(exe);
+            }
+        }
 
         let (settings, warnings) = load_or_create_settings(&dir);
         for w in &warnings {
@@ -906,6 +986,10 @@ mod app {
             update_schedule: UpdateSchedule::new(update_checks, Duration::ZERO),
             latest_url: LATEST_URL.to_string(),
             fetch: fetch_latest,
+            exe_path: own_exe(),
+            download: download_release,
+            relaunch,
+            installing: None,
         };
         app.arm_update_timer();
         app.register_hotkey();
@@ -942,8 +1026,6 @@ mod app {
         use crate::updater::post_result;
         use lite_bar_core::hotkey::Hotkey;
         use lite_bar_core::settings_ui::UiAction;
-        use lite_bar_core::update::ReleaseInfo;
-        use std::path::Path;
 
         #[test]
         fn panic_message_formats_str_payload_and_location() {
@@ -996,6 +1078,11 @@ mod app {
                 // A closed local port: tests never ask GitHub.
                 latest_url: "http://127.0.0.1:1/".to_string(),
                 fetch: fetch_latest,
+                // Tests never touch the real exe, GitHub or the shell.
+                exe_path: None,
+                download: |_, _| Err("tests never download".into()),
+                relaunch: |_| Err("tests never relaunch".into()),
+                installing: None,
             };
             (app, owner)
         }
@@ -1901,6 +1988,205 @@ mod app {
             let due = app.update_schedule.next_due().expect("scheduled");
             let now = app.clock.elapsed();
             assert!(due > now + Duration::from_secs(29) && due <= now + Duration::from_secs(30));
+        }
+
+        /// Waits up to `timeout` for a `WM_INSTALL_RESULT` posted to `hwnd` and takes it.
+        fn wait_install_result(hwnd: HWND, timeout: Duration) -> Option<InstallResult> {
+            use windows::Win32::UI::WindowsAndMessaging::{PeekMessageW, PM_REMOVE};
+            let end = Instant::now() + timeout;
+            let mut msg = MSG::default();
+            while Instant::now() < end {
+                let got = unsafe {
+                    PeekMessageW(
+                        &mut msg,
+                        Some(hwnd),
+                        WM_INSTALL_RESULT,
+                        WM_INSTALL_RESULT,
+                        PM_REMOVE,
+                    )
+                };
+                if got.as_bool() {
+                    return Some(unsafe { crate::installer::take_result(msg.lParam) });
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            None
+        }
+
+        const OLD_EXE: &[u8] = b"MZ running lite bar";
+        const NEW_EXE: &[u8] = b"MZ lite bar v99";
+
+        /// The app's exe is `lite-bar.exe` in the temp `dir`, never the real one.
+        fn with_temp_exe(app: &mut App, dir: &Path) -> PathBuf {
+            let exe = dir.join("lite-bar.exe");
+            std::fs::write(&exe, OLD_EXE).unwrap();
+            app.exe_path = Some(exe.clone());
+            exe
+        }
+
+        /// The real download pipeline, minus the GitHub-only URL check (the stub is local).
+        fn download_from_stub(r: &ReleaseInfo, exe: &Path) -> InstallResult {
+            crate::installer::fetch_and_stage(r, exe, |_| true).map_err(|e| e.to_string())
+        }
+
+        #[test]
+        fn install_update_shows_downloading_then_failed_on_a_bad_checksum() {
+            use crate::test_util::{http_ok, serve_paths};
+            let dir = TempDir::new("install-app-bad-sha");
+            let (mut app, _owner) = test_app(dir.path());
+            let exe = with_temp_exe(&mut app, dir.path());
+            app.download = download_from_stub;
+            let wrong = format!("{}  lite-bar.exe\n", "00".repeat(32));
+            let base = serve_paths(vec![
+                ("/sha", http_ok(wrong.as_bytes())),
+                ("/exe", http_ok(NEW_EXE)),
+            ]);
+            let r = ReleaseInfo {
+                exe_url: format!("{base}/exe"),
+                sha_url: format!("{base}/sha"),
+                ..release("99.0.0")
+            };
+            app.on_update_result(Ok(r.clone()));
+            app.open_settings_hidden();
+
+            app.install_update();
+            assert_eq!(app.update, UpdateState::Downloading(r.clone()));
+            assert_eq!(
+                app.settings_ui.as_ref().unwrap().update_state(),
+                UpdateState::Downloading(r.clone())
+            );
+            app.install_update(); // a second click while downloading is ignored
+            let result = wait_install_result(app.hwnd, Duration::from_secs(10)).expect("result");
+            assert!(
+                wait_install_result(app.hwnd, Duration::from_secs(2)).is_none(),
+                "one download"
+            );
+            assert!(!app.on_install_result(result), "keeps running");
+            let UpdateState::Failed(why) = &app.update else {
+                panic!("{:?}", app.update);
+            };
+            assert!(why.contains("checksum"), "{why}");
+            assert_eq!(app.settings_ui.as_ref().unwrap().update_state(), app.update);
+            assert_eq!(std::fs::read(&exe).unwrap(), OLD_EXE);
+            assert!(!crate::installer::new_path(&exe).exists());
+            // The release page stays reachable for a manual download.
+            assert_eq!(app.release_page(), Some(r.page_url.as_str()));
+        }
+
+        #[test]
+        fn install_needs_an_available_newer_release() {
+            let dir = TempDir::new("install-app-guard");
+            let (mut app, _owner) = test_app(dir.path());
+            with_temp_exe(&mut app, dir.path());
+            app.download = |_, _| panic!("must not download");
+            app.install_update();
+            assert_eq!(app.update, UpdateState::Idle);
+            // Not newer than this build (a stale state): ignored too.
+            let stale = UpdateState::Available(release("0.0.1"));
+            app.update = stale.clone();
+            app.install_update();
+            assert_eq!(app.update, stale);
+            assert!(wait_install_result(app.hwnd, Duration::from_millis(300)).is_none());
+        }
+
+        thread_local! {
+            static RELAUNCHED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        }
+
+        fn fake_relaunch(exe: &Path) -> Result<(), String> {
+            RELAUNCHED.with(|r| r.borrow_mut().push(exe.to_path_buf()));
+            Ok(())
+        }
+
+        /// The app mid-download of v99, with the verified exe staged as `.new`.
+        fn staged_app(dir: &Path) -> (App, OwnerWindow, PathBuf, PathBuf) {
+            let (mut app, owner) = test_app(dir);
+            let exe = with_temp_exe(&mut app, dir);
+            let new = crate::installer::stage_update(
+                &exe,
+                NEW_EXE,
+                &lite_bar_core::update::sha256(NEW_EXE),
+            )
+            .unwrap();
+            app.update = UpdateState::Downloading(release("99.0.0"));
+            app.installing = Some(release("99.0.0"));
+            (app, owner, exe, new)
+        }
+
+        #[test]
+        fn verified_download_is_swapped_in_and_relaunched() {
+            let dir = TempDir::new("install-app-swap");
+            let (mut app, _owner, exe, new) = staged_app(dir.path());
+            app.relaunch = fake_relaunch;
+            app.open_settings_hidden();
+            app.settings_ui.as_ref().unwrap().queue(counter(37));
+            assert!(app.on_install_result(Ok(new)), "quits");
+            assert_eq!(std::fs::read(&exe).unwrap(), NEW_EXE);
+            assert_eq!(
+                std::fs::read(crate::installer::old_path(&exe)).unwrap(),
+                OLD_EXE
+            );
+            assert_eq!(RELAUNCHED.with(|r| r.borrow().clone()), vec![exe]);
+            // The Quit path ran first: the window's edits are saved.
+            assert!(app.settings_ui.is_none());
+            assert!(settings_file(dir.path()).contains("counter_size = 37"));
+        }
+
+        #[test]
+        fn relaunch_failure_keeps_running_and_asks_for_a_restart() {
+            let dir = TempDir::new("install-app-relaunch-fails");
+            let (mut app, _owner, exe, new) = staged_app(dir.path());
+            app.relaunch = |_| Err("no shell".into());
+            assert!(!app.on_install_result(Ok(new)), "keeps running");
+            assert_eq!(
+                app.update,
+                UpdateState::Failed(crate::installer::RESTART_TO_FINISH.into())
+            );
+            assert_eq!(std::fs::read(&exe).unwrap(), NEW_EXE, "installed");
+        }
+
+        #[test]
+        fn failed_swap_keeps_the_running_exe() {
+            let dir = TempDir::new("install-app-swap-fails");
+            let (mut app, _owner, exe, new) = staged_app(dir.path());
+            app.relaunch = |_| panic!("must not relaunch");
+            std::fs::remove_file(&new).unwrap(); // the second rename has nothing to move
+            assert!(!app.on_install_result(Ok(new)));
+            assert!(
+                matches!(app.update, UpdateState::Failed(_)),
+                "{:?}",
+                app.update
+            );
+            assert_eq!(std::fs::read(&exe).unwrap(), OLD_EXE);
+        }
+
+        #[test]
+        fn after_an_update_the_guard_is_taken_once_the_old_instance_lets_go() {
+            let mut tries = 0;
+            let got = guard_after_update(|| {
+                tries += 1;
+                Ok((tries == 3).then_some("guard"))
+            });
+            assert_eq!(got.ok(), Some(Some("guard")));
+            assert_eq!(tries, 3);
+            // An unexpected error stops the wait (the caller runs without a guard).
+            let mut tries = 0;
+            let got: windows::core::Result<Option<()>> = guard_after_update(|| {
+                tries += 1;
+                Err(windows::core::Error::empty())
+            });
+            assert!(got.is_err());
+            assert_eq!(tries, 1);
+        }
+
+        #[test]
+        fn install_threads_panics_keep_the_trace() {
+            for t in [
+                crate::installer::WORKER_THREAD,
+                crate::installer::CLEANUP_THREAD,
+            ] {
+                assert!(!panic_stops_trace(false, Some(t)), "{t}");
+            }
         }
 
         #[test]

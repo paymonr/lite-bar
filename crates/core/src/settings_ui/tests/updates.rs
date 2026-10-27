@@ -100,9 +100,11 @@ fn update_now_shows_only_when_available() {
             available,
             "{state:?}"
         );
+        // A failed install points to the release page too (download it by hand).
+        let page = available || matches!(state, UpdateState::Failed(_));
         assert_eq!(
             find_text(p.frame(), "Open release page").is_some(),
-            available,
+            page,
             "{state:?}"
         );
     }
@@ -114,6 +116,18 @@ fn update_now_shows_only_when_available() {
     assert!(fills(p.frame())
         .iter()
         .any(|(r, c, _)| *c == theme::ACCENT && r.contains(pos)));
+}
+
+#[test]
+fn a_failed_install_offers_the_release_page() {
+    let mut p = with_update(UpdateState::Failed(
+        "Can't update in this folder — download it from GitHub".into(),
+    ));
+    assert_eq!(
+        p.click_text("Open release page"),
+        vec![UiAction::OpenReleasePage]
+    );
+    assert!(find_text(p.frame(), "Check now").is_some());
 }
 
 #[test]
