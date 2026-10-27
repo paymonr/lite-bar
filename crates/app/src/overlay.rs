@@ -105,13 +105,13 @@ impl Drop for OwnedWindow {
 }
 
 /// Memory DC the DIB is selected into. Restores the stock bitmap before deleting the DC.
-struct MemDc {
-    dc: HDC,
+pub(crate) struct MemDc {
+    pub(crate) dc: HDC,
     stock: HGDIOBJ,
 }
 
 impl MemDc {
-    fn new() -> windows::core::Result<MemDc> {
+    pub(crate) fn new() -> windows::core::Result<MemDc> {
         // SAFETY: plain FFI; the DC is deleted in Drop.
         unsafe {
             let dc = CreateCompatibleDC(None);
@@ -137,13 +137,13 @@ impl Drop for MemDc {
 }
 
 /// A 32-bit top-down DIB section. Must not be selected into a DC when dropped.
-struct Dib {
-    bitmap: HBITMAP,
-    size: Size,
+pub(crate) struct Dib {
+    pub(crate) bitmap: HBITMAP,
+    pub(crate) size: Size,
 }
 
 impl Dib {
-    fn new(dc: HDC, size: Size) -> windows::core::Result<Dib> {
+    pub(crate) fn new(dc: HDC, size: Size) -> windows::core::Result<Dib> {
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,

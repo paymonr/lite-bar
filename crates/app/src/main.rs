@@ -27,6 +27,9 @@ mod stats_files;
 mod test_util;
 #[cfg(windows)]
 mod tray;
+#[cfg(windows)]
+#[allow(dead_code)] // wired into the tray app by a later task
+mod ui_host;
 
 #[cfg(windows)]
 use app::run;
