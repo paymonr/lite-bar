@@ -309,7 +309,7 @@ mod tests {
     #[test]
     fn current_version_is_the_package_version() {
         assert_eq!(current_version().to_string(), env!("CARGO_PKG_VERSION"));
-        assert_eq!(current_version(), v("0.4.0"));
+        assert_eq!(current_version(), v(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
