@@ -103,6 +103,17 @@ FPS capture needs administrator rights, so Lite Bar starts at sign-in through a 
 - On an account that isn't an administrator, the UAC prompt asks for an administrator's password ("over the shoulder"). The task then belongs to that administrator account and starts Lite Bar at *their* sign-in, not yours. Turn the switch on from your own administrator account instead.
 - To remove the task by hand, run this from an administrator prompt: `schtasks /Delete /TN "Lite Bar" /F`.
 
+### Files
+
+| File | Path |
+| --- | --- |
+| Program | `<Program Files>\Lite Bar\lite-bar.exe` (recommended, see [Install location](#install-location)) |
+| Settings | `%APPDATA%\LiteBar\settings.toml` |
+| Log | `%APPDATA%\LiteBar\lite-bar.log` |
+| Game stats | `%APPDATA%\LiteBar\stats\` (see [Stats and history](#stats-and-history)) |
+
+The settings file is created with the default values and a comment for every key on first run. Afterwards Lite Bar only rewrites the values you change in the settings window. An invalid value falls back to its default and a warning is written to the log. Unknown keys are ignored.
+
 ### Install location
 
 Lite Bar runs as administrator, so the best place for `lite-bar.exe` is `<Program Files>\Lite Bar`, a folder only administrators can change. A copy anywhere else (Downloads, your desktop) can be replaced by any program that runs as you, and Lite Bar would then run that program as administrator.
@@ -116,17 +127,6 @@ When Lite Bar starts from any other folder, a **Welcome to Lite Bar** popup expl
 Settings, the log and stats stay in `%APPDATA%\LiteBar`; only the exe moves. Moving needs your own administrator account: if the UAC prompt is answered with another account's password, nothing is changed and the popup says so.
 
 To move by hand: quit Lite Bar, move `lite-bar.exe` to `<Program Files>\Lite Bar`, start it from there, then turn **Start with Windows** off and on so the task points at the new location.
-
-### Files
-
-| File | Path |
-| --- | --- |
-| Program | `<Program Files>\Lite Bar\lite-bar.exe` (recommended, see [Install location](#install-location)) |
-| Settings | `%APPDATA%\LiteBar\settings.toml` |
-| Log | `%APPDATA%\LiteBar\lite-bar.log` |
-| Game stats | `%APPDATA%\LiteBar\stats\` (see [Stats and history](#stats-and-history)) |
-
-The settings file is created with the default values and a comment for every key on first run. Afterwards Lite Bar only rewrites the values you change in the settings window. An invalid value falls back to its default and a warning is written to the log. Unknown keys are ignored.
 
 ### Settings
 
