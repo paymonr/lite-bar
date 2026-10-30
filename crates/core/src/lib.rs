@@ -8,6 +8,7 @@ pub mod history;
 pub mod hotkey;
 pub mod install;
 pub mod layout;
+pub mod move_prompt_ui;
 pub mod overlay_draw;
 pub mod sessions;
 pub mod settings;

@@ -43,7 +43,7 @@ const SIDEBAR_W: f32 = 170.0;
 const SIDEBAR_BG: Rgba = Rgba(0x19, 0x1B, 0x20, 255);
 const LOGO_BG: Rgba = Rgba(0x2F, 0x6F, 0xDB, 255);
 /// Status text for problems: a failed save, a hotkey another app holds.
-const PROBLEM_TEXT: Rgba = Rgba(0xFF, 0x8A, 0x80, 255);
+pub(crate) const PROBLEM_TEXT: Rgba = Rgba(0xFF, 0x8A, 0x80, 255);
 /// Line between rows inside a card.
 const ROW_LINE: Rgba = Rgba(0x30, 0x34, 0x3D, 255);
 const PAGE_PAD_X: f32 = 24.0;
