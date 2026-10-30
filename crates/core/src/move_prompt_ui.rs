@@ -38,13 +38,21 @@ pub fn move_prompt_frame(ui: &mut Ui, input: &MovePromptInput) -> Vec<MovePrompt
     let a = ui.available();
     let inner = Rect::new(a.x + PAD, a.y + PAD, a.w - 2.0 * PAD, a.h - 2.0 * PAD);
     ui.region(inner, |ui| {
-        paragraph(ui, "Lite Bar is a tiny FPS overlay.", theme::TEXT);
+        paragraph(
+            ui,
+            "A tiny FPS overlay with 1% lows and per-game stats.",
+            theme::TEXT,
+        );
         paragraph(
             ui,
             &format!("Press {} to show or hide it.", input.hotkey),
             theme::TEXT,
         );
-        paragraph(ui, "It lives in the tray, by the clock.", theme::TEXT);
+        paragraph(
+            ui,
+            "Settings and Quit are in the tray icon menu.",
+            theme::TEXT,
+        );
         ui.space(theme::GAP);
         paragraph(
             ui,
@@ -269,6 +277,10 @@ mod tests {
         assert!(has_line(&f, "FPS overlay"));
         assert!(has_line(&f, "Ctrl+Shift+F"));
         assert!(has_line(&f, "tray"));
+        assert!(has_line(&f, "1% lows"));
+        assert!(has_line(&f, "per-game stats"));
+        assert!(has_line(&f, "Settings"));
+        assert!(has_line(&f, "Quit"));
         assert!(has_line(&f, "Only administrators"));
         let (_, _, color) = find_text(&f, DIR).expect("target dir");
         assert_eq!(color, theme::MUTED);
