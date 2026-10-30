@@ -96,9 +96,18 @@ pub fn parse_move_to(args: impl Iterator<Item = String>) -> Option<Result<MoveAr
     })
 }
 
-/// The command line that starts the helper, both values quoted.
+/// `value` in double quotes for a Windows command line. Backslashes right before the closing
+/// quote are doubled, or the quote would be read as an escaped literal. `value` must not
+/// contain `"`.
+fn quote(value: &str) -> String {
+    let trailing = value.len() - value.trim_end_matches('\\').len();
+    format!("\"{value}{}\"", "\\".repeat(trailing))
+}
+
+/// The command line that starts the helper, both values quoted. The values must not
+/// contain `"`.
 pub fn move_to_args(dir: &str, user: &str) -> String {
-    format!("{MOVE_TO_FLAG} \"{dir}\" {FOR_FLAG} \"{user}\"")
+    format!("{MOVE_TO_FLAG} {} {FOR_FLAG} {}", quote(dir), quote(user))
 }
 
 /// The old exe path after `--moved-from`, if the flag and its value are there.
@@ -107,9 +116,9 @@ pub fn parse_moved_from(args: impl Iterator<Item = String>) -> Option<String> {
     flag_value(&args, MOVED_FROM_FLAG).flatten()
 }
 
-/// The moved copy's command line: `--moved-from "<old exe>"`.
+/// The moved copy's command line: `--moved-from "<old exe>"`. `old` must not contain `"`.
 pub fn moved_from_args(old: &str) -> String {
-    format!("{MOVED_FROM_FLAG} \"{old}\"")
+    format!("{MOVED_FROM_FLAG} {}", quote(old))
 }
 
 /// The elevated helper's exit code.
@@ -166,31 +175,74 @@ mod tests {
         vec![PF.to_string(), PF86.to_string()]
     }
 
-    /// Split on spaces outside double quotes and drop the quotes, like Windows argv parsing.
+    /// Split like Windows argv parsing (CommandLineToArgvW): spaces outside quotes separate
+    /// args; 2n backslashes + quote -> n backslashes and the quote toggles; 2n+1 backslashes +
+    /// quote -> n backslashes and a literal quote; other backslashes are literal.
     fn shell_split(s: &str) -> Vec<String> {
+        let chars: Vec<char> = s.chars().collect();
         let mut out = Vec::new();
         let mut cur = String::new();
         let mut quoted = false;
         let mut any = false;
-        for c in s.chars() {
-            match c {
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '\\' => {
+                    let mut n = 0;
+                    while i < chars.len() && chars[i] == '\\' {
+                        n += 1;
+                        i += 1;
+                    }
+                    if i < chars.len() && chars[i] == '"' {
+                        cur.push_str(&"\\".repeat(n / 2));
+                        if n % 2 == 1 {
+                            cur.push('"');
+                            i += 1;
+                        }
+                    } else {
+                        cur.push_str(&"\\".repeat(n));
+                    }
+                    any = true;
+                    continue;
+                }
                 '"' => {
                     quoted = !quoted;
                     any = true;
                 }
                 ' ' if !quoted => {
-                    if any || !cur.is_empty() {
+                    if any {
                         out.push(std::mem::take(&mut cur));
                         any = false;
                     }
                 }
-                _ => cur.push(c),
+                c => {
+                    cur.push(c);
+                    any = true;
+                }
             }
+            i += 1;
         }
-        if any || !cur.is_empty() {
+        if any {
             out.push(cur);
         }
         out
+    }
+
+    #[test]
+    fn args_with_trailing_backslash_round_trip() {
+        let line = move_to_args(r"C:\Program Files\", r"DOM\u");
+        assert_eq!(
+            parse_move_to(shell_split(&line).into_iter()),
+            Some(Ok(MoveArgs {
+                dir: r"C:\Program Files\".to_string(),
+                for_user: r"DOM\u".to_string(),
+            }))
+        );
+        let line = moved_from_args(r"C:\old dir\");
+        assert_eq!(
+            parse_moved_from(shell_split(&line).into_iter()),
+            Some(r"C:\old dir\".to_string())
+        );
     }
 
     #[test]
