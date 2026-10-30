@@ -27,9 +27,10 @@ pub fn same_path(a: &str, b: &str) -> bool {
     slashed(a) == slashed(b)
 }
 
-/// Whether two `DOMAIN\user` names are the same account (no case).
+/// Whether two `DOMAIN\user` names are the same account (no case). An empty (unknown) name
+/// matches none.
 pub fn same_user(a: &str, b: &str) -> bool {
-    a.eq_ignore_ascii_case(b)
+    !a.is_empty() && !b.is_empty() && a.eq_ignore_ascii_case(b)
 }
 
 /// Whether `path` is inside `root` (not `root` itself): no case, either slash, and the match
@@ -59,6 +60,11 @@ pub fn target_dir(program_files: &str) -> String {
     format!("{}\\{TARGET_FOLDER}", program_files.trim_end_matches('\\'))
 }
 
+/// Whether the helper may move into `dir`: only the target under `program_files`.
+pub fn is_allowed_target(dir: &str, program_files: &str) -> bool {
+    !program_files.is_empty() && same_path(dir, &target_dir(program_files))
+}
+
 /// The moved exe's full path.
 pub fn target_exe(program_files: &str) -> String {
     format!("{}\\{EXE_NAME}", target_dir(program_files))
@@ -78,10 +84,11 @@ pub struct MoveArgs {
     pub for_user: String,
 }
 
-/// The value after `flag`, if the flag is there: `Some(None)` when it has no value.
+/// The value after `flag`, if the flag is there: `Some(None)` when it has no value (another
+/// `--` flag is never a value).
 fn flag_value(args: &[String], flag: &str) -> Option<Option<String>> {
     let i = args.iter().position(|a| a == flag)?;
-    Some(args.get(i + 1).cloned())
+    Some(args.get(i + 1).filter(|v| !v.starts_with("--")).cloned())
 }
 
 /// Parses the helper's arguments. `None` without `--move-to`, `Err` when the dir or the
@@ -326,6 +333,15 @@ mod tests {
             Some(Err(_))
         ));
         assert_eq!(parse_move_to(args(&["--updated"])), None);
+        // A flag is never taken as a value.
+        assert!(matches!(
+            parse_move_to(args(&["--move-to", "--for", "u"])),
+            Some(Err(_))
+        ));
+        assert!(matches!(
+            parse_move_to(args(&["--move-to", "X", "--for", "--moved-from"])),
+            Some(Err(_))
+        ));
     }
 
     #[test]
@@ -341,6 +357,7 @@ mod tests {
             Some(r"C:\a b\lite-bar.exe".to_string())
         );
         assert_eq!(parse_moved_from(args(&["--moved-from"])), None);
+        assert_eq!(parse_moved_from(args(&["--moved-from", "--updated"])), None);
         assert_eq!(parse_moved_from(args(&["--updated"])), None);
         let line = moved_from_args(r"C:\a b\lite-bar.exe");
         assert_eq!(
@@ -364,6 +381,22 @@ mod tests {
     fn same_user_ignores_case() {
         assert!(same_user(r"DOM\Paymon", r"dom\paymon"));
         assert!(!same_user(r"DOM\a", r"DOM\b"));
+        // An unknown name never matches, not even another unknown one.
+        assert!(!same_user("", ""));
+        assert!(!same_user("", r"DOM\a"));
+        assert!(!same_user(r"DOM\a", ""));
+    }
+
+    #[test]
+    fn only_the_program_files_target_is_allowed() {
+        assert!(is_allowed_target(r"C:\Program Files\Lite Bar", PF));
+        assert!(is_allowed_target("c:/program files/lite bar", PF));
+        assert!(!is_allowed_target(r"C:\Program Files", PF));
+        assert!(!is_allowed_target(r"C:\Program Files\Lite Bar\x", PF));
+        assert!(!is_allowed_target(r"C:\Users\p\Lite Bar", PF));
+        assert!(!is_allowed_target(r"C:\Program Files (x86)\Lite Bar", PF));
+        assert!(!is_allowed_target("", PF));
+        assert!(!is_allowed_target(r"C:\Program Files\Lite Bar", ""));
     }
 
     #[test]
