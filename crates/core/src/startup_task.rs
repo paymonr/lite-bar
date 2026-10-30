@@ -195,12 +195,6 @@ pub fn task_command(xml: &str) -> Option<String> {
     (!cmd.is_empty()).then(|| cmd.to_string())
 }
 
-/// Whether two Windows paths name the same file: no case, either slash.
-fn same_path(a: &str, b: &str) -> bool {
-    let norm = |p: &str| p.replace('/', "\\").to_lowercase();
-    norm(a) == norm(b)
-}
-
 /// The state for a task that exists or not, given the XML it printed (if any) and this exe.
 /// An existing task whose command can't be read, or a non-ASCII exe path (schtasks prints
 /// its XML in the console code page, so it can't be compared reliably), counts as `On`.
@@ -209,7 +203,9 @@ pub fn state_from_query(exists: bool, xml: Option<&str>, own_exe: &str) -> Start
         return StartupState::Off;
     }
     match xml.and_then(task_command) {
-        Some(cmd) if own_exe.is_ascii() && !same_path(&cmd, own_exe) => StartupState::OnOtherCopy,
+        Some(cmd) if own_exe.is_ascii() && !crate::install::same_path(&cmd, own_exe) => {
+            StartupState::OnOtherCopy
+        }
         _ => StartupState::On,
     }
 }
