@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::thread::JoinHandle;
 
 use lite_bar_core::install::{
-    move_to_args, moved_from_args, safe_to_delete, same_path, same_user, target_dir, HelperExit,
-    MoveArgs, MoveOutcome, EXE_NAME,
+    is_allowed_target, move_to_args, moved_from_args, safe_to_delete, same_path, same_user,
+    target_dir, HelperExit, MoveArgs, MoveOutcome, EXE_NAME,
 };
 use lite_bar_core::startup_task::StartupState;
 use windows::core::{GUID, HSTRING};
@@ -125,6 +125,19 @@ pub fn repoint_startup(
     }
 }
 
+/// `repoint_startup` for this user with the real schtasks. Needs elevation to re-create.
+pub fn repoint_startup_now(old: &str, new: &str) -> Result<bool, String> {
+    let temp = std::env::temp_dir();
+    repoint_startup(
+        &SystemRunner,
+        &schtasks_path(),
+        old,
+        new,
+        &current_user(),
+        &temp,
+    )
+}
+
 /// Starts the moved copy `new` with `--moved-from "<old>"`, in its own folder. An elevated
 /// caller's child is elevated too.
 pub fn start_moved(new: &Path, old: &Path) -> Result<(), String> {
@@ -189,8 +202,14 @@ fn move_steps(exe: &Path, dir: &Path, user: &str) -> MoveOutcome {
     }
 }
 
+/// Whether the helper may move into `dir`: only `<Program Files>\Lite Bar` is.
+fn target_allowed(dir: &str) -> bool {
+    program_files().is_some_and(|pf| is_allowed_target(dir, &pf))
+}
+
 /// The `--move-to "<dir>" --for "<user>"` helper: returns its `HelperExit` code. Refuses
-/// without elevation, and changes nothing when it runs as another account than `--for`.
+/// without elevation, and changes nothing when it runs as another account than `--for` or
+/// `<dir>` isn't `<Program Files>\Lite Bar`.
 pub fn run_move_mode(args: Result<MoveArgs, String>) -> i32 {
     let args = match args {
         Ok(args) => args,
@@ -210,6 +229,13 @@ pub fn run_move_mode(args: Result<MoveArgs, String>) -> i32 {
             args.for_user
         ));
         return HelperExit::OtherAccount as i32;
+    }
+    if !target_allowed(&args.dir) {
+        log::error(&format!(
+            "move: {} isn't the Program Files target; nothing changed",
+            args.dir
+        ));
+        return HelperExit::Failed as i32;
     }
     match std::env::current_exe() {
         Ok(exe) => perform_move(&exe, Path::new(&args.dir), &args.for_user) as i32,
@@ -424,6 +450,21 @@ mod tests {
         // The create fails: an error.
         let r = FakeRunner::new(vec![exit(0), printed(&task_xml(OLD, USER)), exit(1)]);
         assert!(repoint_startup(&r, SCHTASKS, OLD, NEW, USER, tmp.path()).is_err());
+
+        // The task can't be checked: an error, and nothing is created.
+        let r = FakeRunner::new(vec![Err("no schtasks".into())]);
+        assert!(repoint_startup(&r, SCHTASKS, OLD, NEW, USER, tmp.path()).is_err());
+        assert!(creates(&r).is_empty());
+    }
+
+    #[test]
+    fn only_the_program_files_target_is_accepted() {
+        let tmp = TempDir::new("mover-target");
+        assert!(!target_allowed(&tmp.path().to_string_lossy()));
+        assert!(!target_allowed(""));
+        let pf = program_files().unwrap();
+        assert!(target_allowed(&target_dir(&pf)));
+        assert!(!target_allowed(&pf));
     }
 
     #[test]

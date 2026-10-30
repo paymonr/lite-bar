@@ -9,7 +9,6 @@ use lite_bar_core::settings_edit::SettingsChange;
 use super::{quit, set_owns_trace, App};
 use crate::log;
 use crate::move_prompt_window::MovePromptState;
-use crate::mover::spawn_delete_old;
 
 /// Shown when the move's thread could not start.
 const NO_THREAD: &str = "couldn't start the move";
@@ -114,16 +113,40 @@ impl App {
         quit();
     }
 
-    /// The first start of the moved copy: the popup was answered, and the old copy goes.
+    /// The first start of the moved copy: the popup was answered, and the old copy goes,
+    /// unless "Start with Windows" still starts it (the helper's re-point failed and
+    /// re-creating the task for this copy fails again).
     pub(super) fn finish_moved_from(&mut self, old: String) {
         self.apply_settings_change(SettingsChange::MovePrompt(false));
-        if let Some(exe) = &self.exe_path {
-            spawn_delete_old(
-                old,
-                exe.to_string_lossy().into_owned(),
-                self.pf_roots.clone(),
-            );
+        let Some(exe) = &self.exe_path else {
+            log::warn(&format!(
+                "can't find Lite Bar's own file: the old copy at {old} was left in place"
+            ));
+            return;
+        };
+        let exe = exe.to_string_lossy().into_owned();
+        match (self.repoint_old_startup)(&old, &exe) {
+            Ok(true) => log::info(&format!("startup task now starts {exe}")),
+            Ok(false) => {}
+            Err(e) => {
+                log::warn(&format!(
+                    "kept the old copy at {old}: Start with Windows still points at it ({e})"
+                ));
+                return;
+            }
         }
+        (self.delete_old)(old, exe, self.pf_roots.clone());
+    }
+
+    /// Whether a move runs, so `what` (a relaunch) must wait; logged when it does.
+    pub(super) fn held_by_move(&self, what: &str) -> bool {
+        let moving = self.move_status == MoveStatus::Moving;
+        if moving {
+            log::info(&format!(
+                "{what} ignored: Lite Bar is moving to Program Files"
+            ));
+        }
+        moving
     }
 
     /// Closes the popup, if open; a move in progress still reports its outcome.

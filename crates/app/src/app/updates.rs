@@ -119,7 +119,7 @@ impl App {
     /// release newer than the exe on disk is installed, and only from its own URLs; a click
     /// while downloading is ignored.
     pub(super) fn install_update(&mut self) {
-        if self.relaunched {
+        if self.relaunched || self.held_by_move("Update now") {
             return;
         }
         let r = match (&self.update, &self.installing) {
@@ -202,8 +202,13 @@ impl App {
     /// hotkey and tray icon go), then starts `exe --updated <this version>`. Returns true
     /// when it started: the mutex is kept until this process exits (the new instance waits
     /// for it) and the panic hook no longer stops the trace. Otherwise this instance carries
-    /// on as before and asks for a manual restart: the new exe is already in place.
+    /// on as before and asks for a manual restart: the new exe is already in place. While a
+    /// move runs it doesn't start (and asks for the restart).
     fn relaunch_updated(&mut self, exe: &Path) -> bool {
+        if self.held_by_move("restarting to the update") {
+            self.set_update_state(UpdateState::RestartRequired);
+            return false;
+        }
         let was_on = self.overlay_on;
         self.close_for_exit();
         match (self.relaunch)(exe) {

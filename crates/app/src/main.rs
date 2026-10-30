@@ -304,6 +304,11 @@ mod app {
         open_move_prompt: fn(HWND, MovePromptState) -> windows::core::Result<MovePromptUi>,
         /// Starts a move job on a worker that posts `WM_MOVE_RESULT` (`mover::spawn`).
         spawn_move: fn(HWND, Box<dyn FnOnce() -> MoveOutcome + Send>) -> bool,
+        /// After a move: re-creates the "Start with Windows" task for (old exe, new exe) when
+        /// it still starts the old one (`mover::repoint_startup_now`).
+        repoint_old_startup: fn(&str, &str) -> Result<bool, String>,
+        /// Deletes the old copy on a thread: (old, running, roots) → `mover::spawn_delete_old`.
+        delete_old: fn(String, String, Vec<String>) -> Option<std::thread::JoinHandle<()>>,
     }
 
     impl App {
@@ -590,8 +595,12 @@ mod app {
             }
         }
 
-        /// Relaunches elevated. Returns true if this process should exit.
+        /// Relaunches elevated (not while a move runs). Returns true if this process should
+        /// exit.
         fn restart_as_admin(&mut self) -> bool {
+            if self.held_by_move("Restart as administrator") {
+                return false;
+            }
             let was_on = self.overlay_on;
             // The new instance reads the file; the window stays open if UAC is declined.
             self.save_settings_before_restart();
@@ -1137,6 +1146,8 @@ mod app {
             move_job: crate::mover::move_now,
             open_move_prompt: MovePromptUi::open,
             spawn_move: |owner, job| crate::mover::spawn(owner, job),
+            repoint_old_startup: crate::mover::repoint_startup_now,
+            delete_old: crate::mover::spawn_delete_old,
         };
         app.arm_update_timer();
         app.register_hotkey();
@@ -1177,6 +1188,8 @@ mod app {
 
     #[cfg(test)]
     mod tests {
+        use std::thread::JoinHandle;
+
         use super::*;
         use crate::test_util::TempDir;
         use crate::updater::post_result;
@@ -1266,6 +1279,9 @@ mod app {
                 move_job: |_, _| MoveOutcome::Failed("tests never move".into()),
                 open_move_prompt: MovePromptUi::open_hidden,
                 spawn_move: record_move_spawn,
+                // Tests never touch the real scheduled task or delete a real file.
+                repoint_old_startup: |_, _| Ok(false),
+                delete_old: record_delete_old,
             };
             (app, owner)
         }
@@ -2958,6 +2974,116 @@ mod app {
             assert!(!app.settings.install.move_prompt);
             app.flush_settings_save();
             assert!(!saved_move_prompt(dir.path()));
+        }
+
+        thread_local! {
+            /// Old copies the fake `delete_old` was asked to delete (never deleted).
+            static DELETES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        }
+
+        fn record_delete_old(old: String, _: String, _: Vec<String>) -> Option<JoinHandle<()>> {
+            DELETES.with(|d| d.borrow_mut().push(old));
+            None
+        }
+
+        const MOVED_EXE: &str = r"C:\Program Files\Lite Bar\lite-bar.exe";
+
+        /// The moved copy's first start, with the given "Start with Windows" re-point.
+        fn moved_app(
+            dir: &Path,
+            repoint: fn(&str, &str) -> Result<bool, String>,
+        ) -> (App, OwnerWindow) {
+            let (mut app, owner) = test_app(dir);
+            app.exe_path = Some(PathBuf::from(MOVED_EXE));
+            app.pf_roots = vec![PROGRAM_FILES.to_string()];
+            app.repoint_old_startup = repoint;
+            (app, owner)
+        }
+
+        #[test]
+        fn moved_from_deletes_the_old_copy_when_startup_was_re_pointed() {
+            let dir = TempDir::new("move-moved-from-repointed");
+            let (mut app, _owner) = moved_app(dir.path(), |old, new| {
+                assert_eq!((old, new), (DOWNLOADS_EXE, MOVED_EXE));
+                Ok(true)
+            });
+            app.finish_moved_from(DOWNLOADS_EXE.to_string());
+            assert_eq!(DELETES.with(|d| d.borrow().clone()), [DOWNLOADS_EXE]);
+        }
+
+        #[test]
+        fn moved_from_deletes_the_old_copy_when_startup_is_off() {
+            let dir = TempDir::new("move-moved-from-startup-off");
+            let (mut app, _owner) = moved_app(dir.path(), |_, _| Ok(false));
+            app.finish_moved_from(DOWNLOADS_EXE.to_string());
+            assert_eq!(DELETES.with(|d| d.borrow().clone()), [DOWNLOADS_EXE]);
+        }
+
+        #[test]
+        fn moved_from_keeps_the_old_copy_while_startup_still_starts_it() {
+            let dir = TempDir::new("move-moved-from-repoint-fails");
+            let (mut app, _owner) = moved_app(dir.path(), |_, _| Err("access denied".into()));
+            app.finish_moved_from(DOWNLOADS_EXE.to_string());
+            assert!(DELETES.with(|d| d.borrow().is_empty()));
+            // The popup was answered all the same.
+            assert!(!app.settings.install.move_prompt);
+        }
+
+        #[test]
+        fn moved_from_without_its_exe_path_keeps_the_old_copy() {
+            let dir = TempDir::new("move-moved-from-no-exe");
+            let (mut app, _owner) = moved_app(dir.path(), |_, _| panic!("nothing to re-point to"));
+            app.exe_path = None;
+            app.finish_moved_from(DOWNLOADS_EXE.to_string());
+            assert!(DELETES.with(|d| d.borrow().is_empty()));
+        }
+
+        #[test]
+        fn update_now_does_nothing_while_moving() {
+            let dir = TempDir::new("move-blocks-update");
+            let (mut app, _owner) = test_app(dir.path());
+            with_temp_exe(&mut app, dir.path());
+            app.download = |_, _| panic!("must not download");
+            app.move_status = MoveStatus::Moving;
+            let available = UpdateState::Available(release("99.0.0"));
+            app.update = available.clone();
+            app.install_update();
+            assert_eq!(app.update, available);
+            assert!(app.installing.is_none());
+        }
+
+        #[test]
+        fn restart_now_does_nothing_while_moving() {
+            let dir = TempDir::new("move-blocks-restart");
+            let (mut app, _owner) = test_app(dir.path());
+            with_temp_exe(&mut app, dir.path());
+            app.relaunch = |_| panic!("must not relaunch");
+            app.move_status = MoveStatus::Moving;
+            app.update = UpdateState::RestartRequired;
+            assert!(!app.restart_to_update(), "keeps running");
+            assert!(!app.relaunched);
+            assert_eq!(app.update, UpdateState::RestartRequired);
+        }
+
+        #[test]
+        fn a_download_finishing_while_moving_waits_for_a_restart() {
+            let dir = TempDir::new("move-blocks-install-relaunch");
+            let (mut app, _owner, exe, new) = staged_app(dir.path());
+            app.relaunch = |_| panic!("must not relaunch");
+            app.move_status = MoveStatus::Moving;
+            assert!(!app.on_install_result(Ok(new)), "keeps running");
+            assert!(!app.relaunched);
+            assert_eq!(app.update, UpdateState::RestartRequired);
+            assert_eq!(std::fs::read(&exe).unwrap(), NEW_EXE, "installed");
+        }
+
+        #[test]
+        fn restart_as_admin_does_nothing_while_moving() {
+            let dir = TempDir::new("move-blocks-admin-restart");
+            let (mut app, _owner) = test_app(dir.path());
+            app.relaunch_admin = || panic!("must not relaunch");
+            app.move_status = MoveStatus::Moving;
+            assert!(!app.restart_as_admin(), "keeps running");
         }
     }
 }
