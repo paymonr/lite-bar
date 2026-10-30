@@ -18,8 +18,8 @@ mod installer;
 #[cfg(windows)]
 mod log;
 #[cfg(windows)]
-// The welcome popup and the App use it from the next change on.
-#[allow(dead_code)]
+mod move_prompt_window;
+#[cfg(windows)]
 mod mover;
 #[cfg(windows)]
 mod overlay;
@@ -73,6 +73,7 @@ mod app {
     use lite_bar_core::fps::{FocusClock, FpsTracker};
     use lite_bar_core::game_name::{display_name, is_known_non_game};
     use lite_bar_core::history::LocalTime;
+    use lite_bar_core::install::{parse_moved_from, MoveOutcome, MoveStatus};
     use lite_bar_core::layout::{fps_text, stats_text};
     use lite_bar_core::sessions::{
         liveness_query_due, session_log_line, OpenSession, QueryGate, SessionBook,
@@ -98,6 +99,7 @@ mod app {
         WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
     };
 
+    mod move_prompt;
     mod settings;
     mod startup;
     mod updates;
@@ -111,6 +113,8 @@ mod app {
         download_release, relaunch, shell_execute_result, spawn_cleanup, updated_launch,
         updated_log_line, InstallResult, WM_INSTALL_RESULT,
     };
+    use crate::move_prompt_window::{MovePromptState, MovePromptUi, WM_MOVE_PROMPT_ACTIONS};
+    use crate::mover::WM_MOVE_RESULT;
     use crate::overlay::Overlay;
     use crate::paths::{app_dir, load_or_create_settings};
     use crate::process_info::{process_info, process_state, ProcessInfo, ProcessState};
@@ -151,12 +155,14 @@ mod app {
         static PENDING_INSTALL: RefCell<Option<InstallResult>> = const { RefCell::new(None) };
         /// A startup-task job's result, until the app can apply it.
         static PENDING_STARTUP: RefCell<Option<StartupResult>> = const { RefCell::new(None) };
+        /// A finished move to Program Files, until the app can apply it.
+        static PENDING_MOVE: RefCell<Option<MoveOutcome>> = const { RefCell::new(None) };
     }
 
     /// Runs `f` on the app state, if it exists and is not already borrowed (re-entrancy).
-    /// Afterwards applies whatever the settings window queued and an update check result
-    /// that is waiting, so a nudge or a result that arrived while the app was busy is never
-    /// lost.
+    /// Afterwards applies whatever the settings window and the welcome popup queued and an
+    /// update check result that is waiting, so a nudge or a result that arrived while the
+    /// app was busy is never lost.
     fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
         APP.with(|app| {
             let mut guard = app.try_borrow_mut().ok()?;
@@ -167,6 +173,7 @@ mod app {
             let r = f(app);
             app.apply_pending_update();
             app.drain_settings_actions();
+            app.drain_move_prompt_actions();
             Some(r)
         })
     }
@@ -285,6 +292,18 @@ mod app {
         relaunched: bool,
         /// Starts an elevated copy through UAC (`elevation::relaunch_as_admin`).
         relaunch_admin: fn() -> windows::core::Result<()>,
+        /// The welcome popup while it is open.
+        move_prompt: Option<MovePromptUi>,
+        /// Where the move to Program Files stands (shown in the popup).
+        move_status: MoveStatus,
+        /// The Program Files folders (`mover::program_files_roots`); the first is the target.
+        pf_roots: Vec<String>,
+        /// Runs on a worker thread to move: (elevated, parent window) → `mover::move_now`.
+        move_job: fn(bool, usize) -> MoveOutcome,
+        /// Opens the popup (`MovePromptUi::open`; hidden in tests).
+        open_move_prompt: fn(HWND, MovePromptState) -> windows::core::Result<MovePromptUi>,
+        /// Starts a move job on a worker that posts `WM_MOVE_RESULT` (`mover::spawn`).
+        spawn_move: fn(HWND, Box<dyn FnOnce() -> MoveOutcome + Send>) -> bool,
     }
 
     impl App {
@@ -299,6 +318,9 @@ mod app {
             }
             if let Some(result) = PENDING_STARTUP.take() {
                 self.on_startup_result(result);
+            }
+            if let Some(outcome) = PENDING_MOVE.take() {
+                self.apply_move_outcome(outcome);
             }
         }
 
@@ -877,8 +899,15 @@ mod app {
                 with_app(|_| ());
                 return LRESULT(0);
             }
-            WM_SETTINGS_ACTIONS => {
-                // `with_app` drains the window's queue.
+            WM_MOVE_RESULT => {
+                // SAFETY: posted by `mover::spawn`; each message is taken once.
+                let outcome = unsafe { crate::mover::take_result(lparam) };
+                PENDING_MOVE.set(Some(outcome));
+                with_app(|_| ());
+                return LRESULT(0);
+            }
+            WM_SETTINGS_ACTIONS | WM_MOVE_PROMPT_ACTIONS => {
+                // `with_app` drains the windows' queues.
                 with_app(|_| ());
                 return LRESULT(0);
             }
@@ -1003,7 +1032,9 @@ mod app {
         }
 
         let updated_from = updated_launch(std::env::args().skip(1));
-        let updated = updated_from.is_some();
+        let moved_from = parse_moved_from(std::env::args().skip(1));
+        // The moved copy waits for the old one like an updated instance does.
+        let updated = updated_from.is_some() || moved_from.is_some();
         let acquired = if updated {
             guard_after_update(|| acquire_single_instance(MUTEX_NAME))
         } else {
@@ -1028,8 +1059,12 @@ mod app {
         for w in &warnings {
             log::warn(w);
         }
+        if let Some(old) = &moved_from {
+            let exe = own_exe().map_or_else(|| "?".into(), |e| e.display().to_string());
+            log::info(&format!("moved from {old} to {exe}"));
+        }
 
-        if let Err(e) = start(dir, settings, guard) {
+        if let Err(e) = start(dir, settings, guard, moved_from) {
             log::error(&format!("startup failed: {e}"));
         }
     }
@@ -1038,6 +1073,7 @@ mod app {
         dir: PathBuf,
         settings: Settings,
         guard: Option<InstanceGuard>,
+        moved_from: Option<String>,
     ) -> windows::core::Result<()> {
         // SAFETY: plain FFI with a static NUL-terminated name.
         let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
@@ -1095,6 +1131,12 @@ mod app {
             startup_change: crate::startup::change,
             relaunched: false,
             relaunch_admin: relaunch_as_admin,
+            move_prompt: None,
+            move_status: MoveStatus::Idle,
+            pf_roots: crate::mover::program_files_roots(),
+            move_job: crate::mover::move_now,
+            open_move_prompt: MovePromptUi::open,
+            spawn_move: |owner, job| crate::mover::spawn(owner, job),
         };
         app.arm_update_timer();
         app.register_hotkey();
@@ -1106,6 +1148,10 @@ mod app {
             is_elevated(),
             app.hotkey_ok
         ));
+        if let Some(old) = moved_from {
+            app.finish_moved_from(old);
+        }
+        app.maybe_offer_move();
         APP.with(|slot| *slot.borrow_mut() = Some(app));
 
         // SAFETY: standard message loop on the thread that owns the windows.
@@ -1135,6 +1181,7 @@ mod app {
         use crate::test_util::TempDir;
         use crate::updater::post_result;
         use lite_bar_core::hotkey::Hotkey;
+        use lite_bar_core::move_prompt_ui::MovePromptAction;
         use lite_bar_core::settings_ui::UiAction;
 
         #[test]
@@ -1212,6 +1259,13 @@ mod app {
                 relaunched: false,
                 // Tests never start an elevated copy.
                 relaunch_admin: || Err(windows::core::Error::empty()),
+                move_prompt: None,
+                move_status: MoveStatus::Idle,
+                pf_roots: Vec::new(),
+                // Tests never move the exe.
+                move_job: |_, _| MoveOutcome::Failed("tests never move".into()),
+                open_move_prompt: MovePromptUi::open_hidden,
+                spawn_move: record_move_spawn,
             };
             (app, owner)
         }
@@ -2712,6 +2766,198 @@ mod app {
                 Some(crate::startup::WORKER_THREAD),
                 true
             ));
+        }
+
+        thread_local! {
+            /// Move jobs the fake `spawn_move` was handed (never run).
+            static MOVE_SPAWNS: Cell<u32> = const { Cell::new(0) };
+        }
+
+        fn record_move_spawn(_: HWND, _: Box<dyn FnOnce() -> MoveOutcome + Send>) -> bool {
+            MOVE_SPAWNS.set(MOVE_SPAWNS.get() + 1);
+            true
+        }
+
+        const DOWNLOADS_EXE: &str = r"C:\Users\p\Downloads\lite-bar.exe";
+        const PROGRAM_FILES: &str = r"C:\Program Files";
+
+        /// The app running from Downloads, with Program Files to move to.
+        fn outside_app(dir: &Path) -> (App, OwnerWindow) {
+            let (mut app, owner) = test_app(dir);
+            app.exe_path = Some(PathBuf::from(DOWNLOADS_EXE));
+            app.pf_roots = vec![PROGRAM_FILES.to_string()];
+            (app, owner)
+        }
+
+        /// `outside_app` with the popup open.
+        fn offered_app(dir: &Path) -> (App, OwnerWindow) {
+            let (mut app, owner) = outside_app(dir);
+            app.maybe_offer_move();
+            assert!(app.move_prompt.is_some(), "offered");
+            (app, owner)
+        }
+
+        fn saved_move_prompt(dir: &Path) -> bool {
+            load_or_create_settings(dir).0.install.move_prompt
+        }
+
+        #[test]
+        fn offers_move_when_outside_program_files() {
+            let dir = TempDir::new("move-offer");
+            let (mut app, _owner) = outside_app(dir.path());
+            assert!(app.settings.install.move_prompt);
+            app.maybe_offer_move();
+            assert!(app.move_prompt.is_some());
+        }
+
+        #[test]
+        fn no_offer_when_answered_or_inside_program_files() {
+            let dir = TempDir::new("move-no-offer");
+            let (mut app, _owner) = outside_app(dir.path());
+            app.settings.install.move_prompt = false;
+            app.maybe_offer_move();
+            assert!(app.move_prompt.is_none(), "answered");
+
+            let (mut app, _owner) = outside_app(dir.path());
+            app.exe_path = Some(PathBuf::from(r"C:\Program Files\Lite Bar\lite-bar.exe"));
+            app.maybe_offer_move();
+            assert!(app.move_prompt.is_none(), "already inside");
+
+            let (mut app, _owner) = outside_app(dir.path());
+            app.pf_roots = Vec::new();
+            app.maybe_offer_move();
+            assert!(app.move_prompt.is_none(), "no Program Files");
+        }
+
+        #[test]
+        fn no_thanks_saves_false_and_closes() {
+            let dir = TempDir::new("move-no-thanks");
+            let (mut app, _owner) = offered_app(dir.path());
+            app.handle_move_prompt_action(MovePromptAction::NoThanks);
+            assert!(!app.settings.install.move_prompt);
+            assert!(app.move_prompt.is_none());
+            app.flush_settings_save();
+            assert!(!saved_move_prompt(dir.path()));
+        }
+
+        #[test]
+        fn later_closes_without_saving() {
+            let dir = TempDir::new("move-later");
+            let (mut app, _owner) = offered_app(dir.path());
+            app.handle_move_prompt_action(MovePromptAction::Later);
+            assert!(app.move_prompt.is_none());
+            assert!(app.settings.install.move_prompt);
+            app.flush_settings_save();
+            assert!(saved_move_prompt(dir.path()));
+        }
+
+        #[test]
+        fn closing_the_popup_is_ask_me_later() {
+            let dir = TempDir::new("move-close");
+            let (mut app, _owner) = offered_app(dir.path());
+            app.move_prompt.as_ref().unwrap().send_close();
+            app.drain_move_prompt_actions();
+            assert!(app.move_prompt.is_none());
+            assert!(app.settings.install.move_prompt);
+        }
+
+        #[test]
+        fn second_move_click_starts_no_second_job() {
+            let dir = TempDir::new("move-twice");
+            let (mut app, _owner) = offered_app(dir.path());
+            app.handle_move_prompt_action(MovePromptAction::Move);
+            app.handle_move_prompt_action(MovePromptAction::Move);
+            assert_eq!(MOVE_SPAWNS.get(), 1);
+            assert_eq!(app.move_status, MoveStatus::Moving);
+            assert_eq!(
+                app.move_prompt.as_ref().unwrap().status(),
+                MoveStatus::Moving
+            );
+        }
+
+        #[test]
+        fn move_runs_the_job_with_the_elevation_and_the_popup_as_parent() {
+            let dir = TempDir::new("move-job");
+            let (mut app, _owner) = offered_app(dir.path());
+            app.elevated = false;
+            app.spawn_move = |_, job| {
+                MOVE_SPAWNS.set(MOVE_SPAWNS.get() + 1);
+                assert_eq!(job(), MoveOutcome::Declined);
+                true
+            };
+            app.move_job = |elevated, parent| {
+                assert!(!elevated);
+                assert_ne!(parent, 0);
+                MoveOutcome::Declined
+            };
+            app.handle_move_prompt_action(MovePromptAction::Move);
+            assert_eq!(MOVE_SPAWNS.get(), 1);
+        }
+
+        #[test]
+        fn declined_shows_status_and_keeps_prompt() {
+            let dir = TempDir::new("move-declined");
+            let (mut app, _owner) = offered_app(dir.path());
+            app.handle_move_prompt_action(MovePromptAction::Move);
+            app.apply_move_outcome(MoveOutcome::Declined);
+            let shown = MoveStatus::Done(MoveOutcome::Declined);
+            assert_eq!(app.move_status, shown);
+            assert_eq!(app.move_prompt.as_ref().expect("open").status(), shown);
+            assert!(app.settings.install.move_prompt);
+            // Done: Move may be tried again.
+            app.handle_move_prompt_action(MovePromptAction::Move);
+            assert_eq!(MOVE_SPAWNS.get(), 2);
+        }
+
+        #[test]
+        fn moved_result_after_popup_closed_still_exits() {
+            let _lock = TRACE_FLAG.lock().unwrap_or_else(|e| e.into_inner());
+            set_owns_trace(true);
+            let dir = TempDir::new("move-moved");
+            write_one_game(dir.path());
+            let (mut app, _owner) = offered_app(dir.path());
+            app.handle_move_prompt_action(MovePromptAction::Move);
+            app.handle_move_prompt_action(MovePromptAction::Later);
+            assert!(app.move_prompt.is_none());
+            app.open_settings_hidden();
+            app.settings_ui.as_ref().unwrap().queue(counter(37));
+            app.apply_move_outcome(MoveOutcome::Moved);
+            assert!(app.relaunched);
+            assert!(!owns_trace(), "the moved copy runs the capture");
+            // The Quit path ran (`close_for_exit`): the window's edits are saved.
+            assert!(app.settings_ui.is_none());
+            assert!(settings_file(dir.path()).contains("counter_size = 37"));
+            // The moved copy owns the stats files now: nothing more is written.
+            app.writer.mark_games_csv_dirty();
+            app.shutdown();
+            assert!(!dir.path().join(STATS_DIR).join("games.csv").exists());
+        }
+
+        #[test]
+        fn moved_not_started_saves_false_and_stays() {
+            let dir = TempDir::new("move-not-started");
+            let (mut app, _owner) = offered_app(dir.path());
+            app.handle_move_prompt_action(MovePromptAction::Move);
+            let o = MoveOutcome::MovedNotStarted("x".into());
+            app.apply_move_outcome(o.clone());
+            assert!(!app.settings.install.move_prompt);
+            assert!(!app.relaunched);
+            assert_eq!(app.move_status, MoveStatus::Done(o.clone()));
+            assert_eq!(
+                app.move_prompt.as_ref().expect("open").status(),
+                MoveStatus::Done(o)
+            );
+        }
+
+        #[test]
+        fn moved_from_start_saves_false() {
+            let dir = TempDir::new("move-moved-from");
+            let (mut app, _owner) = test_app(dir.path());
+            assert!(app.settings.install.move_prompt);
+            app.finish_moved_from(DOWNLOADS_EXE.to_string());
+            assert!(!app.settings.install.move_prompt);
+            app.flush_settings_save();
+            assert!(!saved_move_prompt(dir.path()));
         }
     }
 }
