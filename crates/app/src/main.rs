@@ -18,6 +18,10 @@ mod installer;
 #[cfg(windows)]
 mod log;
 #[cfg(windows)]
+// The welcome popup and the App use it from the next change on.
+#[allow(dead_code)]
+mod mover;
+#[cfg(windows)]
 mod overlay;
 #[cfg(windows)]
 mod paths;
@@ -958,6 +962,8 @@ mod app {
             crate::installer::WORKER_THREAD,
             crate::installer::CLEANUP_THREAD,
             crate::startup::WORKER_THREAD,
+            crate::mover::WORKER_THREAD,
+            crate::mover::DELETE_THREAD,
         ];
         owns_trace && !in_ui_frame && !thread.is_some_and(|t| workers.contains(&t))
     }
@@ -989,6 +995,11 @@ mod app {
         // mutex, tray, overlay or capture; it changes the task and exits.
         if let Some(flag) = crate::startup::parse_flag(std::env::args().skip(1)) {
             std::process::exit(crate::startup::run_mode(flag));
+        }
+        // The elevated helper a non-elevated Lite Bar starts to move itself to Program
+        // Files: no mutex, tray or UI; it copies the exe, starts the copy and exits.
+        if let Some(args) = lite_bar_core::install::parse_move_to(std::env::args().skip(1)) {
+            std::process::exit(crate::mover::run_move_mode(args));
         }
 
         let updated_from = updated_launch(std::env::args().skip(1));
@@ -2502,6 +2513,8 @@ mod app {
             for t in [
                 crate::installer::WORKER_THREAD,
                 crate::installer::CLEANUP_THREAD,
+                crate::mover::WORKER_THREAD,
+                crate::mover::DELETE_THREAD,
             ] {
                 assert!(!panic_stops_trace(false, Some(t), true), "{t}");
             }

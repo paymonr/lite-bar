@@ -49,7 +49,7 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// `FILE_SHARE_READ`.
 const SHARE_READ: u32 = 0x0000_0001;
 /// How long a non-elevated Lite Bar waits for its elevated helper.
-const HELPER_WAIT_MS: u32 = 60_000;
+pub(crate) const HELPER_WAIT_MS: u32 = 60_000;
 
 /// Why a job that panicked failed.
 pub const PANICKED: &str = "unexpected error";
@@ -386,15 +386,48 @@ fn change_elevated(enabled: bool) -> StartupResult {
 /// administrator (UAC, owned by the window `parent`), waits for it, then reports the
 /// state. Blocks.
 fn change_via_uac(enabled: bool, parent: usize) -> StartupResult {
-    let exe = match own_exe() {
-        Ok(exe) => exe,
-        Err(e) => return StartupResult::Changed(failed_change(&e, &query_now())),
+    let params = format!("{STARTUP_FLAG} {}", if enabled { "on" } else { "off" });
+    let code = match run_elevated_helper(&params, parent) {
+        Ok(code) => code,
+        Err(ElevatedError::Declined) => {
+            log::info("startup task: the administrator prompt was declined");
+            return StartupResult::Declined;
+        }
+        Err(ElevatedError::Other(e)) => {
+            log::warn(&format!(
+                "startup task: couldn't start the elevated helper: {e}"
+            ));
+            return StartupResult::Changed(failed_change(&e, &query_now()));
+        }
     };
+    // Checked after the helper, also when it failed or is still running (timed out), so
+    // the switch shows what is really there.
+    let state = query_now();
+    if code != 0 {
+        log::warn(&format!(
+            "startup task: the elevated helper exited with {code} (or didn't finish)"
+        ));
+        return StartupResult::Changed(failed_change("see lite-bar.log", &state));
+    }
+    StartupResult::Changed(state)
+}
+
+/// Why the elevated helper didn't run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ElevatedError {
+    /// The user declined the UAC prompt.
+    Declined,
+    /// It couldn't be started.
+    Other(String),
+}
+
+/// Starts this exe with `params` as administrator (one UAC prompt, owned by the window
+/// `parent`), hidden, and waits up to `HELPER_WAIT_MS` for it. Returns its exit code: 1 when
+/// it didn't finish in time or the code couldn't be read. Blocks.
+pub(crate) fn run_elevated_helper(params: &str, parent: usize) -> Result<u32, ElevatedError> {
+    let exe = own_exe().map_err(ElevatedError::Other)?;
     let file = HSTRING::from(exe.as_str());
-    let params = HSTRING::from(format!(
-        "{STARTUP_FLAG} {}",
-        if enabled { "on" } else { "off" }
-    ));
+    let params = HSTRING::from(params);
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
         fMask: SEE_MASK_NOCLOSEPROCESS,
@@ -418,13 +451,9 @@ fn change_via_uac(enabled: bool, parent: usize) -> StartupResult {
     };
     if let Err(e) = launched {
         if e.code() == ERROR_CANCELLED.to_hresult() {
-            log::info("startup task: the administrator prompt was declined");
-            return StartupResult::Declined;
+            return Err(ElevatedError::Declined);
         }
-        log::warn(&format!(
-            "startup task: couldn't start the elevated helper: {e}"
-        ));
-        return StartupResult::Changed(failed_change(&e.message(), &query_now()));
+        return Err(ElevatedError::Other(e.message()));
     }
     let mut code = 1u32;
     if !info.hProcess.is_invalid() {
@@ -436,16 +465,7 @@ fn change_via_uac(enabled: bool, parent: usize) -> StartupResult {
             let _ = CloseHandle(info.hProcess);
         }
     }
-    // Checked after the helper, also when it failed or is still running (timed out), so
-    // the switch shows what is really there.
-    let state = query_now();
-    if code != 0 {
-        log::warn(&format!(
-            "startup task: the elevated helper exited with {code} (or didn't finish)"
-        ));
-        return StartupResult::Changed(failed_change("see lite-bar.log", &state));
-    }
-    StartupResult::Changed(state)
+    Ok(code)
 }
 
 /// Starts `job` on a new thread and posts its result, or `if_panics` if it panics, to
@@ -478,64 +498,16 @@ pub unsafe fn take_result(lparam: LPARAM) -> StartupResult {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
-
     use lite_bar_core::startup_task::{
         create_args, delete_args, query_args, query_xml_args, task_xml,
     };
 
     use super::*;
-    use crate::test_util::{MsgWindow, TempDir};
+    use crate::test_util::{FakeRunner, MsgWindow, TempDir};
 
     const SCHTASKS: &str = r"C:\Windows\System32\schtasks.exe";
     const EXE: &str = r"C:\Games & Tools\Lite Bar\lite-bar.exe";
     const USER: &str = r"PC\paymon";
-
-    /// Records every call and answers with scripted exit codes and stdout, in order.
-    #[derive(Default)]
-    struct FakeRunner {
-        calls: RefCell<Vec<(String, Vec<String>)>>,
-        /// Answers for the calls in order; a call past the end fails.
-        answers: RefCell<Vec<Output>>,
-        /// The XML file's bytes, read while the create command "runs".
-        seen_file: RefCell<Option<Vec<u8>>>,
-    }
-
-    impl FakeRunner {
-        fn new(answers: Vec<Output>) -> FakeRunner {
-            FakeRunner {
-                answers: RefCell::new(answers.into_iter().rev().collect()),
-                ..FakeRunner::default()
-            }
-        }
-
-        fn calls(&self) -> Vec<Vec<String>> {
-            self.calls.borrow().iter().map(|c| c.1.clone()).collect()
-        }
-
-        fn answer(&self, exe: &str, args: &[String]) -> Output {
-            self.calls
-                .borrow_mut()
-                .push((exe.to_string(), args.to_vec()));
-            if args.first().map(String::as_str) == Some("/Create") {
-                *self.seen_file.borrow_mut() = std::fs::read(&args[4]).ok();
-            }
-            self.answers
-                .borrow_mut()
-                .pop()
-                .unwrap_or_else(|| Err("unexpected call".into()))
-        }
-    }
-
-    impl CommandRunner for FakeRunner {
-        fn run(&self, exe: &str, args: &[String]) -> Result<i32, String> {
-            self.answer(exe, args).map(|a| a.0)
-        }
-
-        fn output(&self, exe: &str, args: &[String]) -> Output {
-            self.answer(exe, args)
-        }
-    }
 
     fn exit(code: i32) -> Output {
         Ok((code, Vec::new()))
