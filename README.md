@@ -99,14 +99,29 @@ FPS capture needs administrator rights, so Lite Bar starts at sign-in through a 
 - Until Lite Bar has checked the task, the switch sits in the middle and ignores clicks. If a change fails, the switch shows what the task looks like after the failed attempt.
 - If Windows refuses a non-elevated Lite Bar's check, the switch may show off even though the task exists. Turning it on is still safe: it re-creates the same task.
 - The task runs at normal priority.
-- Security: the elevated task runs whatever `lite-bar.exe` is at its path, with administrator rights, at every sign-in. Anyone who can replace that file can run code as administrator. On a shared PC, or when other accounts or programs you don't trust can write to Lite Bar's folder, keep Lite Bar in a folder only administrators can change, such as `C:\Program Files\Lite Bar`. **Update now** still works there when Lite Bar runs elevated, which it does when the task starts it.
+- Security: the elevated task runs whatever `lite-bar.exe` is at its path, with administrator rights, at every sign-in. Anyone who can replace that file can run code as administrator. On a shared PC, or when other accounts or programs you don't trust can write to Lite Bar's folder, keep Lite Bar in a folder only administrators can change, such as `C:\Program Files\Lite Bar` (see [Install location](#install-location)). **Update now** still works there when Lite Bar runs elevated, which it does when the task starts it.
 - On an account that isn't an administrator, the UAC prompt asks for an administrator's password ("over the shoulder"). The task then belongs to that administrator account and starts Lite Bar at *their* sign-in, not yours. Turn the switch on from your own administrator account instead.
 - To remove the task by hand, run this from an administrator prompt: `schtasks /Delete /TN "Lite Bar" /F`.
+
+### Install location
+
+Lite Bar runs as administrator, so the best place for `lite-bar.exe` is `<Program Files>\Lite Bar`, a folder only administrators can change. A copy anywhere else (Downloads, your desktop) can be replaced by any program that runs as you, and Lite Bar would then run that program as administrator.
+
+When Lite Bar starts from any other folder, a **Welcome to Lite Bar** popup explains the basics and offers the move. It is not shown when Lite Bar already runs from Program Files.
+
+- **Move to Program Files** copies `lite-bar.exe` to `<Program Files>\Lite Bar`, replacing a `lite-bar.exe` already there, starts the new copy as administrator and quits the old one, then deletes the old `lite-bar.exe` if it can. One UAC prompt, unless Lite Bar already runs as administrator. If **Start with Windows** was on for the old copy, it is pointed at the new one.
+- **Ask me later** (or closing the popup) shows it again the next time Lite Bar starts.
+- **No thanks** never asks again (`[install] move_prompt = false`).
+
+Settings, the log and stats stay in `%APPDATA%\LiteBar`; only the exe moves. Moving needs your own administrator account: if the UAC prompt is answered with another account's password, nothing is changed and the popup says so.
+
+To move by hand: quit Lite Bar, move `lite-bar.exe` to `<Program Files>\Lite Bar`, start it from there, then turn **Start with Windows** off and on so the task points at the new location.
 
 ### Files
 
 | File | Path |
 | --- | --- |
+| Program | `<Program Files>\Lite Bar\lite-bar.exe` (recommended, see [Install location](#install-location)) |
 | Settings | `%APPDATA%\LiteBar\settings.toml` |
 | Log | `%APPDATA%\LiteBar\lite-bar.log` |
 | Game stats | `%APPDATA%\LiteBar\stats\` (see [Stats and history](#stats-and-history)) |
@@ -150,6 +165,12 @@ Hotkey syntax: zero or more modifiers (`Ctrl`, `Alt`, `Shift`, `Win`) and exactl
 | Key | Type and values | Default |
 | --- | --- | --- |
 | `check` | bool; check GitHub for a newer release about 30 s after start and then every 24 h. Nothing is downloaded or installed until you click **Update now** | `true` |
+
+`[install]`
+
+| Key | Type and values | Default |
+| --- | --- | --- |
+| `move_prompt` | bool; offer to move Lite Bar to Program Files in a welcome popup when it starts from another folder. Set to `false` when you answer **Move to Program Files** or **No thanks** | `true` |
 
 `[game_names]`
 
