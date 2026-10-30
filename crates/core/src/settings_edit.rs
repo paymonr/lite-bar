@@ -24,7 +24,8 @@ pub enum SettingsChange {
     TextSize(u16),
     SavedColors(Vec<Rgb>),
     CheckUpdates(bool),
-    /// Resets `overlay`, `hotkeys` and `updates`; keeps `game_names` and `saved_colors`.
+    MovePrompt(bool),
+    /// Resets `overlay`, `hotkeys` and `updates`; keeps `install`, `game_names` and `saved_colors`.
     RestoreDefaults,
     ToggleHotkey(Hotkey),
     /// `None` removes the override.
@@ -56,6 +57,7 @@ pub fn apply_change(settings: &mut Settings, change: &SettingsChange) {
             settings.saved_colors = last_saved(v).to_vec();
         }
         SettingsChange::CheckUpdates(v) => settings.updates.check = *v,
+        SettingsChange::MovePrompt(v) => settings.install.move_prompt = *v,
         SettingsChange::RestoreDefaults => {
             let d = Settings::default();
             settings.overlay = d.overlay;
@@ -136,6 +138,7 @@ fn edit_doc(doc: &mut DocumentMut, change: &SettingsChange) -> Result<(), String
             set(doc, "colors", "saved", array.into())
         }
         SettingsChange::CheckUpdates(v) => set(doc, "updates", "check", (*v).into()),
+        SettingsChange::MovePrompt(v) => set(doc, "install", "move_prompt", (*v).into()),
         SettingsChange::RestoreDefaults => {
             let d = OverlaySettings::default();
             edit_doc(doc, &SettingsChange::Visible(d.visible))?;
@@ -456,6 +459,26 @@ mod tests {
         let mut s = parse_settings("[updates]\ncheck = false\n").0;
         apply_change(&mut s, &SettingsChange::RestoreDefaults);
         assert!(s.updates.check);
+    }
+
+    #[test]
+    fn move_prompt_edit_adds_section_and_keeps_comments() {
+        let start = "# mine\n[updates]\ncheck = false # keep\n";
+        let out = edit_settings_text(start, &[SettingsChange::MovePrompt(false)]).unwrap();
+        assert!(out.contains("# mine"), "{out:?}");
+        assert!(out.contains("check = false # keep"), "{out:?}");
+        assert!(!parse_settings(&out).0.install.move_prompt);
+    }
+
+    #[test]
+    fn restore_defaults_keeps_move_prompt() {
+        let mut s = Settings::default();
+        apply_change(&mut s, &SettingsChange::MovePrompt(false));
+        apply_change(&mut s, &SettingsChange::RestoreDefaults);
+        assert!(!s.install.move_prompt);
+        let out = edit_settings_text("", &[SettingsChange::MovePrompt(false)]).unwrap();
+        let out = edit_settings_text(&out, &[SettingsChange::RestoreDefaults]).unwrap();
+        assert!(!parse_settings(&out).0.install.move_prompt);
     }
 
     #[test]

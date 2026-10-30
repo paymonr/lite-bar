@@ -101,6 +101,18 @@ impl Default for UpdateSettings {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+pub struct InstallSettings {
+    /// Offer to move Lite Bar to Program Files when it starts.
+    pub move_prompt: bool,
+}
+
+impl Default for InstallSettings {
+    fn default() -> Self {
+        InstallSettings { move_prompt: true }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Default, Serialize)]
 pub struct Settings {
     pub overlay: OverlaySettings,
@@ -111,6 +123,7 @@ pub struct Settings {
     /// Colors saved in the settings window's picker, oldest first, at most `MAX_SAVED_COLORS`.
     pub saved_colors: Vec<Rgb>,
     pub updates: UpdateSettings,
+    pub install: InstallSettings,
 }
 
 /// Most colors kept in `[colors] saved`.
@@ -232,6 +245,11 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
         settings.updates.check = v;
     }
 
+    let install = read_section(&root, "install", &mut warnings);
+    if let Some(v) = read_field(&install, "install", "move_prompt", &mut warnings) {
+        settings.install.move_prompt = v;
+    }
+
     let colors = read_section(&root, "colors", &mut warnings);
     if let Some(entries) = read_field::<Vec<toml::Value>>(&colors, "colors", "saved", &mut warnings)
     {
@@ -312,6 +330,11 @@ saved = []
 # Check GitHub for a newer Lite Bar shortly after start and then once a day: true or false.
 # Nothing is downloaded or installed until you click "Update now".
 check = true
+
+[install]
+# Offer to move Lite Bar to Program Files when it starts: true or false.
+# Set to false once you answer "Move to Program Files" or "No thanks".
+move_prompt = true
 
 [game_names]
 # Display names used in the game stats files (games.csv, sessions.csv). The key is an exe
@@ -557,5 +580,33 @@ mod updates_tests {
         assert!(lines.contains(&"[updates]"));
         let at = lines.iter().position(|l| *l == "check = true").unwrap();
         assert!(lines[at - 1].starts_with('#'));
+    }
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+
+    #[test]
+    fn move_prompt_defaults_true_and_parses() {
+        assert!(Settings::default().install.move_prompt);
+        let (s, w) = parse_settings("[install]\nmove_prompt = false\n");
+        assert!(!s.install.move_prompt);
+        assert!(w.is_empty(), "{w:?}");
+        let (s, w) = parse_settings("[install]\nmove_prompt = 3\n");
+        assert!(s.install.move_prompt);
+        assert!(w[0].contains("install.move_prompt"));
+        let (s, _) = parse_settings("");
+        assert!(s.install.move_prompt);
+    }
+
+    #[test]
+    fn template_documents_move_prompt() {
+        let t = default_settings_toml();
+        assert!(t.contains("[install]"));
+        assert!(t.contains("move_prompt = true"));
+        let (s, w) = parse_settings(&t);
+        assert_eq!(s, Settings::default());
+        assert!(w.is_empty(), "{w:?}");
     }
 }
