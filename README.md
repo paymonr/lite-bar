@@ -108,6 +108,8 @@ FPS capture needs administrator rights, so Lite Bar starts at sign-in through a 
 | File | Path |
 | --- | --- |
 | Program | `<Program Files>\Lite Bar\lite-bar.exe` (recommended, see [Install location](#install-location)) |
+| Start menu shortcut | `%ProgramData%\Microsoft\Windows\Start Menu\Programs\Lite Bar.lnk` (added by **Install to Program Files**) |
+| Installed apps entry | `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\LiteBar` (added by **Install to Program Files**) |
 | Settings | `%APPDATA%\LiteBar\settings.toml` |
 | Log | `%APPDATA%\LiteBar\lite-bar.log` |
 | Game stats | `%APPDATA%\LiteBar\stats\` (see [Stats and history](#stats-and-history)) |
@@ -118,15 +120,29 @@ The settings file is created with the default values and a comment for every key
 
 Lite Bar runs as administrator, so the best place for `lite-bar.exe` is `<Program Files>\Lite Bar`, a folder only administrators can change. A copy anywhere else (Downloads, your desktop) can be replaced by any program that runs as you, and Lite Bar would then run that program as administrator.
 
-When Lite Bar starts from any other folder, a **Welcome to Lite Bar** popup explains the basics and offers the move. It is not shown when Lite Bar already runs from Program Files.
+When Lite Bar starts from any other folder, a **Welcome to Lite Bar** popup explains the basics and offers to install it. It is not shown when Lite Bar already runs from Program Files.
 
-- **Move to Program Files** copies `lite-bar.exe` to `<Program Files>\Lite Bar`, replacing a `lite-bar.exe` already there, starts the new copy as administrator and quits the old one, then deletes the old `lite-bar.exe` if it can. One UAC prompt, unless Lite Bar already runs as administrator. If **Start with Windows** was on for the old copy, it is pointed at the new one.
+- **Install to Program Files** copies `lite-bar.exe` to `<Program Files>\Lite Bar`, replacing a `lite-bar.exe` already there, adds Lite Bar to the Start menu (for all users) and to Installed apps, starts the new copy as administrator and quits the old one, then deletes the old `lite-bar.exe` if it can. One UAC prompt, unless Lite Bar already runs as administrator. If **Start with Windows** was on for the old copy, it is pointed at the new one.
 - **Ask me later** (or closing the popup) shows it again the next time Lite Bar starts.
 - **No thanks** never asks again (`[install] move_prompt = false`).
 
-Settings, the log and stats stay in `%APPDATA%\LiteBar`; only the exe moves. Moving needs your own administrator account: if the UAC prompt is answered with another account's password, nothing is changed and the popup says so.
+Settings, the log and stats stay in `%APPDATA%\LiteBar`; only the exe moves. Installing needs your own administrator account: if the UAC prompt is answered with another account's password, nothing is changed and the popup says so.
 
-To move by hand: quit Lite Bar, move `lite-bar.exe` to `<Program Files>\Lite Bar`, start it from there, then turn **Start with Windows** off and on so the task points at the new location.
+Opening Lite Bar from Start runs it without administrator rights, like double-clicking `lite-bar.exe`. Opening it while it already runs shows its Settings window. When Lite Bar runs as administrator from `<Program Files>\Lite Bar`, it refreshes the Start menu shortcut and the Installed apps entry at each start, so they stay current after **Update now**.
+
+### Uninstall
+
+Remove Lite Bar in Windows **Settings → Apps → Installed apps**, which runs `lite-bar.exe --uninstall`. It asks for administrator rights (another account's password is refused) and shows a confirmation window with **Also delete my settings and stats**, off by default. Uninstalling then:
+
+1. quits Lite Bar;
+2. removes **Start with Windows**, the Start menu shortcut and the program folder (deleted after the uninstall window closes, and again at the next restart if something still held it);
+3. removes the Installed apps entry, last.
+
+Settings and stats in `%APPDATA%\LiteBar` are kept unless you turn the switch on.
+
+On a copy outside Program Files (a portable copy), `lite-bar.exe --uninstall` removes only the **Start with Windows** entry and, if you choose, the settings and stats. It leaves the exe where it is.
+
+To install by hand: quit Lite Bar, move `lite-bar.exe` to `<Program Files>\Lite Bar`, start it from there, then turn **Start with Windows** off and on so the task points at the new location.
 
 ### Settings
 
@@ -170,7 +186,7 @@ Hotkey syntax: zero or more modifiers (`Ctrl`, `Alt`, `Shift`, `Win`) and exactl
 
 | Key | Type and values | Default |
 | --- | --- | --- |
-| `move_prompt` | bool; offer to move Lite Bar to Program Files in a welcome popup when it starts from another folder. Set to `false` when you answer **Move to Program Files** or **No thanks** | `true` |
+| `move_prompt` | bool; offer to install Lite Bar to Program Files in a welcome popup when it starts from another folder. Set to `false` when you answer **Install to Program Files** or **No thanks** | `true` |
 
 `[game_names]`
 
