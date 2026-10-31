@@ -10,6 +10,7 @@ pub mod install;
 pub mod layout;
 pub mod move_prompt_ui;
 pub mod overlay_draw;
+pub mod registration;
 pub mod sessions;
 pub mod settings;
 pub mod settings_edit;
