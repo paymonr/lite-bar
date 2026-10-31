@@ -45,7 +45,7 @@ pub const WORKER_THREAD: &str = "startup-task";
 pub const STARTUP_FLAG: &str = "--startup";
 
 /// `CREATE_NO_WINDOW`: schtasks is a console program; no console flashes up.
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 /// `FILE_SHARE_READ`.
 const SHARE_READ: u32 = 0x0000_0001;
 /// How long a non-elevated Lite Bar waits for its elevated helper.

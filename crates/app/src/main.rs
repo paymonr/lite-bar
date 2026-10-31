@@ -46,6 +46,10 @@ mod ui_host;
 #[cfg(windows)]
 mod ui_paint;
 #[cfg(windows)]
+// Nothing runs the uninstall until its window (the next step) exists.
+#[allow(dead_code)]
+mod uninstall;
+#[cfg(windows)]
 mod updater;
 
 #[cfg(windows)]
@@ -134,7 +138,7 @@ mod app {
     use crate::updater::{fetch_latest, take_result, CheckResult, LATEST_URL, WM_UPDATE_RESULT};
     use crate::{log, tray};
 
-    const MUTEX_NAME: &str = "Local\\LiteBar.SingleInstance";
+    pub(crate) const MUTEX_NAME: &str = "Local\\LiteBar.SingleInstance";
     const TIMER_ID: usize = 1;
     const TIMER_MS: u32 = 250;
     /// Owner-window timer that writes the settings file once the save debounce is due.
@@ -1064,6 +1068,7 @@ mod app {
             crate::mover::WORKER_THREAD,
             crate::mover::DELETE_THREAD,
             crate::registration::REGISTER_THREAD,
+            crate::uninstall::UNINSTALL_THREAD,
         ];
         owns_trace && !in_ui_frame && !thread.is_some_and(|t| workers.contains(&t))
     }

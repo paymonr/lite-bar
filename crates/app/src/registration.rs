@@ -14,7 +14,7 @@ use lite_bar_core::registration::{
 };
 use windows::core::{Interface, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, RPC_E_CHANGED_MODE,
+    ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, RPC_E_CHANGED_MODE,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
@@ -90,8 +90,11 @@ pub fn read_values(root: HKEY, subkey: &str) -> BTreeMap<String, RegValue> {
         if status == ERROR_NO_MORE_ITEMS {
             break;
         }
+        if status == ERROR_MORE_DATA {
+            continue; // a value too large for the buffer: not one of ours
+        }
         if status != ERROR_SUCCESS {
-            continue; // e.g. a value too large for the buffer: not one of ours
+            break; // e.g. the key was deleted meanwhile: it won't get better
         }
         let name = String::from_utf16_lossy(&name[..name_len as usize]);
         let data = &data[..data_len as usize];
@@ -162,9 +165,7 @@ pub fn write_values(
     Ok(())
 }
 
-/// Deletes the key `root\subkey` (it has no subkeys); a missing key is fine. Only the tests
-/// call it until the uninstall removes the entry.
-#[allow(dead_code)]
+/// Deletes the key `root\subkey` (it has no subkeys); a missing key is fine.
 pub fn delete_key(root: HKEY, subkey: &str) -> Result<(), String> {
     // SAFETY: plain FFI with a valid string.
     let status = unsafe { RegDeleteKeyExW(root, &HSTRING::from(subkey), KEY_WOW64_64KEY.0, None) };

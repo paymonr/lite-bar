@@ -1,10 +1,14 @@
 //! Elevation (UAC) helpers.
 
-use windows::core::{w, HSTRING};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use crate::startup::ElevatedError;
+use windows::core::{w, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+use windows::Win32::System::Com::{
+    CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+};
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{ShellExecuteExW, ShellExecuteW, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 /// Whether the current process token is elevated. `false` on any failure.
@@ -41,6 +45,39 @@ pub fn relaunch_as_admin() -> windows::core::Result<()> {
         Ok(())
     } else {
         Err(windows::core::Error::from_thread())
+    }
+}
+
+/// Starts this exe with `params` as administrator (one UAC prompt) in a visible window and
+/// doesn't wait for it. A declined prompt is `Declined`. Nothing calls it until the
+/// uninstall mode (the next step) does.
+#[allow(dead_code)]
+pub fn run_as_admin(params: &str) -> Result<(), ElevatedError> {
+    let exe = std::env::current_exe().map_err(|e| ElevatedError::Other(e.to_string()))?;
+    let file = HSTRING::from(exe.as_os_str());
+    let params = HSTRING::from(params);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        lpVerb: w!("runas"),
+        lpFile: PCWSTR(file.as_ptr()),
+        lpParameters: PCWSTR(params.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    // ShellExecuteEx may use COM; it is initialized here only when this thread had none.
+    // SAFETY: `info` and the strings it points to live through the call.
+    let launched = unsafe {
+        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        let r = ShellExecuteExW(&mut info);
+        if com.is_ok() {
+            CoUninitialize();
+        }
+        r
+    };
+    match launched {
+        Ok(()) => Ok(()),
+        Err(e) if e.code() == ERROR_CANCELLED.to_hresult() => Err(ElevatedError::Declined),
+        Err(e) => Err(ElevatedError::Other(e.message())),
     }
 }
 
