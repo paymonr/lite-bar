@@ -46,9 +46,9 @@ mod ui_host;
 #[cfg(windows)]
 mod ui_paint;
 #[cfg(windows)]
-// Nothing runs the uninstall until its window (the next step) exists.
-#[allow(dead_code)]
 mod uninstall;
+#[cfg(windows)]
+mod uninstall_window;
 #[cfg(windows)]
 mod updater;
 
@@ -1087,6 +1087,28 @@ mod app {
         }));
     }
 
+    /// A helper process mode: `run` dispatches these before the single-instance mutex.
+    enum HelperMode {
+        /// The elevated helper a non-elevated Lite Bar starts for "Start with Windows": it
+        /// changes the task and exits.
+        Startup(Result<bool, String>),
+        /// The elevated helper a non-elevated Lite Bar starts to move itself to Program
+        /// Files: it copies the exe, starts the copy and exits.
+        MoveTo(Result<lite_bar_core::install::MoveArgs, String>),
+        /// `--uninstall [--for "<user>"]`, as Windows runs it from Installed apps.
+        Uninstall(Option<String>),
+    }
+
+    fn helper_mode(args: Vec<String>) -> Option<HelperMode> {
+        if let Some(flag) = crate::startup::parse_flag(args.iter().cloned()) {
+            return Some(HelperMode::Startup(flag));
+        }
+        if let Some(args) = lite_bar_core::install::parse_move_to(args.iter().cloned()) {
+            return Some(HelperMode::MoveTo(args));
+        }
+        lite_bar_core::uninstall::parse_uninstall(args.into_iter()).map(HelperMode::Uninstall)
+    }
+
     pub fn run() {
         // SAFETY: plain FFI. Fails (ignored) if a manifest already set the awareness.
         unsafe {
@@ -1096,15 +1118,14 @@ mod app {
         log::init(&dir);
         install_panic_hook();
 
-        // The elevated helper a non-elevated Lite Bar starts for "Start with Windows": no
-        // mutex, tray, overlay or capture; it changes the task and exits.
-        if let Some(flag) = crate::startup::parse_flag(std::env::args().skip(1)) {
-            std::process::exit(crate::startup::run_mode(flag));
-        }
-        // The elevated helper a non-elevated Lite Bar starts to move itself to Program
-        // Files: no mutex, tray or UI; it copies the exe, starts the copy and exits.
-        if let Some(args) = lite_bar_core::install::parse_move_to(std::env::args().skip(1)) {
-            std::process::exit(crate::mover::run_move_mode(args));
+        // The helper modes run without the mutex, tray, overlay or capture.
+        match helper_mode(std::env::args().skip(1).collect()) {
+            Some(HelperMode::Startup(flag)) => std::process::exit(crate::startup::run_mode(flag)),
+            Some(HelperMode::MoveTo(args)) => std::process::exit(crate::mover::run_move_mode(args)),
+            Some(HelperMode::Uninstall(user)) => {
+                std::process::exit(crate::uninstall::run_uninstall_mode(user))
+            }
+            None => {}
         }
 
         let updated_from = updated_launch(std::env::args().skip(1));
@@ -2667,6 +2688,32 @@ mod app {
             ui.queue(UiAction::InstallUpdate);
             app.drain_settings_actions();
             assert_eq!(RELAUNCHED.with(|r| r.borrow().clone()), vec![exe]);
+        }
+
+        fn args(a: &[&str]) -> Vec<String> {
+            a.iter().map(|s| s.to_string()).collect()
+        }
+
+        #[test]
+        fn uninstall_flag_dispatches_before_mutex() {
+            assert!(matches!(
+                helper_mode(args(&["--uninstall"])),
+                Some(HelperMode::Uninstall(None))
+            ));
+            assert!(matches!(
+                helper_mode(args(&["--uninstall", "--for", r"PC\me"])),
+                Some(HelperMode::Uninstall(Some(u))) if u == r"PC\me"
+            ));
+            assert!(matches!(
+                helper_mode(args(&["--startup", "on"])),
+                Some(HelperMode::Startup(Ok(true)))
+            ));
+            assert!(matches!(
+                helper_mode(args(&["--move-to", r"C:\Program Files\Lite Bar"])),
+                Some(HelperMode::MoveTo(_))
+            ));
+            assert!(helper_mode(args(&[])).is_none());
+            assert!(helper_mode(args(&["--updated-from", "1.0.0"])).is_none());
         }
 
         #[test]

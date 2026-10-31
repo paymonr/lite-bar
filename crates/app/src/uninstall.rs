@@ -7,21 +7,43 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use lite_bar_core::registration::{SHORTCUT_FILE, UNINSTALL_KEY};
+use lite_bar_core::install::same_user;
+use lite_bar_core::registration::{is_installed_copy, SHORTCUT_FILE, UNINSTALL_KEY};
 use lite_bar_core::startup_task::StartupState;
-use lite_bar_core::uninstall::{folder_removable, UninstallStep, QUIT_FAILED};
+use lite_bar_core::uninstall::{
+    finish_message, folder_removable, uninstall_args, uninstall_plan, UninstallStep, OTHER_ACCOUNT,
+    QUIT_FAILED,
+};
+use lite_bar_core::uninstall_ui::{UninstallAction, UninstallStatus};
 use windows::core::{w, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
 use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_CLOSE};
+use windows::Win32::UI::WindowsAndMessaging::{
+    CreateWindowExW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, PostMessageW,
+    TranslateMessage, HWND_MESSAGE, MSG, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WS_OVERLAPPED,
+};
 
+use crate::elevation::{is_elevated, run_as_admin};
 use crate::log;
 use crate::registration::{common_programs, delete_key};
 use crate::single_instance::{acquire_single_instance, wait_for};
-use crate::startup::{query, schtasks_path, set_now, SystemRunner, CREATE_NO_WINDOW};
+use crate::startup::{
+    current_user, query, schtasks_path, set_now, ElevatedError, SystemRunner, CREATE_NO_WINDOW,
+};
+use crate::uninstall_window::{UninstallState, UninstallUi};
 
 /// Name of the uninstall thread; the panic hook leaves the ETW trace alone for it.
 pub const UNINSTALL_THREAD: &str = "uninstall";
+
+/// Posted to the owner window with the uninstall's result (`UninstallResult`).
+pub const WM_UNINSTALL_RESULT: u32 = WM_APP + 8;
+
+/// What the worker reports: the steps that failed, or why nothing was changed.
+type UninstallResult = Result<Vec<UninstallStep>, String>;
+
+/// Shown when the worker panicked.
+const PANICKED: &str = "The uninstall stopped unexpectedly. See the log for details.";
 
 /// How long the running Lite Bar gets to close, and how often that is checked.
 const QUIT_WAIT: Duration = Duration::from_secs(10);
@@ -250,13 +272,243 @@ fn remove_entry() -> Result<(), String> {
     delete_key(HKEY_LOCAL_MACHINE, UNINSTALL_KEY)
 }
 
+/// How the `--uninstall` mode starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Entry {
+    /// Not elevated: start an elevated copy and leave.
+    Relaunch,
+    /// Elevated as another account: say so.
+    Refuse,
+    /// Show the confirmation.
+    Confirm,
+}
+
+/// `for_user` is the `--for` account the elevated copy was started for, `me` the account
+/// this process runs as.
+pub fn uninstall_entry(elevated: bool, for_user: Option<&str>, me: &str) -> Entry {
+    match for_user {
+        _ if !elevated => Entry::Relaunch,
+        Some(u) if !same_user(u, me) => Entry::Refuse,
+        _ => Entry::Confirm,
+    }
+}
+
+/// Whether the message loop goes on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flow {
+    Continue,
+    Exit,
+}
+
+/// Starts the worker for `(owner, installed, delete_data)`; false when it couldn't start.
+type StartJob = fn(HWND, bool, bool) -> bool;
+
+/// The open window and what the user chose so far.
+struct Session {
+    ui: UninstallUi,
+    owner: HWND,
+    installed: bool,
+    delete_data: bool,
+    working: bool,
+    start: StartJob,
+}
+
+impl Session {
+    fn new(ui: UninstallUi, owner: HWND, installed: bool, start: StartJob) -> Session {
+        Session {
+            ui,
+            owner,
+            installed,
+            delete_data: false,
+            working: false,
+            start,
+        }
+    }
+
+    /// Applies what the page queued. Cancel and Close end it, except while the uninstall
+    /// runs: that finishes first (`on_result` ends it).
+    fn drain(&mut self) -> Flow {
+        for action in self.ui.take() {
+            match action {
+                UninstallAction::SetDeleteData(on) => {
+                    self.delete_data = on;
+                    self.ui.set_delete_data(on);
+                }
+                UninstallAction::Uninstall if !self.working => {
+                    self.working = true;
+                    self.ui.set_status(&UninstallStatus::Working);
+                    if !(self.start)(self.owner, self.installed, self.delete_data) {
+                        self.working = false;
+                        let msg = "Couldn't start the uninstall.".to_string();
+                        self.ui.set_status(&UninstallStatus::Failed(msg));
+                    }
+                }
+                UninstallAction::Cancel | UninstallAction::Close if !self.working => {
+                    return Flow::Exit;
+                }
+                _ => {}
+            }
+        }
+        Flow::Continue
+    }
+
+    /// Shows the result. Ends the loop when the user closed the window meanwhile.
+    fn on_result(&mut self, result: UninstallResult) -> Flow {
+        self.working = false;
+        let status = match result {
+            Ok(failed) => UninstallStatus::Done(finish_message(&failed)),
+            Err(e) => UninstallStatus::Failed(e),
+        };
+        self.ui.set_status(&status);
+        if self.ui.is_open() {
+            Flow::Continue
+        } else {
+            Flow::Exit
+        }
+    }
+}
+
+/// Runs the plan on its own thread and posts the result to `owner`.
+fn start_job(owner: HWND, installed: bool, delete_data: bool) -> bool {
+    // HWND is not Send; the worker only posts to it.
+    let raw = owner.0 as usize;
+    std::thread::Builder::new()
+        .name(UNINSTALL_THREAD.into())
+        .spawn(move || {
+            let result = std::panic::catch_unwind(|| {
+                log::info(&format!(
+                    "uninstall started (installed: {installed}, delete data: {delete_data})"
+                ));
+                let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                let plan = uninstall_plan(installed, delete_data);
+                run_plan(&plan, &exe.to_string_lossy(), &real_ops())
+            })
+            .unwrap_or_else(|_| Err(PANICKED.into()));
+            // Dropped (harmlessly) when the data step deleted the log folder.
+            log::info(&format!("uninstall finished: {result:?}"));
+            crate::updater::post_boxed(
+                HWND(raw as *mut std::ffi::c_void),
+                WM_UNINSTALL_RESULT,
+                result,
+            );
+        })
+        .is_ok()
+}
+
+/// A message-only window that receives the worker's result; the confirmation window can be
+/// closed while the worker still runs.
+fn create_owner() -> Option<HWND> {
+    // SAFETY: plain FFI; the predefined STATIC class needs no registration.
+    unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            w!(""),
+            WS_OVERLAPPED,
+            0,
+            0,
+            0,
+            0,
+            Some(HWND_MESSAGE),
+            None,
+            None,
+            None,
+        )
+    }
+    .ok()
+}
+
+/// The `--uninstall` mode: relaunches elevated when needed, otherwise shows the
+/// confirmation and uninstalls on a worker thread. Returns the process exit code. Takes no
+/// single-instance mutex: `quit_running` waits for the running Lite Bar to release it.
+pub fn run_uninstall_mode(for_user: Option<String>) -> i32 {
+    let me = current_user();
+    match uninstall_entry(is_elevated(), for_user.as_deref(), &me) {
+        Entry::Relaunch => {
+            match run_as_admin(&uninstall_args(&me)) {
+                Ok(()) => log::info("uninstall: started the elevated copy"),
+                Err(ElevatedError::Declined) => {
+                    log::info("uninstall: the administrator prompt was declined");
+                }
+                Err(ElevatedError::Other(e)) => {
+                    log::warn(&format!("uninstall: couldn't start the elevated copy: {e}"));
+                }
+            }
+            0
+        }
+        entry => show_window(entry),
+    }
+}
+
+/// Opens the window (`Confirm` or `Refuse`) and runs its message loop until it ends.
+fn show_window(entry: Entry) -> i32 {
+    let exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let installed = crate::mover::program_files().is_some_and(|pf| is_installed_copy(&exe, &pf));
+    let status = if entry == Entry::Refuse {
+        UninstallStatus::Failed(OTHER_ACCOUNT.into())
+    } else {
+        UninstallStatus::Confirm
+    };
+    let Some(owner) = create_owner() else {
+        log::error("uninstall: couldn't create the owner window");
+        return 1;
+    };
+    let ui = UninstallUi::open(UninstallState {
+        installed,
+        data_dir: crate::paths::app_dir().to_string_lossy().into_owned(),
+        delete_data: false,
+        status,
+    });
+    let ui = match ui {
+        Ok(ui) => ui,
+        Err(e) => {
+            log::error(&format!("uninstall: couldn't open the window: {e}"));
+            // SAFETY: our own window, destroyed once.
+            let _ = unsafe { DestroyWindow(owner) };
+            return 1;
+        }
+    };
+    let mut session = Session::new(ui, owner, installed, start_job);
+    // SAFETY: standard message loop on the thread that owns the windows.
+    unsafe {
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
+            let flow = if msg.hwnd == owner && msg.message == WM_UNINSTALL_RESULT {
+                // SAFETY: posted by `start_job` with an `UninstallResult`; taken once.
+                session.on_result(take_result(msg.lParam))
+            } else {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+                session.drain()
+            };
+            if flow == Flow::Exit {
+                break;
+            }
+        }
+        let _ = DestroyWindow(owner);
+    }
+    0
+}
+
+/// Takes back the result a `WM_UNINSTALL_RESULT` carries.
+///
+/// # Safety
+/// `lparam` must come from a `WM_UNINSTALL_RESULT` posted by `start_job`, taken once.
+unsafe fn take_result(lparam: LPARAM) -> UninstallResult {
+    // SAFETY: the caller's guarantee.
+    unsafe { crate::updater::take_boxed(lparam) }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
 
-    use lite_bar_core::uninstall::{uninstall_plan, UninstallStep, QUIT_FAILED};
+    use lite_bar_core::uninstall::{finish_message, uninstall_plan, UninstallStep, QUIT_FAILED};
 
     use super::*;
+    use crate::test_util::MsgWindow;
 
     thread_local! {
         static CALLS: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
@@ -389,5 +641,105 @@ mod tests {
             DIR,
             pf
         ));
+    }
+
+    #[test]
+    fn entry_rules() {
+        let me = r"PC\me";
+        assert_eq!(uninstall_entry(false, None, me), Entry::Relaunch);
+        assert_eq!(uninstall_entry(false, Some(me), me), Entry::Relaunch);
+        assert_eq!(uninstall_entry(true, None, me), Entry::Confirm);
+        assert_eq!(uninstall_entry(true, Some(r"pc\ME"), me), Entry::Confirm);
+        assert_eq!(uninstall_entry(true, Some(r"PC\other"), me), Entry::Refuse);
+        // An unknown current user can't be matched.
+        assert_eq!(uninstall_entry(true, Some(me), ""), Entry::Refuse);
+    }
+
+    thread_local! {
+        static STARTED: RefCell<Vec<(bool, bool)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    fn fake_start(_owner: HWND, installed: bool, delete_data: bool) -> bool {
+        STARTED.with(|s| s.borrow_mut().push((installed, delete_data)));
+        true
+    }
+
+    fn session(owner: &MsgWindow) -> Session {
+        STARTED.with(|s| s.borrow_mut().clear());
+        let ui = UninstallUi::open_hidden(UninstallState {
+            installed: true,
+            data_dir: r"C:\Users\x\AppData\Roaming\LiteBar".into(),
+            delete_data: false,
+            status: UninstallStatus::Confirm,
+        })
+        .unwrap();
+        Session::new(ui, owner.0, true, fake_start)
+    }
+
+    fn started() -> Vec<(bool, bool)> {
+        STARTED.with(|s| s.borrow().clone())
+    }
+
+    #[test]
+    fn cancel_ends_the_loop_without_starting() {
+        let owner = MsgWindow::new();
+        let mut s = session(&owner);
+        s.ui.push_for_test(UninstallAction::Cancel);
+        assert_eq!(s.drain(), Flow::Exit);
+        assert!(started().is_empty());
+    }
+
+    #[test]
+    fn uninstall_starts_the_job_with_the_toggle_and_shows_working() {
+        let owner = MsgWindow::new();
+        let mut s = session(&owner);
+        s.ui.push_for_test(UninstallAction::SetDeleteData(true));
+        s.ui.push_for_test(UninstallAction::Uninstall);
+        assert_eq!(s.drain(), Flow::Continue);
+        assert_eq!(started(), vec![(true, true)]);
+        assert_eq!(s.ui.status(), UninstallStatus::Working);
+        // A second click while working starts nothing more.
+        s.ui.push_for_test(UninstallAction::Uninstall);
+        s.drain();
+        assert_eq!(started().len(), 1);
+    }
+
+    #[test]
+    fn result_shows_the_message_and_close_ends() {
+        let owner = MsgWindow::new();
+        let mut s = session(&owner);
+        s.ui.push_for_test(UninstallAction::Uninstall);
+        s.drain();
+        assert_eq!(
+            s.on_result(Ok(vec![UninstallStep::RemoveShortcut])),
+            Flow::Continue
+        );
+        assert_eq!(
+            s.ui.status(),
+            UninstallStatus::Done(finish_message(&[UninstallStep::RemoveShortcut]))
+        );
+        s.ui.push_for_test(UninstallAction::Close);
+        assert_eq!(s.drain(), Flow::Exit);
+    }
+
+    #[test]
+    fn failed_result_is_shown_as_failed() {
+        let owner = MsgWindow::new();
+        let mut s = session(&owner);
+        s.ui.push_for_test(UninstallAction::Uninstall);
+        s.drain();
+        s.on_result(Err(QUIT_FAILED.into()));
+        assert_eq!(s.ui.status(), UninstallStatus::Failed(QUIT_FAILED.into()));
+    }
+
+    #[test]
+    fn closing_the_window_mid_uninstall_waits_for_the_result() {
+        let owner = MsgWindow::new();
+        let mut s = session(&owner);
+        s.ui.push_for_test(UninstallAction::Uninstall);
+        s.drain();
+        s.ui.send_close();
+        assert_eq!(s.drain(), Flow::Continue);
+        assert_eq!(s.on_result(Ok(vec![])), Flow::Exit);
     }
 }

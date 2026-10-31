@@ -49,9 +49,7 @@ pub fn relaunch_as_admin() -> windows::core::Result<()> {
 }
 
 /// Starts this exe with `params` as administrator (one UAC prompt) in a visible window and
-/// doesn't wait for it. A declined prompt is `Declined`. Nothing calls it until the
-/// uninstall mode (the next step) does.
-#[allow(dead_code)]
+/// doesn't wait for it. A declined prompt is `Declined`.
 pub fn run_as_admin(params: &str) -> Result<(), ElevatedError> {
     let exe = std::env::current_exe().map_err(|e| ElevatedError::Other(e.to_string()))?;
     let file = HSTRING::from(exe.as_os_str());
