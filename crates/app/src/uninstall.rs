@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use lite_bar_core::install::same_user;
+use lite_bar_core::install::{same_path, same_user};
 use lite_bar_core::registration::{is_installed_copy, SHORTCUT_FILE, UNINSTALL_KEY};
 use lite_bar_core::startup_task::StartupState;
 use lite_bar_core::uninstall::{
@@ -16,8 +16,11 @@ use lite_bar_core::uninstall::{
 };
 use lite_bar_core::uninstall_ui::{UninstallAction, UninstallStatus};
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM};
 use windows::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_DELAY_UNTIL_REBOOT};
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, PostMessageW,
@@ -25,7 +28,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::elevation::{is_elevated, run_as_admin};
+use crate::installer::{new_path, old_path};
 use crate::log;
+use crate::process_info::process_info;
 use crate::registration::{common_programs, delete_key};
 use crate::single_instance::{acquire_single_instance, wait_for};
 use crate::startup::{
@@ -51,7 +56,8 @@ const QUIT_POLL: Duration = Duration::from_millis(200);
 
 /// What each step does. Fields are plain `fn`s so the tests can swap in fakes.
 pub struct UninstallOps {
-    pub quit_running: fn() -> Result<(), String>,
+    /// Takes the exe path.
+    pub quit_running: fn(&str) -> Result<(), String>,
     pub remove_startup: fn(&str) -> Result<(), String>,
     pub remove_shortcut: fn() -> Result<(), String>,
     pub remove_data: fn() -> Result<(), String>,
@@ -83,7 +89,7 @@ pub fn run_plan(
     let mut failed = Vec::new();
     for &step in plan {
         let result = match step {
-            UninstallStep::QuitRunning => (ops.quit_running)(),
+            UninstallStep::QuitRunning => (ops.quit_running)(exe),
             UninstallStep::RemoveStartup => (ops.remove_startup)(exe),
             UninstallStep::RemoveShortcut => (ops.remove_shortcut)(),
             UninstallStep::RemoveData => (ops.remove_data)(),
@@ -108,7 +114,7 @@ pub fn run_plan(
 
 /// Asks a running Lite Bar to quit (as the tray's Quit does, saving the sessions) and waits
 /// for it to let go of the single-instance mutex.
-fn quit_running() -> Result<(), String> {
+fn quit_running(exe: &str) -> Result<(), String> {
     // SAFETY: plain FFI with a static NUL-terminated class name.
     if let Ok(hwnd) = unsafe { FindWindowW(w!("LiteBarOwner"), None) } {
         // SAFETY: plain FFI; a window that has gone since is only an error result.
@@ -127,7 +133,57 @@ fn quit_running() -> Result<(), String> {
         // Held only for the check: dropped right away.
         || matches!(acquire_single_instance(crate::app::MUTEX_NAME), Ok(Some(_))).then_some(()),
     );
-    free.ok_or_else(|| "Lite Bar is still running".to_string())
+    free.ok_or_else(|| "Lite Bar is still running".to_string())?;
+    // The mutex is per session: a copy in another session still holds the exe. Same
+    // overall budget.
+    let gone = wait_for(
+        QUIT_WAIT.saturating_sub(start.elapsed()),
+        QUIT_POLL,
+        || start.elapsed(),
+        std::thread::sleep,
+        || (!other_copy_running(exe)).then_some(()),
+    );
+    gone.ok_or_else(|| "Lite Bar is still running in another session".to_string())
+}
+
+/// Whether a process other than `own_pid` runs the image `exe`; `procs` is (pid, image path).
+fn others_running(own_pid: u32, exe: &str, procs: &[(u32, String)]) -> bool {
+    procs
+        .iter()
+        .any(|(pid, image)| *pid != own_pid && same_path(image, exe))
+}
+
+/// The pids of all running processes; empty when they can't be listed.
+fn process_ids() -> Vec<u32> {
+    // SAFETY: plain FFI; the snapshot handle is closed below.
+    let Ok(snapshot) = (unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }) else {
+        return Vec::new();
+    };
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut pids = Vec::new();
+    // SAFETY: the snapshot is open and `entry` is a live PROCESSENTRY32W with `dwSize` set.
+    let mut more = unsafe { Process32FirstW(snapshot, &mut entry) }.is_ok();
+    while more {
+        pids.push(entry.th32ProcessID);
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snapshot, &mut entry) }.is_ok();
+    }
+    // SAFETY: opened above, closed once.
+    let _ = unsafe { CloseHandle(snapshot) };
+    pids
+}
+
+/// Whether another process (in any session) runs `exe`. Processes that can't be opened are
+/// skipped.
+fn other_copy_running(exe: &str) -> bool {
+    let procs: Vec<(u32, String)> = process_ids()
+        .into_iter()
+        .filter_map(|pid| process_info(pid).map(|i| (pid, i.exe_path)))
+        .collect();
+    others_running(std::process::id(), exe, &procs)
 }
 
 /// Deletes the startup task when it starts this exe.
@@ -244,8 +300,8 @@ fn spawn_cleaner(exe: &str, dir: &str, remove_dir: bool) -> Result<(), String> {
 }
 
 /// Deletes the exe (and its folder when only Lite Bar's own files are in it). The exe is
-/// locked while this process runs, so it is both scheduled for deletion at restart and
-/// handed to a cleaner that waits for this process to exit. `Ok` when either was set up.
+/// locked while this process runs, so a cleaner waits for this process to exit and deletes
+/// it. Only when the cleaner can't start is the delete scheduled for the next restart.
 fn remove_program(exe: &str) -> Result<(), String> {
     let dir = Path::new(exe)
         .parent()
@@ -253,19 +309,45 @@ fn remove_program(exe: &str) -> Result<(), String> {
         .unwrap_or_default();
     let pf = crate::mover::program_files();
     let remove_dir = removes_folder(list_names(&dir), &dir, pf.as_deref());
-    // The folder after the exe: pending deletes run in order, and it must be empty by then.
-    let mut restart = delete_at_restart(exe);
-    if restart.is_ok() && remove_dir {
-        restart = delete_at_restart(&dir);
-    }
-    let cleaner = spawn_cleaner(exe, &dir, remove_dir);
-    if let (Err(r), Err(c)) = (&restart, &cleaner) {
-        return Err(format!("{r}; {c}"));
-    }
-    for e in [restart.err(), cleaner.err()].into_iter().flatten() {
-        log::warn(&format!("uninstall: {e}"));
-    }
-    Ok(())
+    let leftovers: Vec<String> = [new_path(Path::new(exe)), old_path(Path::new(exe))]
+        .into_iter()
+        .filter(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    remove_with(
+        exe,
+        &dir,
+        remove_dir,
+        &leftovers,
+        || spawn_cleaner(exe, &dir, remove_dir),
+        delete_at_restart,
+    )
+}
+
+/// What `remove_program` does once it knows the paths: start the cleaner, and only when that
+/// fails schedule the restart deletes (`leftovers`, then the exe, then the folder when
+/// `remove_dir`). `Ok` when either worked.
+fn remove_with(
+    exe: &str,
+    dir: &str,
+    remove_dir: bool,
+    leftovers: &[String],
+    spawn: impl FnOnce() -> Result<(), String>,
+    schedule: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let Err(cleaner) = spawn() else {
+        return Ok(());
+    };
+    // Scheduled only now: a restart delete that outlives a working cleaner would remove a
+    // reinstall made before the restart. The folder goes last, when it is empty.
+    let folder = remove_dir.then_some(dir);
+    let mut paths = leftovers
+        .iter()
+        .map(String::as_str)
+        .chain([exe])
+        .chain(folder);
+    let scheduled = paths.try_for_each(schedule);
+    scheduled.map_err(|r| format!("{cleaner}; {r}"))
 }
 
 fn remove_entry() -> Result<(), String> {
@@ -525,7 +607,7 @@ mod tests {
 
     fn ok_ops() -> UninstallOps {
         UninstallOps {
-            quit_running: || call("quit", Ok(())),
+            quit_running: |_| call("quit", Ok(())),
             remove_startup: |_| call("startup", Ok(())),
             remove_shortcut: || call("shortcut", Ok(())),
             remove_data: || call("data", Ok(())),
@@ -549,7 +631,7 @@ mod tests {
     fn quit_failure_aborts_before_any_change() {
         calls();
         let ops = UninstallOps {
-            quit_running: || call("quit", Err("stuck".into())),
+            quit_running: |_| call("quit", Err("stuck".into())),
             ..ok_ops()
         };
         let plan = uninstall_plan(true, true);
@@ -641,6 +723,90 @@ mod tests {
             DIR,
             pf
         ));
+    }
+
+    fn schedule_log<'a>(
+        log: &'a RefCell<Vec<String>>,
+        fail: bool,
+    ) -> impl FnMut(&str) -> Result<(), String> + 'a {
+        move |p| {
+            log.borrow_mut().push(p.to_string());
+            if fail {
+                Err("denied".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn cleaner_started_schedules_nothing() {
+        let log = RefCell::new(Vec::new());
+        let left = vec![format!("{EXE}.new")];
+        let r = remove_with(EXE, DIR, true, &left, || Ok(()), schedule_log(&log, false));
+        assert_eq!(r, Ok(()));
+        assert!(log.borrow().is_empty());
+    }
+
+    #[test]
+    fn cleaner_failure_schedules_leftovers_exe_then_folder() {
+        let log = RefCell::new(Vec::new());
+        let left = vec![format!("{EXE}.new"), format!("{EXE}.old")];
+        let spawn = || Err("no powershell".to_string());
+        let r = remove_with(EXE, DIR, true, &left, spawn, schedule_log(&log, false));
+        assert_eq!(r, Ok(()));
+        assert_eq!(
+            *log.borrow(),
+            [
+                format!("{EXE}.new"),
+                format!("{EXE}.old"),
+                EXE.into(),
+                DIR.into()
+            ]
+        );
+    }
+
+    #[test]
+    fn fallback_leaves_the_folder_when_not_removable() {
+        let log = RefCell::new(Vec::new());
+        let spawn = || Err("no powershell".to_string());
+        let r = remove_with(EXE, DIR, false, &[], spawn, schedule_log(&log, false));
+        assert_eq!(r, Ok(()));
+        assert_eq!(*log.borrow(), [EXE]);
+    }
+
+    #[test]
+    fn both_failing_is_an_error() {
+        let log = RefCell::new(Vec::new());
+        let spawn = || Err("no powershell".to_string());
+        let r = remove_with(EXE, DIR, true, &[], spawn, schedule_log(&log, true));
+        assert!(r.is_err());
+    }
+
+    fn procs() -> Vec<(u32, String)> {
+        vec![
+            (4, r"C:\Windows\System32\svchost.exe".into()),
+            (10, EXE.into()),
+            (11, EXE.to_uppercase()),
+        ]
+    }
+
+    #[test]
+    fn own_process_is_not_another_copy() {
+        assert!(!others_running(10, EXE, &procs()[..2]));
+    }
+
+    #[test]
+    fn same_image_in_another_process_matches_ignoring_case() {
+        assert!(others_running(10, EXE, &procs()));
+        assert!(others_running(1, EXE, &procs()[2..]));
+    }
+
+    #[test]
+    fn a_different_image_is_not_another_copy() {
+        let other = vec![(7, r"D:\Games\lite-bar.exe".to_string())];
+        assert!(!others_running(1, EXE, &other));
+        assert!(!others_running(1, EXE, &[]));
     }
 
     #[test]

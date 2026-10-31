@@ -135,7 +135,7 @@ Opening Lite Bar from Start runs it without administrator rights, like double-cl
 Remove Lite Bar in Windows **Settings → Apps → Installed apps**, which runs `lite-bar.exe --uninstall`. It asks for administrator rights (another account's password is refused) and shows a confirmation window with **Also delete my settings and stats**, off by default. Uninstalling then:
 
 1. quits Lite Bar;
-2. removes **Start with Windows**, the Start menu shortcut and the program folder (deleted after the uninstall window closes, and again at the next restart if something still held it);
+2. removes **Start with Windows**, the Start menu shortcut and the program folder (deleted after the uninstall window closes; only if that cleanup can't be started is it deleted at the next restart instead). The folder goes only when it holds nothing but Lite Bar's files, otherwise only `lite-bar.exe` is deleted;
 3. removes the Installed apps entry, last.
 
 Settings and stats in `%APPDATA%\LiteBar` are kept unless you turn the switch on.

@@ -8,7 +8,9 @@ use windows::Win32::System::Com::{
     CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
 };
 use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-use windows::Win32::UI::Shell::{ShellExecuteExW, ShellExecuteW, SHELLEXECUTEINFOW};
+use windows::Win32::UI::Shell::{
+    ShellExecuteExW, ShellExecuteW, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+};
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 /// Whether the current process token is elevated. `false` on any failure.
@@ -59,6 +61,8 @@ pub fn run_as_admin(params: &str) -> Result<(), ElevatedError> {
         lpVerb: w!("runas"),
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: PCWSTR(params.as_ptr()),
+        // The caller exits right after: the launch must finish before this returns.
+        fMask: SEE_MASK_NOASYNC,
         nShow: SW_SHOWNORMAL.0,
         ..Default::default()
     };
