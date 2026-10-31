@@ -17,4 +17,5 @@ pub mod settings_edit;
 pub mod settings_ui;
 pub mod startup_task;
 pub mod ui;
+pub mod uninstall;
 pub mod update;

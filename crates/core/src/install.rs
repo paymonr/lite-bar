@@ -86,7 +86,7 @@ pub struct MoveArgs {
 
 /// The value after `flag`, if the flag is there: `Some(None)` when it has no value (another
 /// `--` flag is never a value).
-fn flag_value(args: &[String], flag: &str) -> Option<Option<String>> {
+pub(crate) fn flag_value(args: &[String], flag: &str) -> Option<Option<String>> {
     let i = args.iter().position(|a| a == flag)?;
     Some(args.get(i + 1).filter(|v| !v.starts_with("--")).cloned())
 }
@@ -106,7 +106,7 @@ pub fn parse_move_to(args: impl Iterator<Item = String>) -> Option<Result<MoveAr
 /// `value` in double quotes for a Windows command line. Backslashes right before the closing
 /// quote are doubled, or the quote would be read as an escaped literal. `value` must not
 /// contain `"`.
-fn quote(value: &str) -> String {
+pub(crate) fn quote(value: &str) -> String {
     let trailing = value.len() - value.trim_end_matches('\\').len();
     format!("\"{value}{}\"", "\\".repeat(trailing))
 }
@@ -172,7 +172,7 @@ pub enum MoveStatus {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     const PF: &str = r"C:\Program Files";
@@ -185,7 +185,7 @@ mod tests {
     /// Split like Windows argv parsing (CommandLineToArgvW): spaces outside quotes separate
     /// args; 2n backslashes + quote -> n backslashes and the quote toggles; 2n+1 backslashes +
     /// quote -> n backslashes and a literal quote; other backslashes are literal.
-    fn shell_split(s: &str) -> Vec<String> {
+    pub(crate) fn shell_split(s: &str) -> Vec<String> {
         let chars: Vec<char> = s.chars().collect();
         let mut out = Vec::new();
         let mut cur = String::new();
