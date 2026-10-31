@@ -7,7 +7,7 @@ use crate::settings_ui::PROBLEM_TEXT;
 use crate::ui::{id, theme, Cmd, Pt, Rect, Rgba, TextMeasure, TextStyle, Ui};
 
 /// Popup client size in DIPs.
-pub const POPUP_SIZE_DIP: (f32, f32) = (460.0, 460.0);
+pub const POPUP_SIZE_DIP: (f32, f32) = (460.0, 490.0);
 /// The popup's title bar text.
 pub const TITLE: &str = "Lite Bar";
 /// The heading at the top of the page.
@@ -36,11 +36,11 @@ const PATH_STYLE: TextStyle = TextStyle {
     bold: false,
     mono: true,
 };
-const MOVE: &str = "Move to Program Files";
+const MOVE: &str = "Install to Program Files";
 const LATER: &str = "Ask me later";
 const NO_THANKS: &str = "No thanks";
 const CLOSE: &str = "Close";
-const MOVING: &str = "Moving…";
+const MOVING: &str = "Installing…";
 
 pub struct MovePromptInput<'a> {
     /// The toggle hotkey as shown to the user, e.g. "Ctrl+Shift+F".
@@ -90,16 +90,13 @@ pub fn move_prompt_frame(ui: &mut Ui, input: &MovePromptInput) -> Vec<MovePrompt
             });
         });
         ui.space(20.0);
-        ui.label(
-            "Keep it safe in Program Files",
-            TextStyle::BOLD,
-            theme::TEXT,
-        );
+        ui.label("Install to Program Files", TextStyle::BOLD, theme::TEXT);
         ui.space(4.0);
         paragraph(
             ui,
             "Lite Bar runs as administrator, and only administrators can change files in \
-             Program Files, so nothing else can tamper with it there.",
+             Program Files, so nothing else can tamper with it there. Installing also adds \
+             Lite Bar to Start and to Installed apps.",
             theme::MUTED,
         );
         ui.space(10.0);
@@ -208,7 +205,7 @@ fn path_pill(ui: &mut Ui, dir: &str) {
     });
 }
 
-/// The bottom band: "Moving…" on the left while a move runs, otherwise the buttons the
+/// The bottom band: "Installing…" on the left while it runs, otherwise the buttons the
 /// state offers, right-aligned.
 fn footer_band(ui: &mut Ui, rect: Rect, status: &MoveStatus, out: &mut Vec<MovePromptAction>) {
     ui.paint(Cmd::Fill {
@@ -244,18 +241,18 @@ fn status_line(status: &MoveStatus) -> (String, Rgba) {
         MoveStatus::Moving => (MOVING.into(), theme::MUTED),
         MoveStatus::Done(o) => match o {
             MoveOutcome::Declined => (
-                "Not moved: Windows didn't get permission.".into(),
+                "Not installed: Windows didn't get permission.".into(),
                 theme::MUTED,
             ),
             MoveOutcome::OtherAccount => (
-                "Moving needs your own administrator account. You can move lite-bar.exe \
+                "Installing needs your own administrator account. You can move lite-bar.exe \
                  to Program Files by hand."
                     .into(),
                 PROBLEM_TEXT,
             ),
-            MoveOutcome::Failed(e) => (format!("Couldn't move Lite Bar: {e}"), PROBLEM_TEXT),
+            MoveOutcome::Failed(e) => (format!("Couldn't install Lite Bar: {e}"), PROBLEM_TEXT),
             MoveOutcome::MovedNotStarted(e) => (
-                format!("Moved, but couldn't start the new copy: {e}"),
+                format!("Installed, but couldn't start the new copy: {e}"),
                 PROBLEM_TEXT,
             ),
             MoveOutcome::Moved => (String::new(), theme::MUTED),
@@ -263,7 +260,7 @@ fn status_line(status: &MoveStatus) -> (String, Rgba) {
     }
 }
 
-/// The buttons the state offers, right-aligned; "Moving…" instead while moving, only
+/// The buttons the state offers, right-aligned; "Installing…" instead while installing, only
 /// Close once the file has moved.
 fn buttons(ui: &mut Ui, status: &MoveStatus, out: &mut Vec<MovePromptAction>) {
     let m = ui.text_measure();
@@ -400,8 +397,15 @@ mod tests {
     fn find_text(f: &Frame, text: &str) -> Option<(Pt, TextStyle, Rgba)> {
         texts(f)
             .into_iter()
+            .rev()
             .find(|t| t.1 == text)
             .map(|t| (t.0, t.2, t.3))
+    }
+
+    /// Whether `text` is drawn in the footer band (the section heading shares the
+    /// main button's words).
+    fn in_footer(f: &Frame, text: &str) -> bool {
+        find_text(f, text).is_some_and(|t| t.0.y > POPUP_SIZE_DIP.1 - FOOTER_H)
     }
 
     fn center_of(f: &Frame, text: &str) -> Pt {
@@ -444,7 +448,7 @@ mod tests {
         v.into_iter().map(|t| t.1).collect::<Vec<_>>().join(" ")
     }
 
-    const MOVE: &str = "Move to Program Files";
+    const MOVE: &str = "Install to Program Files";
     const LATER: &str = "Ask me later";
     const NO: &str = "No thanks";
 
@@ -459,6 +463,10 @@ mod tests {
         assert!(has_line(&f, "Settings and Quit"));
         assert!(has_line(&f, "tray"));
         assert!(has_line(&f, "administrators"));
+        let heads = texts(&f).iter().filter(|t| t.1 == MOVE && t.2.bold).count();
+        assert_eq!(heads, 2, "section heading and button");
+        assert!(has_line(&f, "Start"));
+        assert!(has_line(&f, "Installed apps"));
         let (_, path, _) = find_text(&f, DIR).expect("target dir");
         assert!(path.mono, "the folder reads as a path");
         assert_ne!(TITLE, HEADING, "the title bar doesn't repeat the heading");
@@ -542,9 +550,9 @@ mod tests {
         let idle = frame(&MoveStatus::Idle);
         let at = center_of(&idle, MOVE);
         let f = frame(&MoveStatus::Moving);
-        assert!(find_text(&f, "Moving…").is_some());
+        assert!(find_text(&f, "Installing…").is_some());
         for b in [MOVE, LATER, NO] {
-            assert!(find_text(&f, b).is_none(), "{b} still drawn");
+            assert!(!in_footer(&f, b), "{b} still drawn");
         }
         assert!(click_at(&MoveStatus::Moving, at).is_empty());
     }
@@ -554,21 +562,21 @@ mod tests {
         let done = |o| MoveStatus::Done(o);
         let f = frame(&done(MoveOutcome::Declined));
         let (_, _, color) =
-            find_text(&f, "Not moved: Windows didn't get permission.").expect("declined line");
+            find_text(&f, "Not installed: Windows didn't get permission.").expect("declined line");
         assert_eq!(color, theme::MUTED);
         assert!(find_text(&f, MOVE).is_some());
 
         let f = frame(&done(MoveOutcome::Failed("access denied".into())));
         assert_eq!(
             joined(&f, PROBLEM_TEXT),
-            "Couldn't move Lite Bar: access denied"
+            "Couldn't install Lite Bar: access denied"
         );
         assert!(find_text(&f, NO).is_some());
 
         let f = frame(&done(MoveOutcome::OtherAccount));
         assert_eq!(
             joined(&f, PROBLEM_TEXT),
-            "Moving needs your own administrator account. You can move lite-bar.exe to \
+            "Installing needs your own administrator account. You can move lite-bar.exe to \
              Program Files by hand."
         );
         assert!(find_text(&f, LATER).is_some());
@@ -577,10 +585,10 @@ mod tests {
         let f = frame(&s);
         assert_eq!(
             joined(&f, PROBLEM_TEXT),
-            "Moved, but couldn't start the new copy: x"
+            "Installed, but couldn't start the new copy: x"
         );
         for b in [MOVE, LATER, NO] {
-            assert!(find_text(&f, b).is_none(), "{b} drawn");
+            assert!(!in_footer(&f, b), "{b} drawn");
         }
         assert_eq!(
             click_at(&s, center_of(&f, "Close")),
@@ -610,7 +618,7 @@ mod tests {
                     "{text:?} runs off right"
                 );
                 assert!(pos.y + h <= POPUP_SIZE_DIP.1, "{text:?} runs off bottom");
-                let in_footer = [MOVE, LATER, NO, "Close", "Moving…"].contains(&text.as_str());
+                let in_footer = [MOVE, LATER, NO, "Close", "Installing…"].contains(&text.as_str());
                 assert!(
                     in_footer || pos.y + h <= POPUP_SIZE_DIP.1 - FOOTER_H - theme::GAP,
                     "{text:?} runs into the footer"
