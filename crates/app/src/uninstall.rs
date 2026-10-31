@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_CLOS
 use crate::log;
 use crate::registration::{common_programs, delete_key};
 use crate::single_instance::{acquire_single_instance, wait_for};
-use crate::startup::{query_now, schtasks_path, set_now, CREATE_NO_WINDOW};
+use crate::startup::{query, schtasks_path, set_now, SystemRunner, CREATE_NO_WINDOW};
 
 /// Name of the uninstall thread; the panic hook leaves the ETW trace alone for it.
 pub const UNINSTALL_THREAD: &str = "uninstall";
@@ -109,8 +109,8 @@ fn quit_running() -> Result<(), String> {
 }
 
 /// Deletes the startup task when it starts this exe.
-fn remove_startup(_exe: &str) -> Result<(), String> {
-    if query_now() == StartupState::On {
+fn remove_startup(exe: &str) -> Result<(), String> {
+    if query(&SystemRunner, &schtasks_path(), exe) == StartupState::On {
         set_now(false)
     } else {
         Ok(())
@@ -142,54 +142,108 @@ fn remove_data() -> Result<(), String> {
     }
 }
 
-/// The `cmd /c` command line that deletes the exe (and the folder) once this process is
-/// gone: the ping is a delay of about two seconds.
-fn delete_command(exe: &str, dir: &str, remove_dir: bool) -> String {
-    let mut command = format!(r#"ping -n 3 127.0.0.1 >nul & del /f /q "{exe}""#);
+/// The PowerShell command that waits for process `pid` to exit, then deletes the exe (and
+/// the folder). Paths are single-quoted `-LiteralPath`s, so `%`, `$` and `&` stay literal.
+fn cleanup_command(pid: u32, exe: &str, dir: &str, remove_dir: bool) -> String {
+    let quoted = |p: &str| format!("'{}'", p.replace('\'', "''"));
+    let mut command = format!(
+        "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; Remove-Item -LiteralPath {} -Force -ErrorAction SilentlyContinue",
+        quoted(exe)
+    );
     if remove_dir {
-        command.push_str(&format!(r#" & rmdir /s /q "{dir}""#));
+        command.push_str(&format!(
+            "; Remove-Item -LiteralPath {} -Recurse -Force -ErrorAction SilentlyContinue",
+            quoted(dir)
+        ));
     }
     command
 }
 
-/// Deletes the exe (and its folder when only Lite Bar's own files are in it) after this
-/// process exits. `Ok` means deleted or scheduled.
+/// Whether the install folder goes too: only when it was listed (a failed listing is not an
+/// empty folder), Program Files is known, and `folder_removable` agrees.
+fn removes_folder(
+    listing: Result<Vec<String>, String>,
+    dir: &str,
+    program_files: Option<&str>,
+) -> bool {
+    match (listing, program_files) {
+        (Ok(entries), Some(pf)) => folder_removable(dir, pf, &entries),
+        _ => false,
+    }
+}
+
+fn list_names(dir: &str) -> Result<Vec<String>, String> {
+    std::fs::read_dir(dir)
+        .map_err(|e| e.to_string())?
+        .map(|e| {
+            e.map(|e| e.file_name().to_string_lossy().into_owned())
+                .map_err(|e| e.to_string())
+        })
+        .collect()
+}
+
+/// Schedules `path` for deletion at the next restart.
+fn delete_at_restart(path: &str) -> Result<(), String> {
+    // SAFETY: the path string outlives the call; a null new name means delete.
+    unsafe {
+        MoveFileExW(
+            &HSTRING::from(path),
+            PCWSTR::null(),
+            MOVEFILE_DELAY_UNTIL_REBOOT,
+        )
+    }
+    .map_err(|e| format!("couldn't schedule {path} for deletion at restart: {e}"))
+}
+
+/// Starts a hidden PowerShell that waits for this process to exit (the exe is locked until
+/// then) and deletes the exe and, if `remove_dir`, the folder.
+fn spawn_cleaner(exe: &str, dir: &str, remove_dir: bool) -> Result<(), String> {
+    let system = Path::new(&schtasks_path())
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let powershell = system.join(r"WindowsPowerShell\v1.0\powershell.exe");
+    let command = cleanup_command(std::process::id(), exe, dir, remove_dir);
+    Command::new(powershell)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+        ])
+        .arg(command)
+        // Not the install folder, which would stay in use and so couldn't be removed.
+        .current_dir(system)
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("couldn't start the cleanup: {e}"))
+}
+
+/// Deletes the exe (and its folder when only Lite Bar's own files are in it). The exe is
+/// locked while this process runs, so it is both scheduled for deletion at restart and
+/// handed to a cleaner that waits for this process to exit. `Ok` when either was set up.
 fn remove_program(exe: &str) -> Result<(), String> {
     let dir = Path::new(exe)
         .parent()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
-    // A folder that can't be listed is not an empty one: then only the exe goes.
-    let remove_dir = match (crate::mover::program_files(), std::fs::read_dir(&dir)) {
-        (Some(pf), Ok(entries)) => {
-            let names: Vec<String> = entries
-                .filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().into_owned())
-                .collect();
-            folder_removable(&dir, &pf, &names)
-        }
-        _ => false,
-    };
-    let cmd = Path::new(&schtasks_path()).with_file_name("cmd.exe");
-    let spawned = Command::new(cmd)
-        .raw_arg(format!("/d /c {}", delete_command(exe, &dir, remove_dir)))
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
-    let Err(spawn_error) = spawned else {
-        return Ok(());
-    };
-    log::warn(&format!(
-        "uninstall: couldn't start the delete command ({spawn_error}); deleting at restart"
-    ));
-    // SAFETY: the path string outlives the call; a null new name means delete.
-    unsafe {
-        MoveFileExW(
-            &HSTRING::from(exe),
-            PCWSTR::null(),
-            MOVEFILE_DELAY_UNTIL_REBOOT,
-        )
+    let pf = crate::mover::program_files();
+    let remove_dir = removes_folder(list_names(&dir), &dir, pf.as_deref());
+    // The folder after the exe: pending deletes run in order, and it must be empty by then.
+    let mut restart = delete_at_restart(exe);
+    if restart.is_ok() && remove_dir {
+        restart = delete_at_restart(&dir);
     }
-    .map_err(|e| format!("couldn't delete {exe}: {spawn_error}; {e}"))
+    let cleaner = spawn_cleaner(exe, &dir, remove_dir);
+    if let (Err(r), Err(c)) = (&restart, &cleaner) {
+        return Err(format!("{r}; {c}"));
+    }
+    for e in [restart.err(), cleaner.err()].into_iter().flatten() {
+        log::warn(&format!("uninstall: {e}"));
+    }
+    Ok(())
 }
 
 fn remove_entry() -> Result<(), String> {
@@ -292,17 +346,48 @@ mod tests {
         assert_eq!(calls(), ["quit", "startup", "data"]);
     }
 
+    const EXE: &str = r"C:\Program Files\Lite Bar\lite-bar.exe";
+    const DIR: &str = r"C:\Program Files\Lite Bar";
+
     #[test]
-    fn remove_program_command_quotes_paths() {
-        let exe = r"C:\Program Files\Lite Bar\lite-bar.exe";
-        let dir = r"C:\Program Files\Lite Bar";
+    fn cleanup_command_waits_for_the_process_then_deletes() {
         assert_eq!(
-            delete_command(exe, dir, true),
-            r#"ping -n 3 127.0.0.1 >nul & del /f /q "C:\Program Files\Lite Bar\lite-bar.exe" & rmdir /s /q "C:\Program Files\Lite Bar""#
+            cleanup_command(42, EXE, DIR, true),
+            r"Wait-Process -Id 42 -ErrorAction SilentlyContinue; Remove-Item -LiteralPath 'C:\Program Files\Lite Bar\lite-bar.exe' -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath 'C:\Program Files\Lite Bar' -Recurse -Force -ErrorAction SilentlyContinue"
         );
         assert_eq!(
-            delete_command(exe, dir, false),
-            r#"ping -n 3 127.0.0.1 >nul & del /f /q "C:\Program Files\Lite Bar\lite-bar.exe""#
+            cleanup_command(42, EXE, DIR, false),
+            r"Wait-Process -Id 42 -ErrorAction SilentlyContinue; Remove-Item -LiteralPath 'C:\Program Files\Lite Bar\lite-bar.exe' -Force -ErrorAction SilentlyContinue"
         );
+    }
+
+    #[test]
+    fn cleanup_command_doubles_single_quotes() {
+        assert_eq!(
+            cleanup_command(1, r"C:\It's\lite-bar.exe", r"C:\It's", true),
+            r"Wait-Process -Id 1 -ErrorAction SilentlyContinue; Remove-Item -LiteralPath 'C:\It''s\lite-bar.exe' -Force -ErrorAction SilentlyContinue; Remove-Item -LiteralPath 'C:\It''s' -Recurse -Force -ErrorAction SilentlyContinue"
+        );
+    }
+
+    #[test]
+    fn cleanup_command_keeps_percent_and_ampersand_literal() {
+        assert_eq!(
+            cleanup_command(1, r"C:\a%PATH%&b\lite-bar.exe", r"C:\a%PATH%&b", false),
+            r"Wait-Process -Id 1 -ErrorAction SilentlyContinue; Remove-Item -LiteralPath 'C:\a%PATH%&b\lite-bar.exe' -Force -ErrorAction SilentlyContinue"
+        );
+    }
+
+    #[test]
+    fn folder_is_removed_only_with_a_listing_and_program_files() {
+        let only_exe = || Ok(vec!["lite-bar.exe".to_string()]);
+        let pf = Some(r"C:\Program Files");
+        assert!(removes_folder(only_exe(), DIR, pf));
+        assert!(!removes_folder(Err("denied".into()), DIR, pf));
+        assert!(!removes_folder(only_exe(), DIR, None));
+        assert!(!removes_folder(
+            Ok(vec!["lite-bar.exe".into(), "notes.txt".into()]),
+            DIR,
+            pf
+        ));
     }
 }

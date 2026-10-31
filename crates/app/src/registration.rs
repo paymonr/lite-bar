@@ -14,7 +14,7 @@ use lite_bar_core::registration::{
 };
 use windows::core::{Interface, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, ERROR_SUCCESS, RPC_E_CHANGED_MODE,
+    ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, RPC_E_CHANGED_MODE, WIN32_ERROR,
 };
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
@@ -45,6 +45,24 @@ impl Drop for RegKey {
     fn drop(&mut self) {
         // SAFETY: the key was opened by this module and is closed exactly once, here.
         let _ = unsafe { RegCloseKey(self.0) };
+    }
+}
+
+/// What `read_values` does after `RegEnumValueW` returned `status`.
+#[derive(Debug, PartialEq, Eq)]
+enum EnumAction {
+    Read,
+    /// A value too large for the buffer: not one of ours, go on with the next.
+    Skip,
+    /// The end, or an error that won't get better (e.g. the key was deleted meanwhile).
+    Stop,
+}
+
+fn enum_action(status: WIN32_ERROR) -> EnumAction {
+    match status {
+        ERROR_SUCCESS => EnumAction::Read,
+        ERROR_MORE_DATA => EnumAction::Skip,
+        _ => EnumAction::Stop,
     }
 }
 
@@ -87,14 +105,10 @@ pub fn read_values(root: HKEY, subkey: &str) -> BTreeMap<String, RegValue> {
                 Some(&mut data_len),
             )
         };
-        if status == ERROR_NO_MORE_ITEMS {
-            break;
-        }
-        if status == ERROR_MORE_DATA {
-            continue; // a value too large for the buffer: not one of ours
-        }
-        if status != ERROR_SUCCESS {
-            break; // e.g. the key was deleted meanwhile: it won't get better
+        match enum_action(status) {
+            EnumAction::Read => {}
+            EnumAction::Skip => continue,
+            EnumAction::Stop => break,
         }
         let name = String::from_utf16_lossy(&name[..name_len as usize]);
         let data = &data[..data_len as usize];
@@ -282,6 +296,8 @@ pub fn spawn_refresh(exe: PathBuf) -> Option<JoinHandle<()>> {
 mod tests {
     use windows::Win32::System::Registry::HKEY_CURRENT_USER;
 
+    use windows::Win32::Foundation::{ERROR_KEY_DELETED, ERROR_NO_MORE_ITEMS};
+
     use super::*;
     use crate::test_util::TempDir;
 
@@ -391,5 +407,13 @@ mod tests {
     #[test]
     fn common_programs_is_a_known_folder() {
         assert!(common_programs().is_some_and(|p| p.is_absolute()));
+    }
+
+    #[test]
+    fn enum_stops_on_a_persistent_error() {
+        assert_eq!(enum_action(ERROR_MORE_DATA), EnumAction::Skip);
+        assert_eq!(enum_action(ERROR_NO_MORE_ITEMS), EnumAction::Stop);
+        assert_eq!(enum_action(ERROR_KEY_DELETED), EnumAction::Stop);
+        assert_eq!(enum_action(ERROR_SUCCESS), EnumAction::Read);
     }
 }
