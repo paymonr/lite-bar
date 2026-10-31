@@ -3,8 +3,11 @@
 //! the returned actions and feeds back the move's status.
 
 use crate::install::{MoveOutcome, MoveStatus};
+use crate::popup::{
+    footer_band, paragraph, path_pill, right_buttons, FOOTER_H, HEADING_STYLE, PAD,
+};
 use crate::settings_ui::PROBLEM_TEXT;
-use crate::ui::{id, theme, Cmd, Pt, Rect, Rgba, TextMeasure, TextStyle, Ui};
+use crate::ui::{id, theme, Cmd, Pt, Rect, Rgba, TextStyle, Ui};
 
 /// Popup client size in DIPs.
 pub const POPUP_SIZE_DIP: (f32, f32) = (460.0, 490.0);
@@ -13,28 +16,14 @@ pub const TITLE: &str = "Lite Bar";
 /// The heading at the top of the page.
 pub const HEADING: &str = "Welcome to Lite Bar";
 
-const PAD: f32 = 24.0;
-const FOOTER_H: f32 = 64.0;
 const ROW_H: f32 = 36.0;
 const CAP_H: f32 = 22.0;
 const CAP_PAD_X: f32 = 7.0;
 const CAP_GAP: f32 = 4.0;
-/// Between the lines of a wrapped paragraph.
-const LINE_GAP: f32 = 2.0;
-const HEADING_STYLE: TextStyle = TextStyle {
-    size: 20.0,
-    bold: true,
-    mono: false,
-};
 const CAP_STYLE: TextStyle = TextStyle {
     size: 12.0,
     bold: true,
     mono: false,
-};
-const PATH_STYLE: TextStyle = TextStyle {
-    size: 12.0,
-    bold: false,
-    mono: true,
 };
 const MOVE: &str = "Install to Program Files";
 const LATER: &str = "Ask me later";
@@ -107,7 +96,7 @@ pub fn move_prompt_frame(ui: &mut Ui, input: &MovePromptInput) -> Vec<MovePrompt
             paragraph(ui, &text, color);
         }
     });
-    footer_band(ui, footer, input.status, &mut out);
+    footer_band(ui, footer, |ui| buttons(ui, input.status, &mut out));
     out
 }
 
@@ -173,67 +162,6 @@ fn key_caps(ui: &mut Ui, keys: &[&str]) {
     }
 }
 
-/// The target folder in a rounded box, in the monospace font.
-fn path_pill(ui: &mut Ui, dir: &str) {
-    let (tw, th) = ui.text_measure().measure(dir, PATH_STYLE);
-    let h = th + 12.0;
-    let w = (tw + 20.0).min(ui.available().w);
-    ui.next_width(w);
-    ui.row(h, |ui| {
-        let r = ui.available();
-        let rect = Rect::new(r.x, r.y, w, h);
-        ui.paint(Cmd::Fill {
-            rect,
-            color: theme::SURFACE,
-            radius: theme::BUTTON_RADIUS,
-        });
-        ui.paint(Cmd::Stroke {
-            rect,
-            color: theme::BORDER,
-            radius: theme::BUTTON_RADIUS,
-            width: 1.0,
-        });
-        ui.paint(Cmd::Text {
-            pos: Pt {
-                x: r.x + 10.0,
-                y: r.y + (h - th) / 2.0,
-            },
-            text: dir.to_string(),
-            style: PATH_STYLE,
-            color: theme::TEXT,
-        });
-    });
-}
-
-/// The bottom band: "Installing…" on the left while it runs, otherwise the buttons the
-/// state offers, right-aligned.
-fn footer_band(ui: &mut Ui, rect: Rect, status: &MoveStatus, out: &mut Vec<MovePromptAction>) {
-    ui.paint(Cmd::Fill {
-        rect,
-        color: theme::SURFACE,
-        radius: 0.0,
-    });
-    ui.paint(Cmd::Line {
-        from: Pt {
-            x: rect.x,
-            y: rect.y,
-        },
-        to: Pt {
-            x: rect.right(),
-            y: rect.y,
-        },
-        color: theme::BORDER,
-        width: 1.0,
-    });
-    let strip = Rect::new(
-        rect.x + PAD,
-        rect.y + (rect.h - theme::CONTROL_HEIGHT) / 2.0,
-        rect.w - 2.0 * PAD,
-        theme::CONTROL_HEIGHT,
-    );
-    ui.place(strip, |ui| buttons(ui, status, out));
-}
-
 /// The status line and its color; empty when there is nothing to say.
 fn status_line(status: &MoveStatus) -> (String, Rgba) {
     match status {
@@ -260,70 +188,34 @@ fn status_line(status: &MoveStatus) -> (String, Rgba) {
     }
 }
 
-/// The buttons the state offers, right-aligned; "Installing…" instead while installing, only
-/// Close once the file has moved.
+/// The buttons the state offers, right-aligned; "Installing…" instead while installing,
+/// only Close once the file has moved.
 fn buttons(ui: &mut Ui, status: &MoveStatus, out: &mut Vec<MovePromptAction>) {
-    let m = ui.text_measure();
-    let w = |label: &str, style| m.measure(label, style).0 + 2.0 * theme::BUTTON_PAD_X;
-    ui.row(theme::CONTROL_HEIGHT, |ui| match status {
+    match status {
         MoveStatus::Moving => ui.label(MOVING, TextStyle::BODY, theme::MUTED),
         MoveStatus::Done(MoveOutcome::MovedNotStarted(_)) => {
-            let close = w(CLOSE, TextStyle::BODY);
-            ui.right_aligned(close, |ui| {
-                ui.next_width(close);
-                if ui.button(id("move_prompt.close"), CLOSE) {
-                    out.push(MovePromptAction::Later);
-                }
-            });
+            if right_buttons(ui, &[(id("move_prompt.close"), CLOSE, false)]).is_some() {
+                out.push(MovePromptAction::Later);
+            }
         }
         _ => {
-            let (mw, lw, nw) = (
-                w(MOVE, TextStyle::BOLD),
-                w(LATER, TextStyle::BODY),
-                w(NO_THANKS, TextStyle::BODY),
+            let picked = right_buttons(
+                ui,
+                &[
+                    (id("move_prompt.move"), MOVE, true),
+                    (id("move_prompt.later"), LATER, false),
+                    (id("move_prompt.no_thanks"), NO_THANKS, false),
+                ],
             );
-            ui.right_aligned(mw + lw + nw + 2.0 * theme::GAP, |ui| {
-                ui.next_width(mw);
-                if ui.button_accent(id("move_prompt.move"), MOVE) {
-                    out.push(MovePromptAction::Move);
-                }
-                ui.next_width(lw);
-                if ui.button(id("move_prompt.later"), LATER) {
-                    out.push(MovePromptAction::Later);
-                }
-                ui.next_width(nw);
-                if ui.button(id("move_prompt.no_thanks"), NO_THANKS) {
-                    out.push(MovePromptAction::NoThanks);
-                }
-            });
-        }
-    });
-}
-
-/// Body text wrapped at word boundaries to the column's width (the toolkit has no wrapping).
-fn paragraph(ui: &mut Ui, text: &str, color: Rgba) {
-    let style = TextStyle::BODY;
-    let max = ui.available().w;
-    for (i, line) in wrap(ui.text_measure(), text, style, max).iter().enumerate() {
-        if i > 0 {
-            ui.space(LINE_GAP);
-        }
-        ui.label(line, style, color);
-    }
-}
-
-fn wrap(m: &dyn TextMeasure, text: &str, style: TextStyle, max: f32) -> Vec<String> {
-    let mut lines: Vec<String> = Vec::new();
-    for word in text.split_whitespace() {
-        match lines.last_mut() {
-            Some(l) if m.measure(&format!("{l} {word}"), style).0 <= max => {
-                l.push(' ');
-                l.push_str(word);
-            }
-            _ => lines.push(word.to_string()),
+            out.extend(picked.map(|i| {
+                [
+                    MovePromptAction::Move,
+                    MovePromptAction::Later,
+                    MovePromptAction::NoThanks,
+                ][i]
+            }));
         }
     }
-    lines
 }
 
 #[cfg(test)]
