@@ -84,11 +84,12 @@ mod app {
     };
     use lite_bar_core::settings::{Settings, StatsLayout};
     use lite_bar_core::settings_edit::SettingsChange;
+    use lite_bar_core::settings_ui::GameRow;
     use lite_bar_core::startup_task::StartupState;
     use lite_bar_core::update::{
         current_version, ReleaseInfo, UpdateSchedule, UpdateState, Version,
     };
-    use windows::core::{w, HSTRING};
+    use windows::core::{w, HSTRING, PCWSTR};
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::HiDpi::{
@@ -96,11 +97,12 @@ mod app {
     };
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW, DestroyWindow,
-        DispatchMessageW, GetMessageW, KillTimer, PostQuitMessage, RegisterClassExW,
-        RegisterWindowMessageW, SetTimer, TranslateMessage, MSG, MSGFLT_ALLOW, SW_SHOWNORMAL,
-        WINDOW_EX_STYLE, WM_CLOSE, WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_HOTKEY,
-        WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER, WNDCLASSEXW, WS_OVERLAPPED,
+        AllowSetForegroundWindow, ChangeWindowMessageFilterEx, CreateWindowExW, DefWindowProcW,
+        DestroyWindow, DispatchMessageW, FindWindowW, GetMessageW, KillTimer, PostMessageW,
+        PostQuitMessage, RegisterClassExW, RegisterWindowMessageW, SetTimer, TranslateMessage,
+        ASFW_ANY, MSG, MSGFLT_ALLOW, SW_SHOWNORMAL, WINDOW_EX_STYLE, WM_CLOSE, WM_CONTEXTMENU,
+        WM_DESTROY, WM_ENDSESSION, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_TIMER,
+        WNDCLASSEXW, WS_OVERLAPPED,
     };
 
     mod move_prompt;
@@ -153,6 +155,8 @@ mod app {
         static MENU_OPEN: Cell<bool> = const { Cell::new(false) };
         /// Id of the registered "TaskbarCreated" broadcast.
         static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
+        /// Id of the registered `OPEN_SETTINGS_MSG`, posted by a second launch.
+        static OPEN_SETTINGS: Cell<u32> = const { Cell::new(0) };
         /// An update check result taken from its message, until the app can apply it.
         static PENDING_UPDATE: RefCell<Option<CheckResult>> = const { RefCell::new(None) };
         /// A finished update download, until the app can apply it.
@@ -778,11 +782,59 @@ mod app {
         }
     }
 
+    /// Registered message a second launch posts to the running instance's owner window.
+    const OPEN_SETTINGS_MSG: PCWSTR = w!("LiteBar.OpenSettings");
+
+    /// Asks the running instance to open Settings: `find` its owner window, then `post` the
+    /// message to it. False when there is no window or the post failed.
+    fn notify_running(find: impl Fn() -> Option<HWND>, post: impl Fn(HWND) -> bool) -> bool {
+        find().is_some_and(post)
+    }
+
+    /// The running instance's owner window, if any.
+    fn find_running() -> Option<HWND> {
+        // SAFETY: plain FFI with a static NUL-terminated class name.
+        unsafe { FindWindowW(w!("LiteBarOwner"), None) }.ok()
+    }
+
+    /// Posts `OPEN_SETTINGS_MSG` to `hwnd`, first letting its process take the foreground.
+    fn post_open_settings(hwnd: HWND) -> bool {
+        // SAFETY: plain FFI; the message id is registered by name, so it matches the
+        // running instance's.
+        unsafe {
+            // Best effort: without it Settings still opens, it just may not come to the front.
+            let _ = AllowSetForegroundWindow(ASFW_ANY);
+            let msg = RegisterWindowMessageW(OPEN_SETTINGS_MSG);
+            PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0)).is_ok()
+        }
+    }
+
+    /// Opens Settings on the running app (or focuses it), with `open` creating the window.
+    fn open_settings_requested(
+        open: fn(HWND, Settings, Vec<GameRow>) -> windows::core::Result<SettingsUi>,
+    ) {
+        with_app(|app| app.open_settings_with(open));
+    }
+
+    /// The registered messages the owner window must receive from lower-integrity senders.
+    fn owner_messages() -> [u32; 2] {
+        [TASKBAR_CREATED.get(), OPEN_SETTINGS.get()]
+    }
+
     /// Lets an elevated process receive `msg` from lower-integrity senders (Explorer's
     /// `TaskbarCreated` broadcast is otherwise dropped by UIPI).
     fn allow_through_uipi(hwnd: HWND, msg: u32) -> windows::core::Result<()> {
         // SAFETY: plain FFI on a window we own.
         unsafe { ChangeWindowMessageFilterEx(hwnd, msg, MSGFLT_ALLOW, None) }
+    }
+
+    /// Allows each of `msgs` through UIPI to `hwnd` with `allow`, logging the ones that fail.
+    fn allow_messages(hwnd: HWND, msgs: &[u32], allow: fn(HWND, u32) -> windows::core::Result<()>) {
+        for &msg in msgs {
+            if let Err(e) = allow(hwnd, msg) {
+                log::warn(&format!("could not allow message {msg} through UIPI: {e}"));
+            }
+        }
     }
 
     fn quit() {
@@ -947,6 +999,11 @@ mod app {
                 });
                 return LRESULT(0);
             }
+            m if m != 0 && m == OPEN_SETTINGS.get() => {
+                // A second launch: show Settings (`open_settings` focuses an open one).
+                open_settings_requested(SettingsUi::open);
+                return LRESULT(0);
+            }
             _ => {}
         }
         match window_command(msg, wparam.0) {
@@ -1055,7 +1112,13 @@ mod app {
             acquire_single_instance(MUTEX_NAME)
         };
         let Some(guard) = guard_or_exit(updated, acquired) else {
-            return; // already running: exit silently
+            // Already running: ask that instance to show Settings, then exit.
+            let sent = notify_running(find_running, post_open_settings);
+            log::info(&format!(
+                "already running; asked it to open Settings: {}",
+                if sent { "sent" } else { "no window found" }
+            ));
+            return;
         };
 
         // This instance runs the capture from here on (also without a guard, when the
@@ -1108,10 +1171,10 @@ mod app {
         // SAFETY: plain FFI with a static NUL-terminated name.
         let taskbar_created = unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
         TASKBAR_CREATED.set(taskbar_created);
+        // SAFETY: plain FFI with a static NUL-terminated name.
+        OPEN_SETTINGS.set(unsafe { RegisterWindowMessageW(OPEN_SETTINGS_MSG) });
         let owner = create_owner_window()?;
-        if let Err(e) = allow_through_uipi(owner.0, taskbar_created) {
-            log::warn(&format!("could not allow TaskbarCreated through UIPI: {e}"));
-        }
+        allow_messages(owner.0, &owner_messages(), allow_through_uipi);
         let tray = Rc::new(tray::Tray::new(owner.0)?);
         maybe_refresh(
             is_elevated(),
@@ -1871,6 +1934,63 @@ mod app {
             unsafe {
                 let _ = DestroyWindow(hwnd);
             }
+        }
+
+        #[test]
+        fn notify_running_posts_to_found_window() {
+            let posted = Cell::new(None);
+            let sent = notify_running(
+                || Some(HWND(7 as _)),
+                |h| {
+                    posted.set(Some(h.0 as usize));
+                    true
+                },
+            );
+            assert!(sent);
+            assert_eq!(posted.get(), Some(7));
+        }
+
+        #[test]
+        fn notify_running_without_window_is_false() {
+            let posted = Cell::new(false);
+            let sent = notify_running(
+                || None,
+                |_| {
+                    posted.set(true);
+                    true
+                },
+            );
+            assert!(!sent);
+            assert!(!posted.get());
+        }
+
+        thread_local! {
+            static ALLOWED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+        }
+
+        fn record_allow(_: HWND, msg: u32) -> windows::core::Result<()> {
+            ALLOWED.with(|a| a.borrow_mut().push(msg));
+            Ok(())
+        }
+
+        #[test]
+        fn owner_allows_open_settings_through_uipi() {
+            TASKBAR_CREATED.set(11);
+            OPEN_SETTINGS.set(22);
+            ALLOWED.with(|a| a.borrow_mut().clear());
+            allow_messages(HWND::default(), &owner_messages(), record_allow);
+            assert_eq!(ALLOWED.with(|a| a.borrow().clone()), [11, 22]);
+        }
+
+        #[test]
+        fn open_settings_message_opens_settings() {
+            let dir = TempDir::new("open-settings-msg");
+            let (app, _owner) = test_app(dir.path());
+            APP.with(|slot| *slot.borrow_mut() = Some(app));
+            open_settings_requested(SettingsUi::open_hidden);
+            let open = with_app(|app| app.settings_ui.as_ref().is_some_and(|ui| ui.is_open()));
+            assert_eq!(open, Some(true));
+            APP.with(|slot| slot.borrow_mut().take());
         }
 
         /// Whether another window could register `hk` right now (it is released again).
