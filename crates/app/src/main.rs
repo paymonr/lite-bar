@@ -28,6 +28,8 @@ mod paths;
 #[cfg(windows)]
 mod process_info;
 #[cfg(windows)]
+mod registration;
+#[cfg(windows)]
 mod settings_window;
 #[cfg(windows)]
 mod single_instance;
@@ -68,6 +70,7 @@ mod app {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
     use lite_bar_core::fps::{FocusClock, FpsTracker};
@@ -75,6 +78,7 @@ mod app {
     use lite_bar_core::history::LocalTime;
     use lite_bar_core::install::{parse_moved_from, MoveOutcome, MoveStatus};
     use lite_bar_core::layout::{fps_text, stats_text};
+    use lite_bar_core::registration::should_register;
     use lite_bar_core::sessions::{
         liveness_query_due, session_log_line, OpenSession, QueryGate, SessionBook,
     };
@@ -1002,6 +1006,7 @@ mod app {
             crate::startup::WORKER_THREAD,
             crate::mover::WORKER_THREAD,
             crate::mover::DELETE_THREAD,
+            crate::registration::REGISTER_THREAD,
         ];
         owns_trace && !in_ui_frame && !thread.is_some_and(|t| workers.contains(&t))
     }
@@ -1078,6 +1083,22 @@ mod app {
         }
     }
 
+    /// Refreshes the Start menu shortcut and Installed apps entry (`spawn`) when
+    /// `should_register`: elevated and running from the installed copy.
+    fn maybe_refresh(
+        elevated: bool,
+        exe: Option<PathBuf>,
+        program_files: Option<String>,
+        spawn: fn(PathBuf) -> Option<JoinHandle<()>>,
+    ) {
+        let exe_text = exe.as_ref().map(|e| e.to_string_lossy().into_owned());
+        if should_register(elevated, exe_text.as_deref(), program_files.as_deref()) {
+            if let Some(exe) = exe {
+                spawn(exe);
+            }
+        }
+    }
+
     fn start(
         dir: PathBuf,
         settings: Settings,
@@ -1092,6 +1113,12 @@ mod app {
             log::warn(&format!("could not allow TaskbarCreated through UIPI: {e}"));
         }
         let tray = Rc::new(tray::Tray::new(owner.0)?);
+        maybe_refresh(
+            is_elevated(),
+            own_exe(),
+            crate::mover::program_files(),
+            crate::registration::spawn_refresh,
+        );
         let overlay = Overlay::new(&settings.overlay)?;
 
         let start_visible = settings.overlay.visible;
@@ -1188,14 +1215,43 @@ mod app {
 
     #[cfg(test)]
     mod tests {
-        use std::thread::JoinHandle;
-
         use super::*;
         use crate::test_util::TempDir;
         use crate::updater::post_result;
         use lite_bar_core::hotkey::Hotkey;
         use lite_bar_core::move_prompt_ui::MovePromptAction;
         use lite_bar_core::settings_ui::UiAction;
+
+        thread_local! {
+            static SPAWNED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+        }
+
+        fn record_spawn(exe: PathBuf) -> Option<JoinHandle<()>> {
+            SPAWNED.with(|s| s.borrow_mut().push(exe));
+            None
+        }
+
+        fn refreshed(elevated: bool, exe: Option<&str>, pf: Option<&str>) -> Vec<PathBuf> {
+            SPAWNED.with(|s| s.borrow_mut().clear());
+            maybe_refresh(
+                elevated,
+                exe.map(PathBuf::from),
+                pf.map(String::from),
+                record_spawn,
+            );
+            SPAWNED.with(|s| s.borrow().clone())
+        }
+
+        #[test]
+        fn refresh_runs_only_when_should_register() {
+            let exe = r"C:\Program Files\Lite Bar\lite-bar.exe";
+            let pf = r"C:\Program Files";
+            assert_eq!(refreshed(true, Some(exe), Some(pf)), [PathBuf::from(exe)]);
+            assert!(refreshed(false, Some(exe), Some(pf)).is_empty());
+            assert!(refreshed(true, Some(r"C:\Users\p\lite-bar.exe"), Some(pf)).is_empty());
+            assert!(refreshed(true, None, Some(pf)).is_empty());
+            assert!(refreshed(true, Some(exe), None).is_empty());
+        }
 
         #[test]
         fn panic_message_formats_str_payload_and_location() {

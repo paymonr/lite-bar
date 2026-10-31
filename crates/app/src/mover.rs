@@ -62,7 +62,7 @@ pub fn program_files_roots() -> Vec<String> {
     roots
 }
 
-fn known_folder(id: &GUID) -> Option<String> {
+pub(crate) fn known_folder(id: &GUID) -> Option<String> {
     // SAFETY: plain FFI; on success the returned string is ours to free, once, below.
     let p = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }.ok()?;
     // SAFETY: `p` is a valid NUL-terminated string until it is freed.
@@ -159,7 +159,8 @@ pub fn start_moved(new: &Path, old: &Path) -> Result<(), String> {
 }
 
 /// The move steps for `user`: copies `exe` into `dir`, re-points the startup task (a
-/// failure is only logged) and starts the new copy. Each error is logged. Needs elevation.
+/// failure is only logged), registers the Start menu shortcut and Installed apps entry (a failure is only logged too)
+/// and starts the new copy. Each error is logged. Needs elevation.
 pub fn perform_move(exe: &Path, dir: &Path, user: &str) -> HelperExit {
     exit_code(&move_steps(exe, dir, user))
 }
@@ -174,8 +175,38 @@ fn exit_code(outcome: &MoveOutcome) -> HelperExit {
     }
 }
 
+/// What `move_steps_with` does after the copy; the tests swap in fakes.
+struct MoveSteps {
+    /// Re-points the startup task: old exe, new exe, user.
+    repoint: fn(&str, &str, &str),
+    /// Writes the Start menu shortcut and the Installed apps entry for the new exe.
+    register: fn(&Path) -> Result<(), String>,
+    /// Starts the new copy: new exe, old exe.
+    start: fn(&Path, &Path) -> Result<(), String>,
+}
+
+/// The real steps.
+const STEPS: MoveSteps = MoveSteps {
+    repoint: repoint_and_log,
+    register: crate::registration::register,
+    start: start_moved,
+};
+
+fn repoint_and_log(old: &str, new: &str, user: &str) {
+    let temp = std::env::temp_dir();
+    match repoint_startup(&SystemRunner, &schtasks_path(), old, new, user, &temp) {
+        Ok(true) => log::info(&format!("startup task now starts {new}")),
+        Ok(false) => {}
+        Err(e) => log::error(&format!("startup task not re-pointed after the move: {e}")),
+    }
+}
+
 /// `perform_move` with the error texts.
 fn move_steps(exe: &Path, dir: &Path, user: &str) -> MoveOutcome {
+    move_steps_with(exe, dir, user, &STEPS)
+}
+
+fn move_steps_with(exe: &Path, dir: &Path, user: &str, steps: &MoveSteps) -> MoveOutcome {
     let new = match copy_into(exe, dir) {
         Ok(new) => new,
         Err(e) => {
@@ -184,13 +215,11 @@ fn move_steps(exe: &Path, dir: &Path, user: &str) -> MoveOutcome {
         }
     };
     let (old_s, new_s) = (exe.to_string_lossy(), new.to_string_lossy());
-    let temp = std::env::temp_dir();
-    match repoint_startup(&SystemRunner, &schtasks_path(), &old_s, &new_s, user, &temp) {
-        Ok(true) => log::info(&format!("startup task now starts {new_s}")),
-        Ok(false) => {}
-        Err(e) => log::error(&format!("startup task not re-pointed after the move: {e}")),
+    (steps.repoint)(&old_s, &new_s, user);
+    if let Err(e) = (steps.register)(&new) {
+        log::error(&format!("registration after the move failed: {e}"));
     }
-    match start_moved(&new, exe) {
+    match (steps.start)(&new, exe) {
         Ok(()) => {
             log::info(&format!("copied {old_s} to {new_s} and started it"));
             MoveOutcome::Moved
@@ -374,6 +403,56 @@ mod tests {
             .into_iter()
             .filter(|c| c.first().map(String::as_str) == Some("/Create"))
             .collect()
+    }
+
+    thread_local! {
+        static CALLS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn note(call: &str) {
+        CALLS.with(|c| c.borrow_mut().push(call.to_string()));
+    }
+
+    fn fake_steps(register: fn(&Path) -> Result<(), String>) -> MoveSteps {
+        MoveSteps {
+            repoint: |_, _, _| note("repoint"),
+            register,
+            start: |_, _| {
+                note("start");
+                Ok(())
+            },
+        }
+    }
+
+    fn run_fake_move(name: &str, register: fn(&Path) -> Result<(), String>) -> MoveOutcome {
+        CALLS.with(|c| c.borrow_mut().clear());
+        let dir = TempDir::new(name);
+        let exe = dir.path().join("old.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        move_steps_with(&exe, &dir.path().join("pf"), USER, &fake_steps(register))
+    }
+
+    #[test]
+    fn move_steps_registers_before_starting() {
+        let outcome = run_fake_move("move-registers", |new| {
+            assert!(new.ends_with("pf\\lite-bar.exe"), "{new:?}");
+            note("register");
+            Ok(())
+        });
+        assert_eq!(outcome, MoveOutcome::Moved);
+        let calls = CALLS.with(|c| c.borrow().clone());
+        assert_eq!(calls, ["repoint", "register", "start"]);
+    }
+
+    #[test]
+    fn move_steps_register_failure_does_not_change_the_outcome() {
+        let outcome = run_fake_move("move-register-fails", |_| {
+            note("register");
+            Err("denied".into())
+        });
+        assert_eq!(outcome, MoveOutcome::Moved);
+        let calls = CALLS.with(|c| c.borrow().clone());
+        assert_eq!(calls, ["repoint", "register", "start"]);
     }
 
     #[test]
