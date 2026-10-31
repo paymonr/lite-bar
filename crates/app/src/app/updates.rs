@@ -119,7 +119,7 @@ impl App {
     /// release newer than the exe on disk is installed, and only from its own URLs; a click
     /// while downloading is ignored.
     pub(super) fn install_update(&mut self) {
-        if self.relaunched {
+        if self.relaunched || self.held_by_move("Update now") {
             return;
         }
         let r = match (&self.update, &self.installing) {
@@ -202,17 +202,15 @@ impl App {
     /// hotkey and tray icon go), then starts `exe --updated <this version>`. Returns true
     /// when it started: the mutex is kept until this process exits (the new instance waits
     /// for it) and the panic hook no longer stops the trace. Otherwise this instance carries
-    /// on as before and asks for a manual restart: the new exe is already in place.
+    /// on as before and asks for a manual restart: the new exe is already in place. While a
+    /// move runs it doesn't start (and asks for the restart).
     fn relaunch_updated(&mut self, exe: &Path) -> bool {
+        if self.held_by_move("restarting to the update") {
+            self.set_update_state(UpdateState::RestartRequired);
+            return false;
+        }
         let was_on = self.overlay_on;
-        // Before the window closes: a queued second Restart now (or Update now) applied
-        // while it drains is ignored.
-        self.relaunched = true;
-        self.close_settings_window_for_exit();
-        hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
-        self.stop_overlay();
-        self.tray.remove();
-        self.finish_all_sessions();
+        self.close_for_exit();
         match (self.relaunch)(exe) {
             Ok(()) => {
                 set_owns_trace(false);
@@ -232,6 +230,21 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Quit's close path before another instance takes over (an update relaunch, a move to
+    /// Program Files): marks `relaunched`, saves the windows' edits, sessions and stats, and
+    /// lets go of the hotkey, capture and tray icon.
+    pub(super) fn close_for_exit(&mut self) {
+        // Before the windows close: a queued second Restart now (or Update now) applied
+        // while they drain is ignored.
+        self.relaunched = true;
+        self.close_settings_window_for_exit();
+        self.close_move_prompt();
+        hotkeys::unregister(self.hwnd, HotkeyId::ToggleOverlay);
+        self.stop_overlay();
+        self.tray.remove();
+        self.finish_all_sessions();
     }
 
     /// Restart now: starts the installed update again (after an earlier relaunch failed).

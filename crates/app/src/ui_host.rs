@@ -42,11 +42,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsIconic, KillTimer, LoadCursorW, RegisterClassExW, SetCursor, SetForegroundWindow, SetTimer,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA, HCURSOR, HTCLIENT, IDC_ARROW,
     IDC_HAND, IDC_IBEAM, MINMAXINFO, SWP_NOACTIVATE, SWP_NOZORDER, SW_RESTORE, SW_SHOW,
-    WINDOW_EX_STYLE, WM_ACTIVATE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY,
-    WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-    WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CANCELMODE, WM_CAPTURECHANGED, WM_CHAR,
+    WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
+    WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
+    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_SYSCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
+    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_MINIMIZEBOX, WS_OVERLAPPED, WS_OVERLAPPEDWINDOW,
+    WS_SYSMENU,
 };
 
 use crate::log;
@@ -558,6 +559,7 @@ struct Shared {
     /// WM_DESTROY was seen: the hwnd is dead and must not be destroyed again.
     destroyed: Cell<bool>,
     min_client_dip: (f32, f32),
+    style: WINDOW_STYLE,
 }
 
 impl Shared {
@@ -662,8 +664,12 @@ fn cursor_monitor() -> (RECT, u32) {
     }
 }
 
-/// Window size in pixels for a client size in DIPs at `dpi`.
-fn window_size_for_client(client_dip: (f32, f32), dpi: u32) -> (i32, i32) {
+/// Style of `UiWindow::open_fixed` windows: a title bar with close and minimize, no resizing.
+const FIXED_STYLE: WINDOW_STYLE =
+    WINDOW_STYLE(WS_OVERLAPPED.0 | WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0);
+
+/// Window size in pixels for a client size in DIPs at `dpi`, for a window of `style`.
+fn window_size_for_client(client_dip: (f32, f32), style: WINDOW_STYLE, dpi: u32) -> (i32, i32) {
     let scale = scale_for_dpi(dpi);
     let mut r = RECT {
         left: 0,
@@ -672,9 +678,7 @@ fn window_size_for_client(client_dip: (f32, f32), dpi: u32) -> (i32, i32) {
         bottom: dip_to_px(client_dip.1, scale),
     };
     // SAFETY: valid in/out parameter.
-    let _ = unsafe {
-        AdjustWindowRectExForDpi(&mut r, WS_OVERLAPPEDWINDOW, false, WINDOW_EX_STYLE(0), dpi)
-    };
+    let _ = unsafe { AdjustWindowRectExForDpi(&mut r, style, false, WINDOW_EX_STYLE(0), dpi) };
     (r.right - r.left, r.bottom - r.top)
 }
 
@@ -904,7 +908,7 @@ fn handle(shared: &Shared, hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
         }
         WM_GETMINMAXINFO => {
             let dpi = unsafe { GetDpiForWindow(hwnd) };
-            let (w, h) = window_size_for_client(shared.min_client_dip, dpi);
+            let (w, h) = window_size_for_client(shared.min_client_dip, shared.style, dpi);
             // SAFETY: lParam points to the system's MINMAXINFO for this message.
             let info = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
             info.ptMinTrackSize = POINT { x: w, y: h };
@@ -973,6 +977,27 @@ impl UiWindow {
         UiWindow::create(title, size_dip, min_dip, app, false)
     }
 
+    /// Opens a window with a fixed `size_dip` client area (no resizing or maximize), centred
+    /// on the monitor under the cursor.
+    pub fn open_fixed(
+        title: &str,
+        size_dip: (f32, f32),
+        app: Box<dyn UiApp>,
+    ) -> windows::core::Result<UiWindow> {
+        UiWindow::create_styled(title, size_dip, size_dip, FIXED_STYLE, app, true)
+    }
+
+    /// `open_fixed`, but never shown (tests drive it with messages).
+    #[cfg(test)]
+    pub fn open_fixed_hidden(
+        title: &str,
+        size_dip: (f32, f32),
+        app: Box<dyn UiApp>,
+    ) -> windows::core::Result<UiWindow> {
+        UiWindow::create_styled(title, size_dip, size_dip, FIXED_STYLE, app, false)
+    }
+
+    /// A resizable window (`WS_OVERLAPPEDWINDOW`).
     fn create(
         title: &str,
         size_dip: (f32, f32),
@@ -980,10 +1005,21 @@ impl UiWindow {
         app: Box<dyn UiApp>,
         show: bool,
     ) -> windows::core::Result<UiWindow> {
+        UiWindow::create_styled(title, size_dip, min_dip, WS_OVERLAPPEDWINDOW, app, show)
+    }
+
+    fn create_styled(
+        title: &str,
+        size_dip: (f32, f32),
+        min_dip: (f32, f32),
+        style: WINDOW_STYLE,
+        app: Box<dyn UiApp>,
+        show: bool,
+    ) -> windows::core::Result<UiWindow> {
         register_window_class();
         let title = HSTRING::from(title);
         let (work, monitor_dpi) = cursor_monitor();
-        let (create_w, create_h) = window_size_for_client(size_dip, monitor_dpi);
+        let (create_w, create_h) = window_size_for_client(size_dip, style, monitor_dpi);
         let min_client = (min_dip.0.min(size_dip.0), min_dip.1.min(size_dip.1));
         // SAFETY: plain FFI; the window is destroyed by PendingWindow on every error path.
         unsafe {
@@ -992,7 +1028,7 @@ impl UiWindow {
                 WINDOW_EX_STYLE(0),
                 CLASS_NAME,
                 &title,
-                WS_OVERLAPPEDWINDOW,
+                style,
                 work.left,
                 work.top,
                 create_w,
@@ -1008,9 +1044,9 @@ impl UiWindow {
             let wanted = if dpi == monitor_dpi {
                 (create_w, create_h)
             } else {
-                window_size_for_client(size_dip, dpi)
+                window_size_for_client(size_dip, style, dpi)
             };
-            let min = window_size_for_client(min_client, dpi);
+            let min = window_size_for_client(min_client, style, dpi);
             let (w, h) = opening_size(wanted, min, work);
             let (x, y) = centered_in(work, (w, h));
             SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE)?;
@@ -1055,6 +1091,7 @@ impl UiWindow {
                 close_pending: Cell::new(false),
                 destroyed: Cell::new(false),
                 min_client_dip: min_client,
+                style,
             });
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Rc::into_raw(shared.clone()) as isize);
             std::mem::forget(pending);
@@ -1426,8 +1463,9 @@ mod win_tests {
     use windows::Win32::Foundation::{LPARAM, RECT, WPARAM};
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DestroyWindow, IsWindow, SendMessageW, WM_CHAR, WM_CLOSE, WM_DPICHANGED, WM_LBUTTONDOWN,
-        WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT,
+        DestroyWindow, IsWindow, SendMessageW, GWL_STYLE, WM_CHAR, WM_CLOSE, WM_DPICHANGED,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WS_CAPTION, WS_MAXIMIZEBOX,
+        WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME,
     };
 
     use super::*;
@@ -1542,13 +1580,38 @@ mod win_tests {
             &mut info as *mut MINMAXINFO as isize,
         );
         let dpi = unsafe { GetDpiForWindow(w.hwnd()) };
-        let (mw, mh) = window_size_for_client((720.0, 520.0), dpi);
+        let (mw, mh) = window_size_for_client((720.0, 520.0), WS_OVERLAPPEDWINDOW, dpi);
         assert_eq!((info.ptMinTrackSize.x, info.ptMinTrackSize.y), (mw, mh));
         // Opened at its default size, which is at least the minimum.
         let mut r = RECT::default();
         unsafe { GetClientRect(w.hwnd(), &mut r) }.unwrap();
         let s = scale_for_dpi(dpi);
         assert_eq!(r.right - r.left, dip_to_px(900.0, s));
+    }
+
+    #[test]
+    fn fixed_window_cannot_be_resized_and_has_its_client_size() {
+        let app = TestApp {
+            frames: Rc::new(Cell::new(0)),
+            closed: Rc::new(Cell::new(0)),
+            color: RED,
+        };
+        let w = UiWindow::open_fixed_hidden("t", (440.0, 300.0), Box::new(app)).unwrap();
+        let style = unsafe { GetWindowLongPtrW(w.hwnd(), GWL_STYLE) } as u32;
+        assert_eq!(
+            style & (WS_THICKFRAME.0 | WS_MAXIMIZEBOX.0),
+            0,
+            "no resizing"
+        );
+        assert_ne!(style & (WS_CAPTION.0 | WS_SYSMENU.0 | WS_MINIMIZEBOX.0), 0);
+        let dpi = unsafe { GetDpiForWindow(w.hwnd()) };
+        let s = scale_for_dpi(dpi);
+        let mut r = RECT::default();
+        unsafe { GetClientRect(w.hwnd(), &mut r) }.unwrap();
+        assert_eq!(
+            (r.right - r.left, r.bottom - r.top),
+            (dip_to_px(440.0, s), dip_to_px(300.0, s))
+        );
     }
 
     #[test]
