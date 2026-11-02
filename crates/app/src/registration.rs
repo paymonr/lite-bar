@@ -16,6 +16,7 @@ use windows::core::{Interface, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_SUCCESS, RPC_E_CHANGED_MODE, WIN32_ERROR,
 };
+use windows::Win32::Storage::FileSystem::GetLongPathNameW;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, IPersistFile, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
     STGM_READ,
@@ -237,6 +238,23 @@ pub fn write_shortcut(lnk: &Path, exe: &Path) -> Result<(), String> {
     }
 }
 
+/// `p` with any 8.3 short names expanded, as a shortcut reports its target; `p` itself when
+/// that fails (e.g. it doesn't exist).
+pub fn long_path(p: &Path) -> PathBuf {
+    let path = HSTRING::from(p.as_os_str());
+    let mut buf = vec![0u16; 1024];
+    loop {
+        // SAFETY: plain FFI; the buffer is live and its length passed.
+        let len = unsafe { GetLongPathNameW(&path, Some(&mut buf)) } as usize;
+        match len {
+            0 => return p.to_path_buf(),
+            // Too small: `len` is the size needed, with the NUL.
+            n if n > buf.len() => buf.resize(n, 0),
+            n => return PathBuf::from(String::from_utf16_lossy(&buf[..n])),
+        }
+    }
+}
+
 /// Brings the entry under `root\subkey` and the shortcut at `lnk` up to date for `exe`:
 /// writes only the stale values, and the shortcut when it is missing or starts another file.
 /// Both are tried; the first error is returned.
@@ -247,6 +265,7 @@ pub fn register_at(
     exe: &Path,
     version: &str,
 ) -> Result<(), String> {
+    let exe = &long_path(exe);
     let size = std::fs::metadata(exe).map_or(0, |m| m.len());
     let wanted = entry_values(&exe.to_string_lossy(), version, size);
     let stale = stale_values(&read_values(root, subkey), &wanted);
@@ -396,6 +415,41 @@ mod tests {
         let lnk = dir.path().join("Lite Bar.lnk");
         register_at(HKEY_CURRENT_USER, &key.0, &lnk, &exe, "0.5.0").unwrap();
         assert_eq!(shortcut_target(&lnk), Some(exe));
+    }
+
+    /// `p` with its 8.3 names, or `None` when the volume gives it none.
+    fn short_path(p: &Path) -> Option<PathBuf> {
+        use windows::Win32::Storage::FileSystem::GetShortPathNameW;
+        let mut buf = [0u16; 1024];
+        // SAFETY: plain FFI; the buffer is live and its length passed.
+        let len =
+            unsafe { GetShortPathNameW(&HSTRING::from(p.as_os_str()), Some(&mut buf)) } as usize;
+        let short = PathBuf::from(String::from_utf16_lossy(&buf[..len.min(buf.len())]));
+        (len > 0 && len < buf.len() && short != p).then_some(short)
+    }
+
+    fn set_read_only(path: &Path, read_only: bool) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_readonly(read_only);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn register_at_keeps_a_shortcut_when_given_the_exe_by_its_short_path() {
+        let key = TestKey::new("short-exe");
+        let dir = TempDir::new("reg-short-exe");
+        let exe = exe_file(&dir, "lite-bar-installed.exe");
+        let Some(short) = short_path(&exe) else {
+            eprintln!("skipped: no 8.3 name for {}", exe.display());
+            return;
+        };
+        let lnk = dir.path().join("Lite Bar.lnk");
+        write_shortcut(&lnk, &exe).unwrap();
+        set_read_only(&lnk, true); // so a needless rewrite fails
+
+        let result = register_at(HKEY_CURRENT_USER, &key.0, &lnk, &short, "0.5.0");
+        set_read_only(&lnk, false);
+        assert_eq!(result, Ok(()));
     }
 
     #[test]

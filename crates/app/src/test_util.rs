@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use crate::startup::{CommandRunner, Output};
 
-/// A fresh, empty directory under `%TEMP%` that is removed on drop.
+/// A fresh, empty directory under `%TEMP%` that is removed on drop. Its path is the long form,
+/// as Windows reports paths back, even when `%TEMP%` is an 8.3 short path (as on CI runners).
 pub struct TempDir(PathBuf);
 
 impl TempDir {
@@ -13,7 +14,7 @@ impl TempDir {
         let dir = std::env::temp_dir().join(format!("lite-bar-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
-        TempDir(dir)
+        TempDir(crate::registration::long_path(&dir))
     }
 
     pub fn path(&self) -> &Path {
