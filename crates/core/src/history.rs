@@ -111,6 +111,71 @@ pub struct GameRecord {
     pub first_played: LocalTime,
     pub last_played: LocalTime,
     pub hist: FrameHistogram,
+    /// The newest session's numbers; `None` in entries written before they were kept.
+    pub last_session: Option<LastSession>,
+}
+
+/// One session's numbers, kept per game for the Games page's "last session".
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LastSession {
+    pub start: LocalTime,
+    pub end: LocalTime,
+    pub play_secs: f64,
+    pub avg_fps: f64,
+    pub low_1pct_fps: f64,
+    pub high_1pct_fps: f64,
+}
+
+impl LastSession {
+    /// `s`'s numbers, or `None` when it has too few frames for stats.
+    fn of(s: &SessionRecord) -> Option<LastSession> {
+        let sum = s.hist.summary()?;
+        Some(LastSession {
+            start: s.start,
+            end: s.end,
+            play_secs: sum.play_secs,
+            avg_fps: sum.avg_fps,
+            low_1pct_fps: sum.low_1pct_fps,
+            high_1pct_fps: sum.high_1pct_fps,
+        })
+    }
+}
+
+/// On-disk shape of `last_session` in `games.toml`.
+#[derive(Serialize, Deserialize)]
+struct LastSessionFile {
+    start: LocalTime,
+    end: LocalTime,
+    play_secs: f64,
+    avg: f64,
+    low_1pct: f64,
+    high_1pct: f64,
+}
+
+impl From<LastSessionFile> for LastSession {
+    fn from(f: LastSessionFile) -> Self {
+        LastSession {
+            start: f.start,
+            end: f.end,
+            play_secs: f.play_secs,
+            avg_fps: f.avg,
+            low_1pct_fps: f.low_1pct,
+            high_1pct_fps: f.high_1pct,
+        }
+    }
+}
+
+impl From<&LastSession> for LastSessionFile {
+    fn from(l: &LastSession) -> Self {
+        LastSessionFile {
+            start: l.start,
+            end: l.end,
+            play_secs: l.play_secs,
+            avg: l.avg_fps,
+            low_1pct: l.low_1pct_fps,
+            high_1pct: l.high_1pct_fps,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -138,6 +203,7 @@ fn parse_game(value: &toml::Value) -> Result<GameRecord, String> {
         first_played: g.first_played,
         last_played: g.last_played,
         hist: FrameHistogram::from_sparse(&g.buckets, g.total_secs),
+        last_session: g.last_session.map(LastSession::from),
     })
 }
 
@@ -152,6 +218,8 @@ struct GameIn {
     total_secs: f64,
     #[serde(default)]
     buckets: Vec<(u32, u64)>,
+    #[serde(default)]
+    last_session: Option<LastSessionFile>,
 }
 
 #[derive(Serialize)]
@@ -165,6 +233,8 @@ struct GameOut<'a> {
     /// TOML integers are i64, so counts are clamped to `i64::MAX` (only reachable with
     /// corrupt data).
     buckets: Vec<(u32, i64)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_session: Option<LastSessionFile>,
 }
 
 #[derive(Serialize)]
@@ -212,6 +282,7 @@ impl GameStore {
                 last_played: g.last_played,
                 total_secs: g.hist.total_secs(),
                 buckets: toml_buckets(&g.hist),
+                last_session: g.last_session.as_ref().map(LastSessionFile::from),
             };
             let value = toml::Value::try_from(out).expect("game entry converts to a TOML value");
             games.insert(key.clone(), value);
@@ -243,6 +314,7 @@ impl GameStore {
                     g.name = s.name.clone();
                     g.exe_path = s.exe_path.clone();
                     g.last_played = s.end;
+                    g.last_session = LastSession::of(s);
                 }
             }
             None => {
@@ -255,6 +327,7 @@ impl GameStore {
                         first_played: s.start,
                         last_played: s.end,
                         hist: s.hist.clone(),
+                        last_session: LastSession::of(s),
                     },
                 );
             }
@@ -600,6 +673,7 @@ mod tests {
             first_played: t(1, 0, 0),
             last_played: last,
             hist: h,
+            last_session: None,
         }
     }
 
@@ -1240,5 +1314,45 @@ mod tests {
             split_sessions_csv(&all, "", &GameStore::default(), &BTreeMap::new(), &hidden);
         assert_eq!(shown, all);
         assert_eq!(aside, "");
+    }
+
+    // ---- Last session ----
+
+    #[test]
+    fn add_session_keeps_the_newest_session() {
+        let mut store = GameStore::default();
+        let newer = session("k", "A", t(2, 9, 30), t(2, 10, 0), hist(6000, 1.0 / 64.0));
+        let older = session("k", "A", t(2, 8, 0), t(2, 9, 0), hist(6000, 1.0 / 32.0));
+        store.add_session(&newer);
+        store.add_session(&older);
+        let want = newer.hist.summary().unwrap();
+        let last = store.games["k"].last_session.expect("a last session");
+        assert_eq!((last.start, last.end), (newer.start, newer.end));
+        assert_eq!(last.play_secs, want.play_secs);
+        assert_eq!(last.avg_fps, want.avg_fps);
+        assert_eq!(last.low_1pct_fps, want.low_1pct_fps);
+        assert_eq!(last.high_1pct_fps, want.high_1pct_fps);
+    }
+
+    #[test]
+    fn last_session_round_trips_and_old_entries_have_none() {
+        let mut store = GameStore::default();
+        store.add_session(&session(
+            "k",
+            "A",
+            t(2, 9, 30),
+            t(2, 10, 0),
+            hist(6000, 1.0 / 64.0),
+        ));
+        let (back, warnings) = GameStore::parse(&store.to_toml()).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(back.games["k"].last_session, store.games["k"].last_session);
+
+        let old = "[games.k]\nname = \"A\"\nexe_path = 'C:\\A.exe'\nsessions = 1\n\
+                   first_played = \"2026-10-02 09:30:07\"\nlast_played = \"2026-10-02 10:00:07\"\n\
+                   total_secs = 60.0\nbuckets = []\n";
+        let (old, warnings) = GameStore::parse(old).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(old.games["k"].last_session, None);
     }
 }
