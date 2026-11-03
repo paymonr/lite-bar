@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 
 use lite_bar_core::game_name::display_name;
 use lite_bar_core::history::{
-    games_csv, parse_pending, pending_toml, session_csv_row, GameStore, LocalTime, SessionRecord,
-    CSV_BOM, SESSIONS_CSV_HEADER,
+    games_csv, parse_pending, pending_toml, session_csv_row, split_sessions_csv, GameStore,
+    LocalTime, SessionRecord, CSV_BOM, SESSIONS_CSV_HEADER,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
 
@@ -21,6 +21,8 @@ const GAMES_TOML: &str = "games.toml";
 const GAMES_CSV: &str = "games.csv";
 const SESSIONS_CSV: &str = "sessions.csv";
 const PENDING_TOML: &str = "pending.toml";
+/// The `sessions.csv` rows of apps marked "Not a game", kept until "It's a game".
+pub const NOT_GAMES_SESSIONS_CSV: &str = "sessions-not-games.csv";
 
 /// Current local date and time.
 pub fn local_now() -> LocalTime {
@@ -58,6 +60,10 @@ pub struct StatsWriter {
     rows: Vec<String>,
     /// `games.csv` needs regenerating from `games.toml`.
     games_csv_dirty: bool,
+    /// Apps marked "Not a game" (`[not_games]`): not recorded, and left out of the CSV files.
+    not_games: BTreeMap<String, String>,
+    /// `sessions.csv` and `sessions-not-games.csv` need splitting again for `not_games`.
+    split_dirty: bool,
     pending: PendingFile,
 }
 
@@ -70,8 +76,13 @@ impl StatsWriter {
             sessions: Vec::new(),
             rows: Vec::new(),
             games_csv_dirty: false,
+            not_games: BTreeMap::new(),
+            split_dirty: false,
             pending: PendingFile::None,
         };
+        // Rows set aside by an earlier run go back unless the next `set_not_games` keeps
+        // their apps marked.
+        writer.split_dirty = writer.dir.join(NOT_GAMES_SESSIONS_CSV).exists();
         writer.load_pending();
         writer
     }
@@ -109,6 +120,15 @@ impl StatsWriter {
         }
     }
 
+    /// The apps marked "Not a game". A change makes the next `flush` rewrite the CSV files.
+    pub fn set_not_games(&mut self, not_games: &BTreeMap<String, String>) {
+        if self.not_games != *not_games {
+            self.not_games = not_games.clone();
+            self.games_csv_dirty = true;
+            self.split_dirty = true;
+        }
+    }
+
     /// Makes the next `flush` regenerate `games.csv` (e.g. after the name overrides changed).
     pub fn mark_games_csv_dirty(&mut self) {
         self.games_csv_dirty = true;
@@ -130,7 +150,15 @@ impl StatsWriter {
     }
 
     /// Stores a finished session in all three files (or queues whatever can't be written now).
+    /// A session of an app marked "Not a game" is dropped.
     pub fn record(&mut self, s: &SessionRecord, overrides: &BTreeMap<String, String>) {
+        if self.not_games.contains_key(&s.key) {
+            log::info(&format!(
+                "stats: not recorded, marked not a game: {}",
+                s.key
+            ));
+            return;
+        }
         let display = display_name(&s.name, &s.exe_path, overrides);
         self.rows.push(session_csv_row(s, &display));
         self.sessions.push(s.clone());
@@ -168,7 +196,11 @@ impl StatsWriter {
     }
 
     fn write_queued(&mut self, overrides: &BTreeMap<String, String>) {
-        if self.sessions.is_empty() && self.rows.is_empty() && !self.games_csv_dirty {
+        if self.sessions.is_empty()
+            && self.rows.is_empty()
+            && !self.games_csv_dirty
+            && !self.split_dirty
+        {
             return;
         }
         if let Err(e) = std::fs::create_dir_all(&self.dir) {
@@ -179,10 +211,57 @@ impl StatsWriter {
             store = self.merge_sessions();
         }
         if self.sessions.is_empty() && (self.games_csv_dirty || store.is_some()) {
-            self.write_games_csv(store, overrides);
+            store = store.or_else(|| self.load_store());
+            self.write_games_csv(store.as_ref(), overrides);
         }
         if !self.rows.is_empty() {
             self.append_rows();
+        }
+        if self.split_dirty && self.rows.is_empty() {
+            store = store.or_else(|| self.load_store());
+            if let Some(store) = &store {
+                self.split_sessions(store, overrides);
+            }
+        }
+    }
+
+    /// Moves the `sessions.csv` rows of not-games into `sessions-not-games.csv` and the
+    /// others back. Kept dirty (retried by the next flush) when a file can't be read or
+    /// written.
+    fn split_sessions(&mut self, store: &GameStore, overrides: &BTreeMap<String, String>) {
+        let read = |name: &str| match std::fs::read_to_string(self.dir.join(name)) {
+            Ok(text) => Ok(text),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(format!("cannot read {name}: {e}")),
+        };
+        let result = (|| {
+            let (shown, aside) = (read(SESSIONS_CSV)?, read(NOT_GAMES_SESSIONS_CSV)?);
+            if shown.is_empty() && aside.is_empty() {
+                return Ok(());
+            }
+            let (new_shown, new_aside) =
+                split_sessions_csv(&shown, &aside, store, overrides, &self.not_games);
+            if new_shown != shown {
+                write_atomic(&self.dir.join(SESSIONS_CSV), new_shown.as_bytes())
+                    .map_err(|e| format!("cannot write {SESSIONS_CSV}: {e}"))?;
+            }
+            let aside_path = self.dir.join(NOT_GAMES_SESSIONS_CSV);
+            if new_aside.is_empty() {
+                match std::fs::remove_file(&aside_path) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(format!("cannot delete {NOT_GAMES_SESSIONS_CSV}: {e}"))
+                    }
+                    _ => {}
+                }
+            } else if new_aside != aside {
+                write_atomic(&aside_path, new_aside.as_bytes())
+                    .map_err(|e| format!("cannot write {NOT_GAMES_SESSIONS_CSV}: {e}"))?;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.split_dirty = false,
+            Err(e) => log::error(&format!("stats: {e}")),
         }
     }
 
@@ -238,11 +317,11 @@ impl StatsWriter {
         }
     }
 
-    fn write_games_csv(&mut self, store: Option<GameStore>, overrides: &BTreeMap<String, String>) {
-        let Some(store) = store.or_else(|| self.load_store()) else {
+    fn write_games_csv(&mut self, store: Option<&GameStore>, overrides: &BTreeMap<String, String>) {
+        let Some(store) = store else {
             return;
         };
-        let csv = games_csv(&store, overrides);
+        let csv = games_csv(&store.shown(&self.not_games), overrides);
         match write_atomic(&self.dir.join(GAMES_CSV), csv.as_bytes()) {
             Ok(()) => self.games_csv_dirty = false,
             Err(e) => log::error(&format!("stats: cannot write {GAMES_CSV}: {e}")),
@@ -315,8 +394,9 @@ pub fn list_games(stats_dir: &Path) -> Vec<GameRow> {
     };
     let mut rows: Vec<GameRow> = store
         .games
-        .into_values()
-        .map(|g| GameRow {
+        .into_iter()
+        .map(|(key, g)| GameRow {
+            key,
             exe_path: g.exe_path,
             stored_name: g.name,
             override_name: None,
@@ -462,12 +542,14 @@ mod tests {
             rows,
             vec![
                 GameRow {
+                    key: "a".to_string(),
                     exe_path: r"C:\Games\Minecraft.exe".to_string(),
                     stored_name: "Minecraft".to_string(),
                     override_name: None,
                     override_key: None,
                 },
                 GameRow {
+                    key: "b".to_string(),
                     exe_path: r"C:\Games\Zelda.exe".to_string(),
                     stored_name: "Zelda".to_string(),
                     override_name: None,
@@ -581,6 +663,80 @@ mod tests {
         assert!(read(&dir, "games.csv").contains("Renamed"));
         assert!(read(&dir, "sessions.csv").contains("Renamed"));
         assert!(read(&dir, "games.toml").contains("Alpha"));
+    }
+
+    const ZOOM_KEY: &str = r"c:\games\zoom.exe";
+
+    /// A session whose key is its exe's game key, as real sessions have.
+    fn keyed(name: &str, start: LocalTime, end: LocalTime) -> SessionRecord {
+        let key = format!(r"c:\games\{}.exe", name.to_lowercase());
+        session(&key, name, start, end)
+    }
+
+    fn marked(keys: &[&str]) -> BTreeMap<String, String> {
+        keys.iter()
+            .map(|k| (k.to_string(), "x".to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn not_games_leave_the_csv_files_and_come_back() {
+        let tmp = TempDir::new("stats-not-games");
+        let dir = tmp.path().to_path_buf();
+        let mut w = StatsWriter::new(dir.clone());
+        w.record(&keyed("Doom", time(9, 0), time(9, 30)), &no_overrides());
+        w.record(&keyed("Zoom", time(10, 0), time(10, 30)), &no_overrides());
+        let (games, sessions) = (read(&dir, "games.csv"), read(&dir, "sessions.csv"));
+
+        w.set_not_games(&marked(&[ZOOM_KEY]));
+        w.flush(&no_overrides());
+        assert!(!read(&dir, "games.csv").contains("Zoom"));
+        assert!(read(&dir, "games.csv").contains("Doom"));
+        assert!(!read(&dir, "sessions.csv").contains("Zoom"));
+        assert!(read(&dir, NOT_GAMES_SESSIONS_CSV).contains(",Zoom,"));
+        assert!(
+            read(&dir, "games.toml").contains("zoom"),
+            "its history is kept"
+        );
+
+        w.set_not_games(&no_overrides());
+        w.flush(&no_overrides());
+        assert_eq!(read(&dir, "games.csv"), games);
+        assert_eq!(read(&dir, "sessions.csv"), sessions);
+        assert!(!dir.join(NOT_GAMES_SESSIONS_CSV).exists());
+    }
+
+    #[test]
+    fn sessions_of_not_games_are_not_recorded() {
+        let tmp = TempDir::new("stats-not-games-record");
+        let dir = tmp.path().to_path_buf();
+        let mut w = StatsWriter::new(dir.clone());
+        w.set_not_games(&marked(&[ZOOM_KEY]));
+        w.record(&keyed("Doom", time(9, 0), time(9, 30)), &no_overrides());
+        w.record(&keyed("Zoom", time(10, 0), time(10, 30)), &no_overrides());
+        assert!(!read(&dir, "games.toml").contains("zoom"));
+        assert!(!read(&dir, "sessions.csv").contains("Zoom"));
+        assert!(!dir.join(NOT_GAMES_SESSIONS_CSV).exists());
+    }
+
+    #[test]
+    fn a_locked_sessions_csv_is_split_on_a_later_flush() {
+        let tmp = TempDir::new("stats-not-games-locked");
+        let dir = tmp.path().to_path_buf();
+        let mut w = StatsWriter::new(dir.clone());
+        w.record(&keyed("Zoom", time(10, 0), time(10, 30)), &no_overrides());
+        let lock = OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(dir.join("sessions.csv"))
+            .unwrap();
+        w.set_not_games(&marked(&[ZOOM_KEY]));
+        w.flush(&no_overrides());
+        drop(lock);
+        assert!(read(&dir, "sessions.csv").contains("Zoom"), "not split yet");
+        w.flush(&no_overrides());
+        assert!(!read(&dir, "sessions.csv").contains("Zoom"));
+        assert!(read(&dir, NOT_GAMES_SESSIONS_CSV).contains(",Zoom,"));
     }
 
     #[test]

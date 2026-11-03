@@ -1,19 +1,28 @@
-//! Game names section: a name field per played game, and the stats folder button.
+//! Games section: a name field and a "Not a game" button per played game, the apps marked
+//! "Not a game" with "It's a game" to undo it, and the stats folder button.
+
+use std::collections::BTreeMap;
 
 use super::{
     button_width, end_card, row_line, setting_row, text_block, GameEdit, GameRow, SettingsView,
     UiAction, GAMES_HINT, ROW_H,
 };
-use crate::ui::{id, theme, TextEdit, TextFieldEvent, Ui};
+use crate::settings_edit::SettingsChange;
+use crate::ui::{id, theme, TextEdit, TextFieldEvent, TextStyle, Ui};
 
 const FIELD_W: f32 = 220.0;
 const GAME_ROW_H: f32 = theme::CONTROL_HEIGHT;
 const OPEN_FOLDER: &str = "Open stats folder";
+const NOT_A_GAME: &str = "Not a game";
+const IS_A_GAME: &str = "It's a game";
+const NOT_GAMES: &str = "Not games";
+const NOT_GAMES_HINT: &str = "Not recorded, and left out of the stats files";
 
 pub(super) fn section(
     ui: &mut Ui,
     view: &mut SettingsView,
     games: &[GameRow],
+    not_games: &BTreeMap<String, String>,
     out: &mut Vec<UiAction>,
 ) {
     // Fields that went away (the list changed) end their edit now.
@@ -31,13 +40,25 @@ pub(super) fn section(
         }
     }
 
+    let (shown, hidden): (Vec<&GameRow>, Vec<&GameRow>) =
+        games.iter().partition(|g| !not_games.contains_key(&g.key));
+    // Marked apps the stats store doesn't list (yet, or any more) can still be undone.
+    let unlisted: Vec<(&String, &String)> = not_games
+        .iter()
+        .filter(|(key, _)| !games.iter().any(|g| &g.key == *key))
+        .collect();
+
     ui.card(|ui| {
-        if games.is_empty() {
+        if games.is_empty() && unlisted.is_empty() {
             let w = ui.available().w;
             text_block(ui, ROW_H, None, &[GAMES_HINT], w);
             return;
         }
-        for (i, game) in games.iter().enumerate() {
+        if shown.is_empty() {
+            let w = ui.available().w;
+            text_block(ui, ROW_H, None, &[GAMES_HINT], w);
+        }
+        for (i, game) in shown.iter().enumerate() {
             if i > 0 {
                 row_line(ui);
             }
@@ -47,6 +68,25 @@ pub(super) fn section(
                 .entry(game.exe_path.clone())
                 .or_insert_with(|| GameEdit::new(key, game.override_name.as_deref()));
             game_row(ui, game, edit, out);
+        }
+        if !hidden.is_empty() || !unlisted.is_empty() {
+            row_line(ui);
+            text_block(
+                ui,
+                ROW_H,
+                Some(NOT_GAMES),
+                &[NOT_GAMES_HINT],
+                ui.available().w,
+            );
+            for game in &hidden {
+                row_line(ui);
+                let name = game.override_name.as_deref().unwrap_or(&game.stored_name);
+                is_a_game_row(ui, &game.key, name, file_name(&game.exe_path), out);
+            }
+            for (key, name) in &unlisted {
+                row_line(ui);
+                is_a_game_row(ui, key, name, key, out);
+            }
         }
         row_line(ui);
         let bw = button_width(ui, OPEN_FOLDER);
@@ -75,20 +115,48 @@ fn game_row(ui: &mut Ui, game: &GameRow, e: &mut GameEdit, out: &mut Vec<UiActio
             .unwrap_or_else(|| game.exe_path.clone());
     }
     let exe = file_name(&game.exe_path);
-    let field_w = FIELD_W.min(ui.available().w);
+    let bw = ui.text_measure().measure(NOT_A_GAME, TextStyle::BODY).0 + 2.0 * theme::BUTTON_PAD_X;
+    let field_w = FIELD_W.min(ui.available().w - bw - theme::GAP).max(0.0);
     setting_row(
         ui,
         GAME_ROW_H,
         Some(&game.stored_name),
         &[exe],
-        field_w,
-        |ui| match ui.text_field(field, &mut e.edit, &game.stored_name) {
-            TextFieldEvent::None => {}
-            TextFieldEvent::Changed => e.pending = true,
-            TextFieldEvent::Committed => out.extend(e.commit()),
-            TextFieldEvent::Cancelled => e.pending = false,
+        field_w + theme::GAP + bw,
+        |ui| {
+            ui.next_width(field_w);
+            match ui.text_field(field, &mut e.edit, &game.stored_name) {
+                TextFieldEvent::None => {}
+                TextFieldEvent::Changed => e.pending = true,
+                TextFieldEvent::Committed => out.extend(e.commit()),
+                TextFieldEvent::Cancelled => e.pending = false,
+            }
+            if ui.button(id(&format!("settings.not_game:{}", game.key)), NOT_A_GAME) {
+                // Under the name it shows now, so the Not games list reads the same.
+                let name = game
+                    .override_name
+                    .clone()
+                    .unwrap_or(game.stored_name.clone());
+                out.push(UiAction::Change(SettingsChange::NotAGame {
+                    key: game.key.clone(),
+                    name: Some(name),
+                }));
+            }
         },
     );
+}
+
+/// A marked app under "Not games": its name, `detail` (the exe) and "It's a game".
+fn is_a_game_row(ui: &mut Ui, key: &str, name: &str, detail: &str, out: &mut Vec<UiAction>) {
+    let bw = button_width(ui, IS_A_GAME);
+    setting_row(ui, GAME_ROW_H, Some(name), &[detail], bw, |ui| {
+        if ui.button(id(&format!("settings.is_game:{key}")), IS_A_GAME) {
+            out.push(UiAction::Change(SettingsChange::NotAGame {
+                key: key.to_string(),
+                name: None,
+            }));
+        }
+    });
 }
 
 /// The last path component, for showing `C:\Games\x.exe` as `x.exe`.

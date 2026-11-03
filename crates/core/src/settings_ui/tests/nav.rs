@@ -97,7 +97,7 @@ fn wheel_scrolling_moves_the_highlight() {
 #[test]
 fn clicked_last_section_stays_selected_at_the_bottom() {
     let mut p = Page::new(MOCKUP);
-    p.click_text("Game names");
+    p.click_text("Games");
     p.idle();
     // The page cannot scroll far enough to bring the heading to the top.
     assert!(p.scroll() < p.view.headings[NAV_GAMES]);

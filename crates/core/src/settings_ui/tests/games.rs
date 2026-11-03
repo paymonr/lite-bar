@@ -130,6 +130,7 @@ fn file_name_override_page() -> Page {
         .game_names
         .insert("javaw.exe".to_string(), "Minecraft Mod".to_string());
     p.games = vec![GameRow {
+        key: "java".to_string(),
         exe_path: r"C:\Java\bin\javaw.exe".to_string(),
         stored_name: "Java".to_string(),
         override_name: Some("Minecraft Mod".to_string()),
@@ -177,4 +178,105 @@ fn renaming_a_file_name_override_edits_that_key() {
         p.settings.game_names.iter().collect::<Vec<_>>(),
         vec![(&"javaw.exe".to_string(), &"Minecraft Mods".to_string())]
     );
+}
+
+/// Clicks the button labelled `label` in the row titled `title`.
+fn click_in_row(p: &mut Page, title: &str, label: &str) -> Vec<UiAction> {
+    let row_y = texts(p.frame())
+        .into_iter()
+        .filter(|t| t.1 == title)
+        .map(|t| t.0.y)
+        .next()
+        .expect("the row");
+    let at = texts(p.frame())
+        .into_iter()
+        .filter(|t| t.1 == label)
+        .min_by(|a, b| (a.0.y - row_y).abs().total_cmp(&(b.0.y - row_y).abs()))
+        .expect("the button")
+        .0;
+    p.click(Pt {
+        x: at.x + 2.0,
+        y: at.y + 4.0,
+    })
+}
+
+fn not_a_game(key: &str, name: Option<&str>) -> SettingsChange {
+    SettingsChange::NotAGame {
+        key: key.to_string(),
+        name: name.map(str::to_string),
+    }
+}
+
+#[test]
+fn not_a_game_moves_a_game_under_not_games_and_back() {
+    let mut p = Page::new(TALL);
+    assert!(
+        find_text(p.frame(), "Not games").is_none(),
+        "nothing marked yet"
+    );
+    let key = game_key_of("javaw.exe");
+    let a = click_in_row(&mut p, "Minecraft", "Not a game");
+    assert_eq!(changes(&a), vec![not_a_game(&key, Some("Minecraft"))]);
+
+    p.idle();
+    let y = |p: &Page, t: &str| find_text(p.frame(), t).map(|f| f.0.y);
+    let heading = y(&p, "Not games").expect("the Not games list");
+    let row = texts(p.frame())
+        .into_iter()
+        .filter(|t| t.1 == "Minecraft")
+        .map(|t| t.0.y)
+        .fold(f32::MIN, f32::max);
+    assert!(heading < row, "Minecraft is listed under Not games");
+    assert_eq!(
+        texts(p.frame())
+            .iter()
+            .filter(|t| t.1 == "Not a game")
+            .count(),
+        1,
+        "only Elden Ring still has the button"
+    );
+
+    let a = click_in_row(&mut p, "Minecraft", "It's a game");
+    assert_eq!(changes(&a), vec![not_a_game(&key, None)]);
+    p.idle();
+    assert!(y(&p, "Not games").is_none());
+    assert_eq!(
+        texts(p.frame())
+            .iter()
+            .filter(|t| t.1 == "Not a game")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn a_renamed_game_is_marked_under_its_shown_name() {
+    let mut p = Page::new(TALL);
+    let a = click_in_row(&mut p, "ELDEN RING", "Not a game");
+    assert_eq!(
+        changes(&a),
+        vec![not_a_game(
+            &game_key_of("eldenring.exe"),
+            Some("Elden Ring")
+        )]
+    );
+}
+
+#[test]
+fn a_not_game_without_stats_can_still_be_made_a_game() {
+    let mut p = Page::new(TALL);
+    p.settings
+        .not_games
+        .insert("gone-key".to_string(), "Old App".to_string());
+    p.idle();
+    assert!(find_text(p.frame(), "Not games").is_some());
+    let a = click_in_row(&mut p, "Old App", "It's a game");
+    assert_eq!(changes(&a), vec![not_a_game("gone-key", None)]);
+}
+
+#[test]
+fn games_section_is_called_games() {
+    let p = Page::new(TALL);
+    assert!(find_text(p.frame(), "GAMES").is_some());
+    assert!(find_text(p.frame(), "GAME NAMES").is_none());
 }

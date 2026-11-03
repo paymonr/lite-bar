@@ -64,6 +64,11 @@ fn check(f: &Frame, w: f32, h: f32, scroll: f32) {
                 "{text:?} {r:?} runs past the content (w {w})"
             );
         }
+        // What shows of text that starts in a field (a long placeholder) ends at its edge.
+        let r = hits
+            .iter()
+            .find(|h| in_field(h))
+            .map_or(r, |f| r.intersect(*f));
         for h in &hits {
             if area(r, *h) > 0.01 {
                 let inside = r.x >= h.x - 0.5
@@ -163,4 +168,37 @@ fn mixer_buttons_wrap_at_the_minimum_width() {
     let y = |t: &str| find_text(f, t).unwrap().0.y;
     // Not all four buttons fit on one line beside the wheel.
     assert!(y("+ Save to my colors") > y("Use for number"));
+}
+
+#[test]
+fn not_games_and_the_install_row_lay_out_cleanly() {
+    for w in [MIN_WINDOW_DIP.0, 1100.0] {
+        for status in [
+            MoveStatus::Idle,
+            MoveStatus::Moving,
+            MoveStatus::Done(MoveOutcome::OtherAccount),
+            MoveStatus::Done(MoveOutcome::MovedNotStarted("x".repeat(80))),
+        ] {
+            let mut p = Page::with_measure(Rect::new(0.0, 0.0, w, 3000.0), &CONSERVATIVE);
+            p.games.push(game(
+                "C:\\Games\\Some Very Long Game Folder\\a-game-with-a-really-long-name.exe",
+                "A Game With A Really Quite Long Name",
+                None,
+            ));
+            p.settings
+                .not_games
+                .insert(game_key_of("eldenring.exe"), "Elden Ring".to_string());
+            p.settings.not_games.insert(
+                "gone".to_string(),
+                "An App Whose Stats Are Gone".to_string(),
+            );
+            p.install_offer = true;
+            p.move_status = status;
+            p.elevated = false;
+            p.idle();
+            p.idle();
+            assert!(find_text(p.frame(), "Not games").is_some());
+            check(p.frame(), w, 3000.0, 0.0);
+        }
+    }
 }

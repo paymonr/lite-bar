@@ -70,6 +70,8 @@ fn scroll_id() -> Id {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GameRow {
+    /// The game's key in the stats store; `[not_games]` uses it.
+    pub key: String,
     pub exe_path: String,
     /// The name in the stats store, shown as the row title and the field's placeholder.
     pub stored_name: String,
@@ -377,7 +379,7 @@ fn sidebar(ui: &mut Ui, view: &mut SettingsView, side: Rect) -> bool {
             item("General"),
             item("Hotkeys"),
             item("Updates"),
-            item("Game names"),
+            item("Games"),
         ];
         if let Some(i) = ui.sidebar(id("settings.nav"), &items, &mut view.selected) {
             // Any click scrolls, also on the selected section.
@@ -459,8 +461,8 @@ fn content(
         hotkeys::section(ui, view, settings, hotkey_status, out);
         view.headings[NAV_UPDATES] = heading(ui, "UPDATES", 16.0) - first;
         updates::section(ui, settings, input.updates, out);
-        view.headings[NAV_GAMES] = heading(ui, "GAME NAMES", 16.0) - first;
-        games::section(ui, view, games, out);
+        view.headings[NAV_GAMES] = heading(ui, "GAMES", 16.0) - first;
+        games::section(ui, view, games, &settings.not_games, out);
         restore_row(ui, view, out);
         bottom = ui.available().y;
     });

@@ -66,8 +66,14 @@ fn rgb(hex: &str) -> Rgb {
     Rgb::parse_hex(hex).unwrap()
 }
 
+/// The test games' key in the stats store.
+fn game_key_of(exe: &str) -> String {
+    format!("key:{exe}")
+}
+
 fn game(exe: &str, stored: &str, name: Option<&str>) -> GameRow {
     GameRow {
+        key: game_key_of(exe),
         exe_path: exe.to_string(),
         stored_name: stored.to_string(),
         override_name: name.map(str::to_string),

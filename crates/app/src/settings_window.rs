@@ -696,6 +696,7 @@ mod tests {
     #[test]
     fn overrides_come_from_the_settings() {
         let rows = vec![GameRow {
+            key: "k".to_string(),
             exe_path: "javaw.exe".into(),
             stored_name: "Java".into(),
             override_name: None,
@@ -713,6 +714,7 @@ mod tests {
     #[test]
     fn file_name_override_shows_in_the_window() {
         let rows = vec![GameRow {
+            key: "k".to_string(),
             exe_path: r"C:\Java\bin\javaw.exe".into(),
             stored_name: "Java".into(),
             override_name: None,

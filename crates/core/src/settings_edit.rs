@@ -33,6 +33,11 @@ pub enum SettingsChange {
         exe_path: String,
         name: Option<String>,
     },
+    /// Marks the game `key` as not a game, under `name`; `None` makes it a game again.
+    NotAGame {
+        key: String,
+        name: Option<String>,
+    },
 }
 
 /// The newest `MAX_SAVED_COLORS` of `colors` (new ones are appended, so the oldest go).
@@ -65,14 +70,27 @@ pub fn apply_change(settings: &mut Settings, change: &SettingsChange) {
             settings.updates = d.updates;
         }
         SettingsChange::ToggleHotkey(v) => settings.hotkeys.toggle_overlay = *v,
-        SettingsChange::GameName { exe_path, name } => match name {
-            Some(n) => {
-                settings.game_names.insert(exe_path.clone(), n.clone());
-            }
-            None => {
-                settings.game_names.remove(exe_path);
-            }
-        },
+        SettingsChange::GameName { exe_path, name } => {
+            set_map_entry(&mut settings.game_names, exe_path, name);
+        }
+        SettingsChange::NotAGame { key, name } => {
+            set_map_entry(&mut settings.not_games, key, name);
+        }
+    }
+}
+
+fn set_map_entry(
+    map: &mut std::collections::BTreeMap<String, String>,
+    key: &str,
+    value: &Option<String>,
+) {
+    match value {
+        Some(v) => {
+            map.insert(key.to_string(), v.clone());
+        }
+        None => {
+            map.remove(key);
+        }
     }
 }
 
@@ -82,7 +100,8 @@ fn supersedes(new: &SettingsChange, old: &SettingsChange) -> bool {
     use SettingsChange::*;
     match (new, old) {
         (GameName { exe_path: a, .. }, GameName { exe_path: b, .. }) => a == b,
-        (RestoreDefaults, GameName { .. } | SavedColors(_)) => false,
+        (NotAGame { key: a, .. }, NotAGame { key: b, .. }) => a == b,
+        (RestoreDefaults, GameName { .. } | NotAGame { .. } | SavedColors(_)) => false,
         (RestoreDefaults, _) => true,
         _ => std::mem::discriminant(new) == std::mem::discriminant(old),
     }
@@ -163,37 +182,47 @@ fn edit_doc(doc: &mut DocumentMut, change: &SettingsChange) -> Result<(), String
         SettingsChange::ToggleHotkey(v) => {
             set(doc, "hotkeys", "toggle_overlay", v.to_string().into())
         }
-        SettingsChange::GameName { exe_path, name } => match name {
-            Some(n) => {
-                let is_new = doc
-                    .get("game_names")
-                    .and_then(Item::as_table)
-                    .is_none_or(|t| !t.contains_key(exe_path));
-                let comments = if is_new {
-                    take_tail_comments(doc, "game_names")
-                } else {
-                    String::new()
-                };
-                set(doc, "game_names", exe_path, n.as_str().into())?;
-                if !comments.is_empty() {
-                    if let Some(mut key) = doc
-                        .get_mut("game_names")
-                        .and_then(Item::as_table_mut)
-                        .and_then(|t| t.key_mut(exe_path))
-                    {
-                        key.leaf_decor_mut().set_prefix(comments);
-                    }
-                }
-                Ok(())
-            }
-            None => {
-                if let Some(table) = doc.get_mut("game_names").and_then(Item::as_table_mut) {
-                    table.remove(exe_path);
-                }
-                Ok(())
-            }
-        },
+        SettingsChange::GameName { exe_path, name } => {
+            set_entry(doc, "game_names", exe_path, name.as_deref())
+        }
+        SettingsChange::NotAGame { key, name } => set_entry(doc, "not_games", key, name.as_deref()),
     }
+}
+
+/// Sets (`Some`) or removes (`None`) `section.key` in a table of names. A new entry goes
+/// after the comment lines that end the section, so its explanation stays on top.
+fn set_entry(
+    doc: &mut DocumentMut,
+    section: &str,
+    key: &str,
+    value: Option<&str>,
+) -> Result<(), String> {
+    let Some(v) = value else {
+        if let Some(table) = doc.get_mut(section).and_then(Item::as_table_mut) {
+            table.remove(key);
+        }
+        return Ok(());
+    };
+    let is_new = doc
+        .get(section)
+        .and_then(Item::as_table)
+        .is_none_or(|t| !t.contains_key(key));
+    let comments = if is_new {
+        take_tail_comments(doc, section)
+    } else {
+        String::new()
+    };
+    set(doc, section, key, v.into())?;
+    if !comments.is_empty() {
+        if let Some(mut k) = doc
+            .get_mut(section)
+            .and_then(Item::as_table_mut)
+            .and_then(|t| t.key_mut(key))
+        {
+            k.leaf_decor_mut().set_prefix(comments);
+        }
+    }
+    Ok(())
 }
 
 /// Takes the comment lines right after `section`'s last entry (up to the first blank line) out
@@ -430,7 +459,7 @@ mod tests {
         }];
         let out = edit_settings_text(&default_settings_toml(), &add).unwrap();
         assert!(
-            out.ends_with("# 'C:\\Games\\Foo\\foo.exe' = \"Foo: Remastered\"\n\"x.exe\" = \"X\"\n"),
+            out.contains("# 'C:\\Games\\Foo\\foo.exe' = \"Foo: Remastered\"\n\"x.exe\" = \"X\"\n\n[not_games]"),
             "{out}"
         );
         assert_eq!(parse_settings(&out).0.game_names["x.exe"], "X");
@@ -445,7 +474,7 @@ mod tests {
         let crlf = default_settings_toml().replace('\n', "\r\n");
         let out = edit_settings_text(&crlf, &add).unwrap();
         assert!(
-            out.ends_with("Remastered\"\r\n\"x.exe\" = \"X\"\r\n"),
+            out.contains("Remastered\"\r\n\"x.exe\" = \"X\"\r\n\r\n[not_games]"),
             "{out:?}"
         );
     }
@@ -586,5 +615,54 @@ mod tests {
                 assert_eq!(edited, applied, "{c:?}");
             }
         }
+    }
+
+    #[test]
+    fn not_a_game_is_saved_and_undone() {
+        let zoom = r"c:\users\p\zoom.exe";
+        let mark = SettingsChange::NotAGame {
+            key: zoom.into(),
+            name: Some("Zoom".into()),
+        };
+        let text =
+            edit_settings_text(&default_settings_toml(), std::slice::from_ref(&mark)).unwrap();
+        let (s, w) = crate::settings::parse_settings(&text);
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(s.not_games[zoom], "Zoom");
+        // The explanation stays above the entry.
+        let at = |needle: &str| text.find(needle).unwrap();
+        assert!(at("[not_games]") < at("Not a game") && at("Not a game") < at("zoom.exe"));
+
+        let mut applied = Settings::default();
+        apply_change(&mut applied, &mark);
+        assert_eq!(applied.not_games, s.not_games);
+
+        let undo = SettingsChange::NotAGame {
+            key: zoom.into(),
+            name: None,
+        };
+        let text = edit_settings_text(&text, std::slice::from_ref(&undo)).unwrap();
+        assert!(crate::settings::parse_settings(&text)
+            .0
+            .not_games
+            .is_empty());
+        apply_change(&mut applied, &undo);
+        assert!(applied.not_games.is_empty());
+    }
+
+    #[test]
+    fn not_a_game_changes_for_one_key_replace_each_other() {
+        let change = |key: &str, name: Option<&str>| SettingsChange::NotAGame {
+            key: key.into(),
+            name: name.map(Into::into),
+        };
+        let mut pending = Vec::new();
+        push_change(&mut pending, change("a", Some("A")));
+        push_change(&mut pending, change("b", Some("B")));
+        push_change(&mut pending, change("a", None));
+        assert_eq!(pending, vec![change("b", Some("B")), change("a", None)]);
+        // Restoring defaults keeps what you marked.
+        push_change(&mut pending, SettingsChange::RestoreDefaults);
+        assert_eq!(pending.len(), 3);
     }
 }

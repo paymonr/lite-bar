@@ -7,7 +7,7 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::frame_stats::{FrameHistogram, StatsSummary};
-use crate::game_name::display_name;
+use crate::game_name::{display_name, game_key, is_generic_host};
 
 /// Sessions with less counted play time than this are discarded.
 pub const MIN_SESSION_SECS: f64 = 60.0;
@@ -406,6 +406,128 @@ pub fn session_csv_row(s: &SessionRecord, display: &str) -> String {
         fps_columns(&s.hist),
         csv_field(&s.exe_path),
     )
+}
+
+impl GameStore {
+    /// The store without the games marked "Not a game", for `games.csv`. The store itself
+    /// keeps them, so "It's a game" brings their history back.
+    pub fn shown(&self, not_games: &BTreeMap<String, String>) -> GameStore {
+        GameStore {
+            games: self
+                .games
+                .iter()
+                .filter(|(key, _)| !not_games.contains_key(*key))
+                .map(|(key, g)| (key.clone(), g.clone()))
+                .collect(),
+            unparsed: BTreeMap::new(),
+        }
+    }
+}
+
+/// Splits the rows of `sessions.csv` (`shown`) and of the file kept aside for not-games
+/// (`aside`) again for `not_games`: rows of a not-game go aside, the others are shown. Each
+/// side is a whole file (BOM, header, rows by end time, the order `sessions.csv` is appended
+/// in); an aside side without rows is empty, meaning no file. Lines that can't be read as a
+/// session row stay shown.
+pub fn split_sessions_csv(
+    shown: &str,
+    aside: &str,
+    store: &GameStore,
+    overrides: &BTreeMap<String, String>,
+    not_games: &BTreeMap<String, String>,
+) -> (String, String) {
+    let (mut visible, mut hidden) = (Vec::new(), Vec::new());
+    for line in data_lines(shown).chain(data_lines(aside)) {
+        let key = csv_fields(line)
+            .filter(|f| f.len() == 9)
+            .and_then(|f| row_key(&f[2], &f[8], store, overrides));
+        if key.is_some_and(|k| not_games.contains_key(&k)) {
+            hidden.push(line);
+        } else {
+            visible.push(line);
+        }
+    }
+    let end_time = |line: &&str| line.get(20..39).unwrap_or("").to_string();
+    visible.sort_by_key(end_time);
+    hidden.sort_by_key(end_time);
+    let file = |rows: &[&str]| {
+        let mut out = format!("{CSV_BOM}{SESSIONS_CSV_HEADER}\r\n");
+        for row in rows {
+            out.push_str(row);
+            out.push_str("\r\n");
+        }
+        out
+    };
+    let aside = if hidden.is_empty() {
+        String::new()
+    } else {
+        file(&hidden)
+    };
+    (file(&visible), aside)
+}
+
+/// The non-empty lines of a sessions CSV file after its BOM and header.
+fn data_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.strip_prefix(CSV_BOM)
+        .unwrap_or(text)
+        .lines()
+        .filter(|l| !l.trim().is_empty() && *l != SESSIONS_CSV_HEADER)
+}
+
+/// The fields of one CSV line, with `"…"` quoting and `""` for a quote; `None` when a quote
+/// is left open.
+fn csv_fields(line: &str) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut at_start = true;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if quoted {
+            if c != '"' {
+                field.push(c);
+            } else if chars.peek() == Some(&'"') {
+                chars.next();
+                field.push('"');
+            } else {
+                quoted = false;
+            }
+        } else if c == ',' {
+            fields.push(std::mem::take(&mut field));
+            at_start = true;
+            continue;
+        } else if c == '"' && at_start {
+            quoted = true;
+        } else {
+            field.push(c);
+        }
+        at_start = false;
+    }
+    (!quoted).then(|| {
+        fields.push(field);
+        fields
+    })
+}
+
+/// The game key of a session row: from the exe path, or for a generic host (Java), the
+/// stored game with that exe and the row's shown name.
+fn row_key(
+    game: &str,
+    exe_path: &str,
+    store: &GameStore,
+    overrides: &BTreeMap<String, String>,
+) -> Option<String> {
+    if !is_generic_host(exe_path) {
+        return Some(game_key(exe_path, None));
+    }
+    store
+        .games
+        .iter()
+        .find(|(_, g)| {
+            g.exe_path.eq_ignore_ascii_case(exe_path)
+                && display_name(&g.name, &g.exe_path, overrides) == game
+        })
+        .map(|(key, _)| key.clone())
 }
 
 /// The whole `games.csv`: BOM, header, then games by `last_played` descending.
@@ -1005,5 +1127,118 @@ mod tests {
         ] {
             assert!(parse_pending(bad).is_err(), "{bad}");
         }
+    }
+
+    // ---- Not games ----
+
+    /// A session of `exe` named `name` (the display name in the row), at hour `h`.
+    fn row_of(exe: &str, name: &str, h: u8) -> String {
+        let s = SessionRecord {
+            start: t(2, h, 0),
+            end: t(2, h, 30),
+            key: String::new(),
+            name: name.into(),
+            exe_path: exe.into(),
+            hist: hist(4000, 1.0 / 64.0),
+        };
+        session_csv_row(&s, name)
+    }
+
+    fn csv_of(rows: &[String]) -> String {
+        format!("{CSV_BOM}{SESSIONS_CSV_HEADER}\r\n{}", rows.concat())
+    }
+
+    fn not_games(keys: &[&str]) -> BTreeMap<String, String> {
+        keys.iter()
+            .map(|k| (k.to_string(), "x".to_string()))
+            .collect()
+    }
+
+    const ZOOM: &str = r"C:\Apps\Zoom.exe";
+    const DOOM: &str = r"C:\Games\Doom.exe";
+
+    #[test]
+    fn shown_store_leaves_out_not_games() {
+        let mut store = GameStore::default();
+        store.games.insert(
+            r"c:\games\a.exe".into(),
+            game("A", t(2, 0, 0), hist(10, 0.5)),
+        );
+        store.games.insert(
+            r"c:\games\b.exe".into(),
+            game("B", t(3, 0, 0), hist(10, 0.5)),
+        );
+        let shown = store.shown(&not_games(&[r"c:\games\b.exe"]));
+        assert_eq!(
+            shown.games.keys().collect::<Vec<_>>(),
+            vec![r"c:\games\a.exe"]
+        );
+        assert_eq!(store.games.len(), 2, "the store itself keeps every game");
+    }
+
+    #[test]
+    fn rows_of_not_games_move_aside_and_come_back_in_order() {
+        let (z1, d2, z3) = (
+            row_of(ZOOM, "Zoom", 1),
+            row_of(DOOM, "Doom", 2),
+            row_of(ZOOM, "Zoom", 3),
+        );
+        let all = csv_of(&[z1.clone(), d2.clone(), z3.clone()]);
+        let store = GameStore::default();
+        let none = BTreeMap::new();
+        let hidden = not_games(&[r"c:\apps\zoom.exe"]);
+
+        let (shown, aside) = split_sessions_csv(&all, "", &store, &none, &hidden);
+        assert_eq!(shown, csv_of(std::slice::from_ref(&d2)));
+        assert_eq!(aside, csv_of(&[z1.clone(), z3.clone()]));
+
+        // "It's a game": the rows go back between the others, by start time.
+        let (shown, aside) = split_sessions_csv(&shown, &aside, &store, &none, &BTreeMap::new());
+        assert_eq!(shown, all);
+        assert_eq!(aside, "", "nothing left aside: no file");
+    }
+
+    #[test]
+    fn java_games_are_told_apart_by_their_shown_name() {
+        let javaw = r"C:\Java\bin\javaw.exe";
+        let mut store = GameStore::default();
+        let mut mc = game("Minecraft", t(2, 0, 0), hist(10, 0.5));
+        mc.exe_path = javaw.into();
+        let mut other = game("Other", t(2, 0, 0), hist(10, 0.5));
+        other.exe_path = javaw.into();
+        store
+            .games
+            .insert(r"c:\java\bin\javaw.exe|minecraft".into(), mc);
+        store
+            .games
+            .insert(r"c:\java\bin\javaw.exe|other".into(), other);
+        let (m, o) = (row_of(javaw, "Minecraft", 1), row_of(javaw, "Other", 2));
+        let all = csv_of(&[m.clone(), o.clone()]);
+        let hidden = not_games(&[r"c:\java\bin\javaw.exe|other"]);
+        let (shown, aside) = split_sessions_csv(&all, "", &store, &BTreeMap::new(), &hidden);
+        assert_eq!(shown, csv_of(&[m]));
+        assert_eq!(aside, csv_of(&[o]));
+    }
+
+    #[test]
+    fn quoted_names_and_a_missing_last_newline_are_read() {
+        let odd = row_of(ZOOM, "Zoom, \"the\" app", 1);
+        let all = csv_of(std::slice::from_ref(&odd));
+        let cut = all.trim_end_matches("\r\n");
+        let hidden = not_games(&[r"c:\apps\zoom.exe"]);
+        let (shown, aside) =
+            split_sessions_csv(cut, "", &GameStore::default(), &BTreeMap::new(), &hidden);
+        assert_eq!(shown, csv_of(&[]));
+        assert_eq!(aside, csv_of(&[odd]));
+    }
+
+    #[test]
+    fn unreadable_lines_stay_shown() {
+        let all = csv_of(&["garbage without commas\r\n".to_string()]);
+        let hidden = not_games(&[r"c:\apps\zoom.exe"]);
+        let (shown, aside) =
+            split_sessions_csv(&all, "", &GameStore::default(), &BTreeMap::new(), &hidden);
+        assert_eq!(shown, all);
+        assert_eq!(aside, "");
     }
 }

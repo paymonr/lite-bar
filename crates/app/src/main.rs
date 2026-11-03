@@ -586,6 +586,7 @@ mod app {
             self.overlay.redraw();
             self.settings = settings;
             self.sync_update_schedule();
+            self.writer.set_not_games(&self.settings.not_games);
             self.writer.flush(&self.settings.game_names);
             if let Some(ui) = &self.settings_ui {
                 ui.set_games(list_games(self.writer.stats_dir()));
@@ -773,6 +774,15 @@ mod app {
     }
 
     /// A reload regenerates `games.csv` only when the display-name overrides changed.
+    /// The stats writer for `dir`, knowing the apps marked "Not a game". Writes what an
+    /// earlier run saved in pending.toml, and the CSV files if those marks changed.
+    fn open_stats_writer(dir: &Path, settings: &Settings) -> StatsWriter {
+        let mut writer = StatsWriter::new(dir.join(STATS_DIR));
+        writer.set_not_games(&settings.not_games);
+        writer.flush(&settings.game_names);
+        writer
+    }
+
     fn game_names_changed(old: &Settings, new: &Settings) -> bool {
         old.game_names != new.game_names
     }
@@ -1212,9 +1222,7 @@ mod app {
 
         let start_visible = settings.overlay.visible;
         let update_checks = settings.updates.check;
-        let mut writer = StatsWriter::new(dir.join(STATS_DIR));
-        // Writes what an earlier run saved in pending.toml.
-        writer.flush(&settings.game_names);
+        let writer = open_stats_writer(&dir, &settings);
         let mut app = App {
             hwnd: owner.0,
             dir,
@@ -1606,6 +1614,53 @@ mod app {
             let stats = dir.join(STATS_DIR);
             std::fs::create_dir_all(&stats).unwrap();
             std::fs::write(stats.join("games.toml"), store.to_toml()).unwrap();
+        }
+
+        fn games_csv(dir: &Path) -> String {
+            std::fs::read_to_string(dir.join(STATS_DIR).join("games.csv")).unwrap_or_default()
+        }
+
+        #[test]
+        fn not_a_game_leaves_the_stats_and_its_a_game_brings_it_back() {
+            let dir = TempDir::new("app-not-a-game");
+            write_one_game(dir.path());
+            let (mut app, _owner) = test_app(dir.path());
+            let mark = |name: Option<&str>| SettingsChange::NotAGame {
+                key: "minecraft".into(),
+                name: name.map(Into::into),
+            };
+            app.apply_settings_change(mark(Some("Minecraft")));
+            assert!(!games_csv(dir.path()).contains("Minecraft"));
+            app.flush_settings_save();
+            assert!(settings_file(dir.path()).contains("minecraft = \"Minecraft\""));
+            app.apply_settings_change(mark(None));
+            assert!(games_csv(dir.path()).contains("Minecraft"));
+        }
+
+        #[test]
+        fn reloading_the_settings_file_applies_not_games() {
+            let dir = TempDir::new("app-not-a-game-reload");
+            write_one_game(dir.path());
+            let (mut app, _owner) = test_app(dir.path());
+            let mut text = settings_file(dir.path());
+            text.push_str("minecraft = \"Minecraft\"\n");
+            assert!(text.contains("[not_games]"));
+            std::fs::write(dir.path().join("settings.toml"), text).unwrap();
+            app.reload_settings_file();
+            assert!(!games_csv(dir.path()).contains("Minecraft"));
+        }
+
+        #[test]
+        fn the_startup_writer_knows_the_not_games() {
+            let dir = TempDir::new("app-not-a-game-start");
+            write_one_game(dir.path());
+            let mut settings = Settings::default();
+            settings
+                .not_games
+                .insert("minecraft".into(), "Minecraft".into());
+            let writer = open_stats_writer(dir.path(), &settings);
+            assert!(!games_csv(dir.path()).contains("Minecraft"));
+            drop(writer);
         }
 
         #[test]
@@ -3194,60 +3249,6 @@ mod app {
         }
 
         #[test]
-        fn moved_from_start_saves_false() {
-            let dir = TempDir::new("move-moved-from");
-            let (mut app, _owner) = test_app(dir.path());
-            assert!(app.settings.install.move_prompt);
-            app.finish_moved_from(DOWNLOADS_EXE.to_string());
-            assert!(!app.settings.install.move_prompt);
-            app.flush_settings_save();
-            assert!(!saved_move_prompt(dir.path()));
-        }
-
-        thread_local! {
-            /// Old copies the fake `delete_old` was asked to delete (never deleted).
-            static DELETES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-        }
-
-        fn record_delete_old(old: String, _: String, _: Vec<String>) -> Option<JoinHandle<()>> {
-            DELETES.with(|d| d.borrow_mut().push(old));
-            None
-        }
-
-        const MOVED_EXE: &str = r"C:\Program Files\Lite Bar\lite-bar.exe";
-
-        /// The moved copy's first start, with the given "Start with Windows" re-point.
-        fn moved_app(
-            dir: &Path,
-            repoint: fn(&str, &str) -> Result<bool, String>,
-        ) -> (App, OwnerWindow) {
-            let (mut app, owner) = test_app(dir);
-            app.exe_path = Some(PathBuf::from(MOVED_EXE));
-            app.pf_roots = vec![PROGRAM_FILES.to_string()];
-            app.repoint_old_startup = repoint;
-            (app, owner)
-        }
-
-        #[test]
-        fn moved_from_deletes_the_old_copy_when_startup_was_re_pointed() {
-            let dir = TempDir::new("move-moved-from-repointed");
-            let (mut app, _owner) = moved_app(dir.path(), |old, new| {
-                assert_eq!((old, new), (DOWNLOADS_EXE, MOVED_EXE));
-                Ok(true)
-            });
-            app.finish_moved_from(DOWNLOADS_EXE.to_string());
-            assert_eq!(DELETES.with(|d| d.borrow().clone()), [DOWNLOADS_EXE]);
-        }
-
-        #[test]
-        fn moved_from_deletes_the_old_copy_when_startup_is_off() {
-            let dir = TempDir::new("move-moved-from-startup-off");
-            let (mut app, _owner) = moved_app(dir.path(), |_, _| Ok(false));
-            app.finish_moved_from(DOWNLOADS_EXE.to_string());
-            assert_eq!(DELETES.with(|d| d.borrow().clone()), [DOWNLOADS_EXE]);
-        }
-
-        #[test]
         fn settings_offers_install_outside_program_files_even_after_no_thanks() {
             let dir = TempDir::new("settings-install-offer");
             let (mut app, _owner) = outside_app(dir.path());
@@ -3306,6 +3307,60 @@ mod app {
             app.apply_ui_action(UiAction::InstallToProgramFiles);
             let settings = app.settings_ui.as_ref().unwrap().hwnd();
             assert_eq!(MOVE_PARENT.get(), settings.0 as usize);
+        }
+
+        #[test]
+        fn moved_from_start_saves_false() {
+            let dir = TempDir::new("move-moved-from");
+            let (mut app, _owner) = test_app(dir.path());
+            assert!(app.settings.install.move_prompt);
+            app.finish_moved_from(DOWNLOADS_EXE.to_string());
+            assert!(!app.settings.install.move_prompt);
+            app.flush_settings_save();
+            assert!(!saved_move_prompt(dir.path()));
+        }
+
+        thread_local! {
+            /// Old copies the fake `delete_old` was asked to delete (never deleted).
+            static DELETES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+        }
+
+        fn record_delete_old(old: String, _: String, _: Vec<String>) -> Option<JoinHandle<()>> {
+            DELETES.with(|d| d.borrow_mut().push(old));
+            None
+        }
+
+        const MOVED_EXE: &str = r"C:\Program Files\Lite Bar\lite-bar.exe";
+
+        /// The moved copy's first start, with the given "Start with Windows" re-point.
+        fn moved_app(
+            dir: &Path,
+            repoint: fn(&str, &str) -> Result<bool, String>,
+        ) -> (App, OwnerWindow) {
+            let (mut app, owner) = test_app(dir);
+            app.exe_path = Some(PathBuf::from(MOVED_EXE));
+            app.pf_roots = vec![PROGRAM_FILES.to_string()];
+            app.repoint_old_startup = repoint;
+            (app, owner)
+        }
+
+        #[test]
+        fn moved_from_deletes_the_old_copy_when_startup_was_re_pointed() {
+            let dir = TempDir::new("move-moved-from-repointed");
+            let (mut app, _owner) = moved_app(dir.path(), |old, new| {
+                assert_eq!((old, new), (DOWNLOADS_EXE, MOVED_EXE));
+                Ok(true)
+            });
+            app.finish_moved_from(DOWNLOADS_EXE.to_string());
+            assert_eq!(DELETES.with(|d| d.borrow().clone()), [DOWNLOADS_EXE]);
+        }
+
+        #[test]
+        fn moved_from_deletes_the_old_copy_when_startup_is_off() {
+            let dir = TempDir::new("move-moved-from-startup-off");
+            let (mut app, _owner) = moved_app(dir.path(), |_, _| Ok(false));
+            app.finish_moved_from(DOWNLOADS_EXE.to_string());
+            assert_eq!(DELETES.with(|d| d.borrow().clone()), [DOWNLOADS_EXE]);
         }
 
         #[test]

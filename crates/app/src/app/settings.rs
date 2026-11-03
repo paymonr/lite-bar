@@ -203,6 +203,10 @@ impl App {
                 self.writer.mark_games_csv_dirty();
                 self.writer.flush(&self.settings.game_names);
             }
+            SettingsChange::NotAGame { .. } => {
+                self.writer.set_not_games(&self.settings.not_games);
+                self.writer.flush(&self.settings.game_names);
+            }
             SettingsChange::CheckUpdates(_) | SettingsChange::RestoreDefaults => {
                 self.sync_update_schedule()
             }

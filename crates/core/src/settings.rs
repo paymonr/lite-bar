@@ -120,6 +120,10 @@ pub struct Settings {
     /// Display names used in the game stats files (`games.csv`, `sessions.csv`). Keys are an
     /// exe file name or a full path.
     pub game_names: BTreeMap<String, String>,
+    /// Apps marked "Not a game": no sessions are recorded for them and the stats files leave
+    /// them out. Keys are game keys (as in `games.toml`); values are the name shown when
+    /// marked.
+    pub not_games: BTreeMap<String, String>,
     /// Colors saved in the settings window's picker, oldest first, at most `MAX_SAVED_COLORS`.
     pub saved_colors: Vec<Rgb>,
     pub updates: UpdateSettings,
@@ -182,6 +186,26 @@ fn read_section(root: &toml::Table, name: &str, warnings: &mut Vec<String>) -> t
             toml::Table::new()
         }
     }
+}
+
+/// The string entries of the table `name`; other values are warned about and skipped.
+fn read_string_map(
+    root: &toml::Table,
+    name: &str,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for (key, value) in &read_section(root, name, warnings) {
+        match value {
+            toml::Value::String(v) => {
+                map.insert(key.clone(), v.clone());
+            }
+            _ => warnings.push(format!(
+                "{name}.{key}: expected a string; ignoring this entry"
+            )),
+        }
+    }
+    map
 }
 
 /// Parses settings text, falling back to the default for every missing or invalid field.
@@ -272,17 +296,8 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
         }
     }
 
-    let game_names = read_section(&root, "game_names", &mut warnings);
-    for (key, value) in &game_names {
-        match value {
-            toml::Value::String(name) => {
-                settings.game_names.insert(key.clone(), name.clone());
-            }
-            _ => warnings.push(format!(
-                "game_names.{key}: expected a string; ignoring this entry"
-            )),
-        }
-    }
+    settings.game_names = read_string_map(&root, "game_names", &mut warnings);
+    settings.not_games = read_string_map(&root, "not_games", &mut warnings);
 
     (settings, warnings)
 }
@@ -342,6 +357,12 @@ move_prompt = true
 # backslashes need no escaping.
 # "javaw.exe" = "Minecraft"
 # 'C:\Games\Foo\foo.exe' = "Foo: Remastered"
+
+[not_games]
+# Apps you marked "Not a game" in the settings window. No play sessions are recorded for them,
+# and games.csv and sessions.csv leave them out (their earlier sessions are kept aside and come
+# back if you click "It's a game"). The key is the game key from games.toml; the value is its
+# name.
 "##;
 
 #[cfg(test)]
@@ -509,8 +530,37 @@ mod tests {
                 .iter()
                 .skip_while(|l| **l != "[game_names]")
                 .skip(1)
+                .take_while(|l| !l.starts_with('['))
                 .any(|l| !l.starts_with('#') && !l.trim().is_empty()),
             "[game_names] must have no active entries"
+        );
+    }
+
+    #[test]
+    fn parses_not_games() {
+        let (s, w) = parse_settings("[not_games]\n'C:\\Zoom\\zoom.exe' = \"Zoom\"\nbad = 3\n");
+        assert_eq!(s.not_games.len(), 1);
+        assert_eq!(s.not_games["C:\\Zoom\\zoom.exe"], "Zoom");
+        assert!(w.iter().any(|w| w.contains("not_games.bad")));
+    }
+
+    #[test]
+    fn template_explains_not_games_without_entries() {
+        let template = default_settings_toml();
+        let lines: Vec<&str> = template.lines().collect();
+        assert!(lines.contains(&"[not_games]"));
+        let section: Vec<&&str> = lines
+            .iter()
+            .skip_while(|l| **l != "[not_games]")
+            .skip(1)
+            .take_while(|l| !l.starts_with('['))
+            .collect();
+        assert!(section.iter().any(|l| l.contains("Not a game")));
+        assert!(
+            section
+                .iter()
+                .all(|l| l.starts_with('#') || l.trim().is_empty()),
+            "[not_games] must have no active entries"
         );
     }
 
