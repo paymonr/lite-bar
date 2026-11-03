@@ -423,7 +423,7 @@ fn name_cell(
         .games
         .entry(game.exe_path.clone())
         .or_insert_with(|| GameEdit::new(key, game.override_name.as_deref()));
-    if !e.pending && !ui.is_focused(field) {
+    if !e.pending && !ui.is_focused(field) && !editing {
         // Follow the settings (a reload, or our own commit applied).
         let current = game.override_name.as_deref().unwrap_or("");
         if e.edit.text != current {
@@ -446,6 +446,10 @@ fn name_cell(
                 TextFieldEvent::None => {}
                 TextFieldEvent::Changed => e.pending = true,
                 TextFieldEvent::Committed => {
+                    // The stored name itself is no override.
+                    if e.edit.text.trim() == game.stored_name {
+                        e.edit = TextEdit::new("");
+                    }
                     out.extend(e.commit());
                     done = true;
                 }
@@ -755,5 +759,16 @@ fn start_rename(ui: &mut Ui, view: &mut SettingsView, row: &GameRow, out: &mut V
         view.games_view.tab = GamesTab::Games;
     }
     view.games_view.editing = Some(row.exe_path.clone());
+    // The field starts with the name shown, selected, so typing replaces it.
+    let key = row.override_key.as_deref().unwrap_or(&row.exe_path);
+    let e = view
+        .games
+        .entry(row.exe_path.clone())
+        .or_insert_with(|| GameEdit::new(key, row.override_name.as_deref()));
+    if !e.pending {
+        let shown = row.override_name.as_deref().unwrap_or(&row.stored_name);
+        e.edit = TextEdit::new(shown);
+        e.edit.all_selected = true;
+    }
     ui.focus(id(&format!("settings.game:{}", row.exe_path)));
 }

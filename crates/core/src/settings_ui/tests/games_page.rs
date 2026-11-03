@@ -681,3 +681,22 @@ fn playing_card_uses_the_rename() {
         vec![not_a_game(&game_key_of("javaw.exe"), Some("Craft"))]
     );
 }
+
+#[test]
+fn the_rename_field_starts_with_the_current_name() {
+    for via_card in [false, true] {
+        let mut p = card_page(false);
+        if via_card {
+            click_in_card(&mut p, "LAST PLAYED · Today 12:18", "Rename");
+            p.idle();
+        } else {
+            start_rename(&mut p, "Minecraft");
+        }
+        let in_field = texts(p.frame())
+            .into_iter()
+            .any(|t| t.1 == "Minecraft" && !t.2.bold && t.3 == theme::TEXT);
+        assert!(in_field, "the field holds the name (via card: {via_card})");
+        // Unchanged, the stored name is no override.
+        assert_eq!(p.keys(vec![key(UiKey::Enter)]), vec![]);
+    }
+}
