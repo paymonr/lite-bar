@@ -700,3 +700,19 @@ fn the_rename_field_starts_with_the_current_name() {
         assert_eq!(p.keys(vec![key(UiKey::Enter)]), vec![]);
     }
 }
+
+#[test]
+fn playing_now_has_a_green_dot() {
+    let green = Rgba(0x7C, 0xFC, 0x7C, 255);
+    let dot = |p: &Page| {
+        let badge = find_text(p.frame(), "PLAYING NOW").map(|b| b.0);
+        fills(p.frame()).into_iter().any(|(r, c, _)| {
+            c == green
+                && r.w == r.h
+                && r.w <= 8.0
+                && badge.is_some_and(|b| r.right() <= b.x && (r.y - b.y).abs() < 12.0)
+        })
+    };
+    assert!(dot(&card_page(true)));
+    assert!(!dot(&card_page(false)), "not on Last played");
+}

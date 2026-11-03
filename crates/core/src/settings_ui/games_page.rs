@@ -537,6 +537,8 @@ const PANELS_SIDE_BY_SIDE_W: f32 = 560.0;
 const PLAYING: Rgba = Rgba(0x7C, 0xFC, 0x7C, 255);
 const PANEL_BG: Rgba = Rgba(0x1F, 0x21, 0x27, 255);
 const RENAME: &str = "Rename";
+/// The PLAYING NOW dot's diameter.
+const DOT: f32 = 7.0;
 const BIG: TextStyle = TextStyle {
     size: 22.0,
     bold: true,
@@ -687,8 +689,19 @@ fn active_game(
             let text_x = tile.right() + 12.0;
             let text_w = (left - COL_GAP - text_x).max(0.0);
             let badge_color = if playing { PLAYING } else { theme::MUTED };
-            let badge = ellipsize(ui, &badge, HEADING, text_w);
-            paint_text(ui, text_x, r.y + 4.0, &badge, HEADING, badge_color);
+            let mut badge_x = text_x;
+            if playing {
+                // A small green dot before PLAYING NOW.
+                let h = ui.text_measure().measure(&badge, HEADING).1;
+                ui.paint(Cmd::Fill {
+                    rect: Rect::new(text_x, r.y + 4.0 + (h - DOT) / 2.0, DOT, DOT),
+                    color: PLAYING,
+                    radius: DOT / 2.0,
+                });
+                badge_x += DOT + 6.0;
+            }
+            let badge = ellipsize(ui, &badge, HEADING, (text_w - (badge_x - text_x)).max(0.0));
+            paint_text(ui, badge_x, r.y + 4.0, &badge, HEADING, badge_color);
             let shown = ellipsize(ui, &name, TextStyle::BOLD, text_w);
             paint_text(ui, text_x, r.y + 22.0, &shown, TextStyle::BOLD, theme::TEXT);
         });
