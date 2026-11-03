@@ -701,6 +701,7 @@ mod tests {
             stored_name: "Java".into(),
             override_name: None,
             override_key: None,
+            ..GameRow::default()
         }];
         let mut s = Settings::default();
         assert_eq!(with_overrides(&rows, &s), rows);
@@ -719,6 +720,7 @@ mod tests {
             stored_name: "Java".into(),
             override_name: None,
             override_key: None,
+            ..GameRow::default()
         }];
         let mut s = Settings::default();
         s.game_names.insert("JAVAW.exe".into(), "Minecraft".into());

@@ -19,6 +19,8 @@ mod tests;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use crate::frame_stats::StatsSummary;
+use crate::history::{LastSession, LocalTime};
 use crate::hotkey::Hotkey;
 use crate::install::MoveStatus;
 use crate::settings::Settings;
@@ -71,7 +73,7 @@ fn scroll_id() -> Id {
     id("settings.scroll")
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct GameRow {
     /// The game's key in the stats store; `[not_games]` uses it.
     pub key: String,
@@ -83,6 +85,13 @@ pub struct GameRow {
     /// The `[game_names]` key `override_name` came from (the full path or the exe file name);
     /// renames and clears edit this key. `None` adds a key for `exe_path`.
     pub override_key: Option<String>,
+    /// From the stats store: kept sessions, counted play time and when it was last played.
+    pub sessions: u32,
+    pub play_secs: f64,
+    pub last_played: LocalTime,
+    /// Lifetime numbers; `None` without enough frames.
+    pub summary: Option<StatsSummary>,
+    pub last_session: Option<LastSession>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

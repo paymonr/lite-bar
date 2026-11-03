@@ -397,6 +397,11 @@ pub fn list_games(stats_dir: &Path) -> Vec<GameRow> {
         .into_iter()
         .map(|(key, g)| GameRow {
             key,
+            summary: g.hist.summary(),
+            play_secs: g.hist.total_secs(),
+            sessions: g.sessions,
+            last_played: g.last_played,
+            last_session: g.last_session,
             exe_path: g.exe_path,
             stored_name: g.name,
             override_name: None,
@@ -538,6 +543,25 @@ mod tests {
         );
         let before = snapshot(dir.path());
         let rows = list_games(dir.path());
+        for row in &rows {
+            assert_eq!(row.sessions, 1);
+            assert!((row.play_secs - 6.0).abs() < 1e-9, "600 frames of 10 ms");
+            assert!(row.summary.is_some());
+            assert!(row.last_session.is_some());
+        }
+        assert_eq!(rows[0].last_played, time(11, 5));
+        assert_eq!(rows[1].last_played, time(10, 5));
+        let rows: Vec<GameRow> = rows
+            .into_iter()
+            .map(|r| GameRow {
+                key: r.key,
+                exe_path: r.exe_path,
+                stored_name: r.stored_name,
+                override_name: r.override_name,
+                override_key: r.override_key,
+                ..GameRow::default()
+            })
+            .collect();
         assert_eq!(
             rows,
             vec![
@@ -547,6 +571,7 @@ mod tests {
                     stored_name: "Minecraft".to_string(),
                     override_name: None,
                     override_key: None,
+                    ..GameRow::default()
                 },
                 GameRow {
                     key: "b".to_string(),
@@ -554,6 +579,7 @@ mod tests {
                     stored_name: "Zelda".to_string(),
                     override_name: None,
                     override_key: None,
+                    ..GameRow::default()
                 },
             ]
         );

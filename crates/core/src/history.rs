@@ -21,7 +21,8 @@ pub const SESSIONS_CSV_HEADER: &str =
 const GAMES_CSV_HEADER: &str =
     "game,sessions,play_time,first_played,last_played,avg_fps,low_1pct_fps,high_1pct_fps,exe_path";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// `Default` is all zeros, only a filler (e.g. for rows built in tests).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LocalTime {
     pub year: u16,
     pub month: u8,

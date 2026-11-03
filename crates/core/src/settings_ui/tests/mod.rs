@@ -78,6 +78,7 @@ fn game(exe: &str, stored: &str, name: Option<&str>) -> GameRow {
         stored_name: stored.to_string(),
         override_name: name.map(str::to_string),
         override_key: name.map(|_| exe.to_string()),
+        ..GameRow::default()
     }
 }
 

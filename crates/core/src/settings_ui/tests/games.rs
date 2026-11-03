@@ -135,6 +135,7 @@ fn file_name_override_page() -> Page {
         stored_name: "Java".to_string(),
         override_name: Some("Minecraft Mod".to_string()),
         override_key: Some("javaw.exe".to_string()),
+        ..GameRow::default()
     }];
     p.idle();
     p.idle();
