@@ -661,3 +661,23 @@ fn card_buttons_rename_and_mark() {
     let a = p.keys(vec![key(UiKey::Enter)]);
     assert_eq!(changes(&a), vec![rename("javaw.exe", Some("Craft"))]);
 }
+
+#[test]
+fn playing_card_uses_the_rename() {
+    let mut p = card_page(true);
+    p.settings
+        .game_names
+        .insert("javaw.exe".to_string(), "Craft".to_string());
+    p.idle();
+    let y = find_text(p.frame(), "PLAYING NOW").unwrap().0.y;
+    let craft = find_text(p.frame(), "Craft").expect("the renamed name on the card");
+    assert!(
+        (craft.0.y - y).abs() < 30.0,
+        "on the card, next to the badge"
+    );
+    let a = click_in_card(&mut p, "PLAYING NOW", "Not a game");
+    assert_eq!(
+        changes(&a),
+        vec![not_a_game(&game_key_of("javaw.exe"), Some("Craft"))]
+    );
+}

@@ -10,6 +10,7 @@ use super::{
 };
 use std::collections::BTreeMap;
 
+use crate::game_name::find_override;
 use crate::history::LocalTime;
 use crate::settings::Settings;
 use crate::settings_edit::SettingsChange;
@@ -100,7 +101,7 @@ pub(super) fn content(
         );
         ui.space(14.0);
         if let Some(card) = active_card(games, &settings.not_games, input.live) {
-            active_game(ui, view, &card, input.now, out);
+            active_game(ui, view, &card, &settings.game_names, input.now, out);
             ui.space(4.0);
         }
         table(ui, view, settings, games, input.now, out);
@@ -612,12 +613,15 @@ fn active_game(
     ui: &mut Ui,
     view: &mut SettingsView,
     card: &Card,
+    game_names: &BTreeMap<String, String>,
     now: LocalTime,
     out: &mut Vec<UiAction>,
 ) {
     let (name, key, row, badge) = match card {
+        // Your rename wins over the looked-up name, as in the stats files.
         Card::Playing { live, row } => (
-            live.name.clone(),
+            find_override(game_names, &live.exe_path)
+                .map_or_else(|| live.name.clone(), |(_, name)| name.to_string()),
             live.key.clone(),
             *row,
             "PLAYING NOW".to_string(),
