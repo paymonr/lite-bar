@@ -4,6 +4,9 @@
 
 mod appearance;
 mod games;
+// Used by the Games page (plan Task 5); the allow goes with it.
+#[allow(dead_code)]
+mod games_text;
 mod general;
 mod hotkeys;
 mod overlay;
