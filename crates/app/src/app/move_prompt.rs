@@ -1,5 +1,5 @@
 //! The welcome popup side of `App`: offering the move to Program Files at start, the
-//! popup's choices, the move itself on a worker thread (`mover::spawn`, whose outcome comes
+//! popup's choices (and Settings' Install button), the move itself on a worker thread (`mover::spawn`, whose outcome comes
 //! back as `WM_MOVE_RESULT`), and the moved copy's first start (`--moved-from`).
 
 use lite_bar_core::install::{should_offer, target_dir, MoveOutcome, MoveStatus};
@@ -67,18 +67,30 @@ impl App {
         }
     }
 
-    /// Move was clicked: moves on a worker. Ignored while a move runs.
-    fn start_move(&mut self) {
+    /// Whether Settings offers "Install to Program Files": Lite Bar runs from outside the
+    /// folder it would move to. Unlike the popup, also after "No thanks".
+    pub(super) fn install_offered(&self) -> bool {
+        let exe = self
+            .exe_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned());
+        !self.pf_roots.is_empty() && should_offer(true, exe.as_deref(), &self.pf_roots)
+    }
+
+    /// Install was clicked (the popup's or Settings'): moves on a worker. Ignored while a
+    /// move runs.
+    pub(super) fn start_move(&mut self) {
         if !matches!(self.move_status, MoveStatus::Idle | MoveStatus::Done(_)) {
             return;
         }
         let (job, elevated) = (self.move_job, self.elevated);
-        // The UAC prompt belongs to the popup.
-        let parent = self
-            .move_prompt
-            .as_ref()
-            .map_or(self.hwnd, |ui| ui.hwnd())
-            .0 as usize;
+        // The UAC prompt belongs to the popup, else to Settings.
+        let parent = match (&self.move_prompt, &self.settings_ui) {
+            (Some(ui), _) => ui.hwnd(),
+            (None, Some(ui)) => ui.hwnd(),
+            (None, None) => self.hwnd,
+        }
+        .0 as usize;
         if (self.spawn_move)(self.hwnd, Box::new(move || job(elevated, parent))) {
             self.set_move_status(MoveStatus::Moving);
         } else {
@@ -159,6 +171,9 @@ impl App {
         self.move_status = status;
         if let Some(ui) = &self.move_prompt {
             ui.set_status(&self.move_status);
+        }
+        if let Some(ui) = &self.settings_ui {
+            ui.set_install(self.install_offered(), &self.move_status);
         }
     }
 }

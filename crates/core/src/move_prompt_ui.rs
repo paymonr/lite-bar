@@ -29,7 +29,7 @@ const MOVE: &str = "Install to Program Files";
 const LATER: &str = "Ask me later";
 const NO_THANKS: &str = "No thanks";
 const CLOSE: &str = "Close";
-const MOVING: &str = "Installing…";
+pub(crate) const MOVING: &str = "Installing…";
 
 pub struct MovePromptInput<'a> {
     /// The toggle hotkey as shown to the user, e.g. "Ctrl+Shift+F".
@@ -162,8 +162,9 @@ fn key_caps(ui: &mut Ui, keys: &[&str]) {
     }
 }
 
-/// The status line and its color; empty when there is nothing to say.
-fn status_line(status: &MoveStatus) -> (String, Rgba) {
+/// The status line and its color; empty when there is nothing to say. The Settings window
+/// shows the same line under its install row.
+pub(crate) fn status_line(status: &MoveStatus) -> (String, Rgba) {
     match status {
         MoveStatus::Idle | MoveStatus::Done(MoveOutcome::Moved) => (String::new(), theme::MUTED),
         MoveStatus::Moving => (MOVING.into(), theme::MUTED),

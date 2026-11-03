@@ -3248,6 +3248,67 @@ mod app {
         }
 
         #[test]
+        fn settings_offers_install_outside_program_files_even_after_no_thanks() {
+            let dir = TempDir::new("settings-install-offer");
+            let (mut app, _owner) = outside_app(dir.path());
+            app.settings.install.move_prompt = false;
+            app.open_settings_hidden();
+            assert_eq!(
+                app.settings_ui.as_ref().unwrap().install_shown(),
+                (true, MoveStatus::Idle)
+            );
+        }
+
+        #[test]
+        fn settings_offers_no_install_inside_program_files() {
+            let dir = TempDir::new("settings-install-inside");
+            let (mut app, _owner) = outside_app(dir.path());
+            app.exe_path = Some(PathBuf::from(r"C:\Program Files\Lite Bar\lite-bar.exe"));
+            app.open_settings_hidden();
+            assert!(!app.settings_ui.as_ref().unwrap().install_shown().0);
+        }
+
+        #[test]
+        fn settings_install_runs_the_move_and_shows_how_it_went() {
+            let dir = TempDir::new("settings-install-run");
+            let (mut app, _owner) = outside_app(dir.path());
+            app.open_settings_hidden();
+            app.apply_ui_action(UiAction::InstallToProgramFiles);
+            assert_eq!(MOVE_SPAWNS.get(), 1);
+            assert_eq!(app.move_status, MoveStatus::Moving);
+            let shown = || app.settings_ui.as_ref().unwrap().install_shown().1;
+            assert_eq!(shown(), MoveStatus::Moving);
+            app.apply_move_outcome(MoveOutcome::Declined);
+            assert_eq!(
+                app.settings_ui.as_ref().unwrap().install_shown().1,
+                MoveStatus::Done(MoveOutcome::Declined)
+            );
+        }
+
+        thread_local! {
+            /// The UAC parent the fake move job was handed.
+            static MOVE_PARENT: Cell<usize> = const { Cell::new(0) };
+        }
+
+        #[test]
+        fn settings_install_asks_for_admin_over_the_settings_window() {
+            let dir = TempDir::new("settings-install-parent");
+            let (mut app, _owner) = outside_app(dir.path());
+            app.open_settings_hidden();
+            app.spawn_move = |_, job| {
+                job();
+                true
+            };
+            app.move_job = |_, parent| {
+                MOVE_PARENT.set(parent);
+                MoveOutcome::Declined
+            };
+            app.apply_ui_action(UiAction::InstallToProgramFiles);
+            let settings = app.settings_ui.as_ref().unwrap().hwnd();
+            assert_eq!(MOVE_PARENT.get(), settings.0 as usize);
+        }
+
+        #[test]
         fn moved_from_keeps_the_old_copy_while_startup_still_starts_it() {
             let dir = TempDir::new("move-moved-from-repoint-fails");
             let (mut app, _owner) = moved_app(dir.path(), |_, _| Err("access denied".into()));

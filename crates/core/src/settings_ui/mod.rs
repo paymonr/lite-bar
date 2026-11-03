@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::rc::Rc;
 
 use crate::hotkey::Hotkey;
+use crate::install::MoveStatus;
 use crate::settings::Settings;
 use crate::settings_edit::SettingsChange;
 use crate::startup_task::StartupState;
@@ -100,6 +101,8 @@ pub enum UiAction {
     RestartToUpdate,
     /// The "Start with Windows" switch: create (true) or delete the logon task.
     SetStartup(bool),
+    /// "Install": move Lite Bar to Program Files, as the welcome popup's button does.
+    InstallToProgramFiles,
 }
 
 /// What the Updates section shows: the app's update state and this build's version.
@@ -117,11 +120,20 @@ pub struct StartupInput<'a> {
     pub elevated: bool,
 }
 
+/// What the General section's install row shows: whether to offer it (Lite Bar runs from
+/// outside Program Files) and how the install is going.
+#[derive(Clone, Copy, Debug)]
+pub struct InstallInput<'a> {
+    pub offer: bool,
+    pub status: &'a MoveStatus,
+}
+
 /// What the app feeds the page besides the settings.
 #[derive(Clone, Copy, Debug)]
 pub struct PageInput<'a> {
     pub updates: UpdatesInput<'a>,
     pub startup: StartupInput<'a>,
+    pub install: InstallInput<'a>,
 }
 
 /// A game's name field. The text stays here while it is edited and is only emitted
@@ -442,7 +454,7 @@ fn content(
         view.headings[NAV_APPEARANCE] = heading(ui, "APPEARANCE", 16.0) - first;
         appearance::section(ui, view, settings, out);
         view.headings[NAV_GENERAL] = heading(ui, "GENERAL", 16.0) - first;
-        general::section(ui, view, input.startup, out);
+        general::section(ui, view, input.startup, input.install, out);
         view.headings[NAV_HOTKEYS] = heading(ui, "HOTKEYS", 16.0) - first;
         hotkeys::section(ui, view, settings, hotkey_status, out);
         view.headings[NAV_UPDATES] = heading(ui, "UPDATES", 16.0) - first;

@@ -13,6 +13,7 @@ mod updates;
 use super::*;
 use crate::color::Rgb;
 use crate::hotkey::Key;
+use crate::install::{MoveOutcome, MoveStatus};
 use crate::settings::{Location, StatsLayout, MAX_SAVED_COLORS};
 use crate::settings_edit::apply_change;
 use crate::startup_task::StartupState;
@@ -85,6 +86,8 @@ struct Page {
     update: UpdateState,
     startup: StartupState,
     elevated: bool,
+    install_offer: bool,
+    move_status: MoveStatus,
     area: Rect,
     now: u64,
     last: Option<Frame>,
@@ -110,6 +113,8 @@ impl Page {
             update: UpdateState::Idle,
             startup: StartupState::Off,
             elevated: true,
+            install_offer: false,
+            move_status: MoveStatus::Idle,
             area,
             now: 0,
             last: None,
@@ -142,6 +147,10 @@ impl Page {
                 startup: StartupInput {
                     state: &self.startup,
                     elevated: self.elevated,
+                },
+                install: InstallInput {
+                    offer: self.install_offer,
+                    status: &self.move_status,
                 },
             },
         );

@@ -70,6 +70,7 @@ impl App {
                 ui.set_save_error(self.save_error);
                 ui.set_update(&self.update);
                 ui.set_startup(&self.startup, self.elevated);
+                ui.set_install(self.install_offered(), &self.move_status);
                 self.settings_ui = Some(ui);
                 self.refresh_startup();
             }
@@ -148,6 +149,7 @@ impl App {
                 }
             }
             UiAction::SetStartup(on) => self.set_startup(on),
+            UiAction::InstallToProgramFiles => self.start_move(),
             UiAction::StartHotkeyCapture => self.start_hotkey_capture(),
             UiAction::CancelHotkeyCapture => {
                 if self.end_hotkey_capture() {

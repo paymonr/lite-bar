@@ -128,6 +128,8 @@ When Lite Bar starts from any other folder, a **Welcome to Lite Bar** popup expl
 - **Ask me later** (or closing the popup) shows it again the next time Lite Bar starts.
 - **No thanks** never asks again (`[install] move_prompt = false`).
 
+Changed your mind? **Settings → General → Install to Program Files** does the same as the popup's button. It shows whenever Lite Bar runs from outside Program Files, also after **No thanks**.
+
 Settings, the log and stats stay in `%APPDATA%\LiteBar`; only the exe moves. Installing needs your own administrator account: if the UAC prompt is answered with another account's password, nothing is changed and the popup says so.
 
 Opening Lite Bar from Start runs it without administrator rights, like double-clicking `lite-bar.exe`. Opening it while it already runs shows its Settings window. When Lite Bar runs as administrator from `<Program Files>\Lite Bar`, it refreshes the Start menu shortcut and the Installed apps entry at each start, so they stay current after **Update now**.

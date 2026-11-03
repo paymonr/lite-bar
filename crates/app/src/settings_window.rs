@@ -18,11 +18,12 @@ use std::time::{Duration, Instant};
 
 use lite_bar_core::game_name::find_override;
 use lite_bar_core::hotkey::Hotkey;
+use lite_bar_core::install::MoveStatus;
 use lite_bar_core::settings::Settings;
 use lite_bar_core::settings_edit::apply_change;
 use lite_bar_core::settings_ui::{
-    settings_frame, GameRow, PageInput, SettingsView, StartupInput, UiAction, UpdatesInput,
-    MIN_WINDOW_DIP,
+    settings_frame, GameRow, InstallInput, PageInput, SettingsView, StartupInput, UiAction,
+    UpdatesInput, MIN_WINDOW_DIP,
 };
 use lite_bar_core::startup_task::StartupState;
 use lite_bar_core::ui::{HotkeyCapture, Ui};
@@ -184,6 +185,10 @@ struct WindowState {
     /// as administrator.
     startup: StartupState,
     elevated: bool,
+    /// What the General section's install row shows: whether Lite Bar runs from outside
+    /// Program Files, and how an install is going.
+    install_offer: bool,
+    move_status: MoveStatus,
     queue: ActionQueue,
 }
 
@@ -227,6 +232,10 @@ impl UiApp for SettingsPage {
                 startup: StartupInput {
                     state: &st.startup,
                     elevated: st.elevated,
+                },
+                install: InstallInput {
+                    offer: st.install_offer,
+                    status: &st.move_status,
                 },
             },
         );
@@ -396,6 +405,24 @@ impl SettingsUi {
         st.elevated = elevated;
         drop(st);
         self.window.request_redraw();
+    }
+
+    /// Shows the install row (only when `offer`) and how an install is going.
+    pub fn set_install(&self, offer: bool, status: &MoveStatus) {
+        let mut st = self.state.borrow_mut();
+        if st.install_offer == offer && st.move_status == *status {
+            return;
+        }
+        st.install_offer = offer;
+        st.move_status = status.clone();
+        drop(st);
+        self.window.request_redraw();
+    }
+
+    #[cfg(test)]
+    pub fn install_shown(&self) -> (bool, MoveStatus) {
+        let st = self.state.borrow();
+        (st.install_offer, st.move_status.clone())
     }
 
     #[cfg(test)]
