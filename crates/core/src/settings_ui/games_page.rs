@@ -242,7 +242,7 @@ fn table(
             return;
         }
         let label = if other_apps { IS_A_GAME } else { NOT_A_GAME };
-        let cols = Columns::new(ui.available(), button_width(ui, label));
+        let cols = Columns::new(ui.available(), button_width(ui, label), num_widths(ui));
         header_row(ui, &cols);
         for row in &rows {
             row_line(ui);
@@ -269,10 +269,23 @@ struct Columns {
 }
 
 const NUM_HEADS: [&str; 5] = ["SESSIONS", "PLAYED", "LAST", "AVG", "1% LOW"];
+/// The narrowest each number column gets; wider when its heading or widest value needs it.
 const NUM_W: [f32; 5] = [56.0, 60.0, 104.0, 44.0, 52.0];
 
+/// Each number column's width: room for its heading and its widest value ("Yesterday
+/// 00:00" in Last).
+fn num_widths(ui: &Ui) -> [f32; 5] {
+    let m = ui.text_measure();
+    let mut w = NUM_W;
+    for (i, head) in NUM_HEADS.iter().enumerate() {
+        w[i] = w[i].max(m.measure(head, HEADING).0);
+    }
+    w[2] = w[2].max(m.measure("Yesterday 00:00", TextStyle::BODY).0);
+    w
+}
+
 impl Columns {
-    fn new(area: Rect, button_w: f32) -> Columns {
+    fn new(area: Rect, button_w: f32, widths: [f32; 5]) -> Columns {
         let right = area.x + area.w;
         let button = Rect::new(right - button_w, 0.0, button_w, theme::CONTROL_HEIGHT);
         let name_x = area.x + TILE + COL_GAP;
@@ -284,7 +297,7 @@ impl Columns {
                     continue;
                 }
                 nums[i] = Some(edge);
-                edge -= NUM_W[i] + COL_GAP;
+                edge -= widths[i] + COL_GAP;
             }
             (nums, edge)
         };
@@ -561,7 +574,7 @@ pub(super) fn active_card<'a>(
 
 const CARD_TILE: f32 = 40.0;
 const CARD_TOP_H: f32 = 44.0;
-const PANEL_H: f32 = 74.0;
+const PANEL_H: f32 = 86.0;
 /// Below this width the two panels stack.
 const PANELS_SIDE_BY_SIDE_W: f32 = 560.0;
 const PLAYING: Rgba = Rgba(0x7C, 0xFC, 0x7C, 255);
@@ -800,10 +813,14 @@ fn panel(ui: &mut Ui, rect: Rect, p: &Panel) {
         color: PANEL_BG,
         radius: 6.0,
     });
+    let m = ui.text_measure();
     let x = rect.x + 12.0;
-    paint_text(ui, x, rect.y + 8.0, p.title, HEADING, theme::MUTED);
+    let title_y = rect.y + 8.0;
+    paint_text(ui, x, title_y, p.title, HEADING, theme::MUTED);
+    // Values share a bottom line under the title, captions go under them.
+    let value_y = title_y + m.measure(p.title, HEADING).1 + 4.0;
+    let value_h = m.measure("0", BIG).1;
     let col_w = ((rect.w - 24.0) / 3.0).max(0.0);
-    let base = rect.y + 52.0;
     for (i, (value, caption)) in p.values.iter().enumerate() {
         let vx = x + col_w * i as f32;
         let (style, color) = match (i, p.live) {
@@ -812,10 +829,17 @@ fn panel(ui: &mut Ui, rect: Rect, p: &Panel) {
             _ => (MONO_BIG, theme::TEXT),
         };
         let value = ellipsize(ui, value, style, (col_w - 8.0).max(0.0));
-        let vh = ui.text_measure().measure(&value, style).1;
-        paint_text(ui, vx, base - vh, &value, style, color);
+        let vh = m.measure(&value, style).1;
+        paint_text(ui, vx, value_y + value_h - vh, &value, style, color);
         let caption = ellipsize(ui, caption, HINT, (col_w - 8.0).max(0.0));
-        paint_text(ui, vx, base + 2.0, &caption, HINT, theme::MUTED);
+        paint_text(
+            ui,
+            vx,
+            value_y + value_h + 2.0,
+            &caption,
+            HINT,
+            theme::MUTED,
+        );
     }
 }
 

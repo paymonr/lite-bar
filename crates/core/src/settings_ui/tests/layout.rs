@@ -1,6 +1,7 @@
 //! Layout checks at the minimum and a roomy window size, with a conservative text measure.
 
 use super::*;
+use crate::history::LocalTime;
 
 fn area(r: Rect, o: Rect) -> f32 {
     let i = r.intersect(o);
@@ -82,6 +83,24 @@ fn check(f: &Frame, w: f32, h: f32, scroll: f32) {
                     "{text:?} {r:?} overlaps control {h:?} (w {w}, scroll {scroll})"
                 );
             }
+        }
+    }
+}
+
+/// Texts on the page (right of the sidebar, inside the window) never overlap each other.
+fn check_text_apart(f: &Frame, w: f32, h: f32, scroll: f32) {
+    let window = Rect::new(SIDEBAR_W + 1.0, 0.0, w, h);
+    let rects: Vec<(String, Rect)> = text_rects(f)
+        .into_iter()
+        .map(|(t, r)| (t, r.intersect(window)))
+        .filter(|(_, r)| r.w * r.h > 0.0)
+        .collect();
+    for (i, (a, ra)) in rects.iter().enumerate() {
+        for (b, rb) in &rects[i + 1..] {
+            assert!(
+                area(*ra, *rb) < 0.5,
+                "{a:?} {ra:?} overlaps {b:?} {rb:?} (w {w}, scroll {scroll})"
+            );
         }
     }
 }
@@ -201,6 +220,13 @@ fn the_install_row_lays_out_cleanly() {
 /// apps 5"), scrolled through.
 fn check_games_page(w: f32, h: f32, other_apps: bool) {
     let mut p = Page::with_measure(Rect::new(0.0, 0.0, w, h), &CONSERVATIVE);
+    // "Yesterday 21:04": the widest the Last column gets.
+    let yesterday = LocalTime {
+        day: p.games_now.day - 1,
+        hour: 21,
+        minute: 4,
+        ..p.games_now
+    };
     p.games = (0..20)
         .map(|i| {
             let exe = format!(
@@ -209,6 +235,14 @@ fn check_games_page(w: f32, h: f32, other_apps: bool) {
             GameRow {
                 sessions: 1234,
                 play_secs: 3_600_000.0,
+                last_played: yesterday,
+                summary: Some(crate::frame_stats::StatsSummary {
+                    frames: 1000,
+                    play_secs: 3_600_000.0,
+                    avg_fps: 1234.0,
+                    low_1pct_fps: 999.0,
+                    high_1pct_fps: 2000.0,
+                }),
                 ..game(
                     &exe,
                     &format!("A Game With A Really Quite Long Name {i}"),
@@ -234,6 +268,7 @@ fn check_games_page(w: f32, h: f32, other_apps: bool) {
         p.st.scroll.insert(id("games.scroll"), scroll);
         p.idle();
         check(p.frame(), w, h, scroll);
+        check_text_apart(p.frame(), w, h, scroll);
         scroll += 60.0;
     }
 }
@@ -290,6 +325,7 @@ fn games_page_card_states_lay_out_cleanly() {
             }
             p.show_games();
             check(p.frame(), w, h, 0.0);
+            check_text_apart(p.frame(), w, h, 0.0);
         }
     }
 }
