@@ -732,3 +732,20 @@ fn games_sharing_an_exe_rename_one_at_a_time() {
     let a = p.keys(vec![key(UiKey::Enter)]);
     assert_eq!(changes(&a), vec![rename("javaw.exe", Some("Craft"))]);
 }
+
+#[test]
+fn a_first_session_can_be_renamed_from_the_card() {
+    let mut p = card_page(true);
+    p.live = Some(live("new.exe", "Java(TM) Platform SE binary"));
+    p.idle();
+    click_in_card(&mut p, "PLAYING NOW", "Rename");
+    p.idle();
+    let in_field = texts(p.frame())
+        .into_iter()
+        .any(|t| t.1 == "Java(TM) Platform SE binary" && !t.2.bold);
+    assert!(in_field, "the field starts with the looked-up name");
+    p.typing("Craft");
+    p.idle();
+    let a = p.keys(vec![key(UiKey::Enter)]);
+    assert_eq!(changes(&a), vec![rename("new.exe", Some("Craft"))]);
+}

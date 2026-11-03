@@ -76,7 +76,7 @@ pub(super) fn content(
     input: GamesInput,
     out: &mut Vec<UiAction>,
 ) -> f32 {
-    end_gone_edits(view, games, out);
+    end_gone_edits(view, games, input.live, out);
     let top = ui.available();
     let inner = Rect::new(
         top.x + PAGE_PAD_X,
@@ -112,11 +112,20 @@ pub(super) fn content(
 }
 
 /// Edits of games that went away (the list changed) end now.
-fn end_gone_edits(view: &mut SettingsView, games: &[GameRow], out: &mut Vec<UiAction>) {
+/// The game being played counts as present (it can be renamed from the card before its
+/// first session is in the list).
+fn end_gone_edits(
+    view: &mut SettingsView,
+    games: &[GameRow],
+    live: Option<&LiveGame>,
+    out: &mut Vec<UiAction>,
+) {
     let gone: Vec<String> = view
         .games
         .keys()
-        .filter(|exe| !games.iter().any(|g| &g.exe_path == *exe))
+        .filter(|exe| {
+            !games.iter().any(|g| &g.exe_path == *exe) && live.is_none_or(|l| &l.exe_path != *exe)
+        })
         .cloned()
         .collect();
     for exe in gone {
@@ -127,7 +136,9 @@ fn end_gone_edits(view: &mut SettingsView, games: &[GameRow], out: &mut Vec<UiAc
         }
     }
     let editing = view.games_view.editing.as_deref();
-    if editing.is_some_and(|key| !games.iter().any(|g| g.key == key)) {
+    let present =
+        |key: &str| games.iter().any(|g| g.key == key) || live.is_some_and(|l| l.key == key);
+    if editing.is_some_and(|key| !present(key)) {
         view.games_view.editing = None;
     }
 }
@@ -442,28 +453,7 @@ fn name_cell(
             FIELD_W.min(cols.name_w),
             theme::CONTROL_HEIGHT,
         );
-        let mut done = false;
-        ui.place(rect, |ui| {
-            match ui.text_field(field, &mut e.edit, &game.stored_name) {
-                TextFieldEvent::None => {}
-                TextFieldEvent::Changed => e.pending = true,
-                TextFieldEvent::Committed => {
-                    // The stored name itself is no override.
-                    if e.edit.text.trim() == game.stored_name {
-                        e.edit = TextEdit::new("");
-                    }
-                    out.extend(e.commit());
-                    done = true;
-                }
-                TextFieldEvent::Cancelled => {
-                    e.pending = false;
-                    done = true;
-                }
-            }
-        });
-        if done {
-            view.games_view.editing = None;
-        }
+        rename_field(ui, view, game, rect, out);
         return;
     }
     let mut clicked = false;
@@ -478,6 +468,44 @@ fn name_cell(
     });
     if clicked {
         start_rename(ui, view, game, out);
+    }
+}
+
+/// `game`'s rename field at `rect`: Enter or leaving it saves, Esc cancels.
+fn rename_field(
+    ui: &mut Ui,
+    view: &mut SettingsView,
+    game: &GameRow,
+    rect: Rect,
+    out: &mut Vec<UiAction>,
+) {
+    let field = field_id(game);
+    let key = game.override_key.as_deref().unwrap_or(&game.exe_path);
+    let e = view
+        .games
+        .entry(game.exe_path.clone())
+        .or_insert_with(|| GameEdit::new(key, game.override_name.as_deref()));
+    let mut done = false;
+    ui.place(rect, |ui| {
+        match ui.text_field(field, &mut e.edit, &game.stored_name) {
+            TextFieldEvent::None => {}
+            TextFieldEvent::Changed => e.pending = true,
+            TextFieldEvent::Committed => {
+                // The stored name itself is no override.
+                if e.edit.text.trim() == game.stored_name {
+                    e.edit = TextEdit::new("");
+                }
+                out.extend(e.commit());
+                done = true;
+            }
+            TextFieldEvent::Cancelled => {
+                e.pending = false;
+                done = true;
+            }
+        }
+    });
+    if done {
+        view.games_view.editing = None;
     }
 }
 
@@ -643,6 +671,25 @@ fn active_game(
     };
     let (first, all_time) = panels(card, row);
     let playing = matches!(card, Card::Playing { .. });
+    // A game in its first session isn't in the list yet: it's renamed right on the card.
+    let first_session = match card {
+        Card::Playing { live, row: None } => {
+            let found = find_override(game_names, &live.exe_path);
+            Some(GameRow {
+                key: live.key.clone(),
+                exe_path: live.exe_path.clone(),
+                stored_name: live.name.clone(),
+                override_name: found.map(|(_, name)| name.to_string()),
+                override_key: found.map(|(key, _)| key.to_string()),
+                ..GameRow::default()
+            })
+        }
+        _ => None,
+    };
+    let rename_row = row.or(first_session.as_ref());
+    let editing_here = first_session
+        .as_ref()
+        .is_some_and(|g| view.games_view.editing.as_deref() == Some(g.key.as_str()));
 
     ui.card(|ui| {
         ui.row(CARD_TOP_H, |ui| {
@@ -675,7 +722,7 @@ fn active_game(
                 }));
             }
             let mut left = mark.x;
-            if let Some(row) = row {
+            if let Some(row) = rename_row {
                 let w = button_width(ui, RENAME);
                 left = mark.x - COL_GAP - w;
                 let rect = Rect::new(left, by, w, theme::CONTROL_HEIGHT);
@@ -704,8 +751,21 @@ fn active_game(
             }
             let badge = ellipsize(ui, &badge, HEADING, (text_w - (badge_x - text_x)).max(0.0));
             paint_text(ui, badge_x, r.y + 4.0, &badge, HEADING, badge_color);
-            let shown = ellipsize(ui, &name, TextStyle::BOLD, text_w);
-            paint_text(ui, text_x, r.y + 22.0, &shown, TextStyle::BOLD, theme::TEXT);
+            match (&first_session, editing_here) {
+                (Some(game), true) => {
+                    let rect = Rect::new(
+                        text_x,
+                        r.y + 16.0,
+                        FIELD_W.min(text_w),
+                        theme::CONTROL_HEIGHT,
+                    );
+                    rename_field(ui, view, game, rect, out);
+                }
+                _ => {
+                    let shown = ellipsize(ui, &name, TextStyle::BOLD, text_w);
+                    paint_text(ui, text_x, r.y + 22.0, &shown, TextStyle::BOLD, theme::TEXT);
+                }
+            }
         });
         ui.space(10.0);
         if ui.available().w >= PANELS_SIDE_BY_SIDE_W {
