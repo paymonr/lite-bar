@@ -186,7 +186,9 @@ pub struct GameStore {
     pub unparsed: BTreeMap<String, toml::Value>,
 }
 
-fn parse_game(value: &toml::Value) -> Result<GameRecord, String> {
+/// A game entry, plus a warning when its optional `last_session` couldn't be read (the game
+/// is kept without it: the field is only shown on the Games page).
+fn parse_game(value: &toml::Value) -> Result<(GameRecord, Option<String>), String> {
     let g: GameIn = value
         .clone()
         .try_into()
@@ -197,15 +199,29 @@ fn parse_game(value: &toml::Value) -> Result<GameRecord, String> {
             g.total_secs
         ));
     }
-    Ok(GameRecord {
+    let (last_session, warning) = match g.last_session {
+        None => (None, None),
+        Some(raw) => match raw.try_into::<LastSessionFile>() {
+            Ok(file) => (Some(LastSession::from(file)), None),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "last_session: {}; ignored",
+                    e.message().replace('\n', " ")
+                )),
+            ),
+        },
+    };
+    let record = GameRecord {
         name: g.name,
         exe_path: g.exe_path,
         sessions: g.sessions,
         first_played: g.first_played,
         last_played: g.last_played,
         hist: FrameHistogram::from_sparse(&g.buckets, g.total_secs),
-        last_session: g.last_session.map(LastSession::from),
-    })
+        last_session,
+    };
+    Ok((record, warning))
 }
 
 /// On-disk shape of one game in `games.toml`.
@@ -219,8 +235,9 @@ struct GameIn {
     total_secs: f64,
     #[serde(default)]
     buckets: Vec<(u32, u64)>,
+    /// Read leniently: a bad one is dropped with a warning, not the whole game.
     #[serde(default)]
-    last_session: Option<LastSessionFile>,
+    last_session: Option<toml::Value>,
 }
 
 #[derive(Serialize)]
@@ -259,7 +276,10 @@ impl GameStore {
         let mut warnings = Vec::new();
         for (key, value) in entries {
             match parse_game(value) {
-                Ok(record) => {
+                Ok((record, warning)) => {
+                    if let Some(w) = warning {
+                        warnings.push(format!("games.{key}: {w}"));
+                    }
                     store.games.insert(key.clone(), record);
                 }
                 Err(reason) => {
@@ -1355,5 +1375,19 @@ mod tests {
         let (old, warnings) = GameStore::parse(old).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(old.games["k"].last_session, None);
+    }
+
+    #[test]
+    fn a_damaged_last_session_leaves_the_game_readable() {
+        let text = "[games.k]\nname = \"A\"\nexe_path = 'C:\\A.exe'\nsessions = 3\n\
+                    first_played = \"2026-10-02 09:30:07\"\nlast_played = \"2026-10-02 10:00:07\"\n\
+                    total_secs = 60.0\nbuckets = []\nlast_session = \"garbage\"\n";
+        let (store, warnings) = GameStore::parse(text).unwrap();
+        let game = store.games.get("k").expect("the game is still read");
+        assert_eq!(game.sessions, 3);
+        assert_eq!(game.last_session, None);
+        assert!(store.unparsed.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("games.k") && warnings[0].contains("last_session"));
     }
 }
