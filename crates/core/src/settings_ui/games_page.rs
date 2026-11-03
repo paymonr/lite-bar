@@ -46,7 +46,8 @@ pub(super) enum GamesTab {
 #[derive(Clone, Debug, Default)]
 pub(super) struct GamesView {
     pub(super) tab: GamesTab,
-    /// The exe path of the game whose name is being edited.
+    /// The key of the game whose name is being edited (games sharing an exe, like Java
+    /// ones, share its name override but are edited one at a time).
     pub(super) editing: Option<String>,
     /// Height of the scrolling content in the last frame.
     pub(super) content_h: f32,
@@ -124,9 +125,10 @@ fn end_gone_edits(view: &mut SettingsView, games: &[GameRow], out: &mut Vec<UiAc
                 out.extend(g.commit());
             }
         }
-        if view.games_view.editing.as_deref() == Some(exe.as_str()) {
-            view.games_view.editing = None;
-        }
+    }
+    let editing = view.games_view.editing.as_deref();
+    if editing.is_some_and(|key| !games.iter().any(|g| g.key == key)) {
+        view.games_view.editing = None;
     }
 }
 
@@ -346,7 +348,7 @@ fn table_row(
     let editing = renamable
         && row
             .game
-            .is_some_and(|g| view.games_view.editing.as_deref() == Some(g.exe_path.as_str()));
+            .is_some_and(|g| view.games_view.editing.as_deref() == Some(g.key.as_str()));
     match row.game {
         Some(game) if renamable => name_cell(ui, view, cols, game, row.name, editing, out),
         _ => {
@@ -417,7 +419,7 @@ fn name_cell(
     editing: bool,
     out: &mut Vec<UiAction>,
 ) {
-    let field = id(&format!("settings.game:{}", game.exe_path));
+    let field = field_id(game);
     let key = game.override_key.as_deref().unwrap_or(&game.exe_path);
     let e = view
         .games
@@ -771,7 +773,7 @@ fn start_rename(ui: &mut Ui, view: &mut SettingsView, row: &GameRow, out: &mut V
         out.extend(view.finish_edits());
         view.games_view.tab = GamesTab::Games;
     }
-    view.games_view.editing = Some(row.exe_path.clone());
+    view.games_view.editing = Some(row.key.clone());
     // The field starts with the name shown, selected, so typing replaces it.
     let key = row.override_key.as_deref().unwrap_or(&row.exe_path);
     let e = view
@@ -783,5 +785,10 @@ fn start_rename(ui: &mut Ui, view: &mut SettingsView, row: &GameRow, out: &mut V
         e.edit = TextEdit::new(shown);
         e.edit.all_selected = true;
     }
-    ui.focus(id(&format!("settings.game:{}", row.exe_path)));
+    ui.focus(field_id(row));
+}
+
+/// The rename field of `game`'s row.
+fn field_id(game: &GameRow) -> Id {
+    id(&format!("settings.game:{}", game.key))
 }

@@ -716,3 +716,19 @@ fn playing_now_has_a_green_dot() {
     assert!(dot(&card_page(true)));
     assert!(!dot(&card_page(false)), "not on Last played");
 }
+
+#[test]
+fn games_sharing_an_exe_rename_one_at_a_time() {
+    let mut p = games_page();
+    p.games.push(GameRow {
+        key: "key:javaw.exe|other".to_string(),
+        ..game("javaw.exe", "Other Java Game", None)
+    });
+    p.idle();
+    start_rename(&mut p, "Other Java Game");
+    p.typing("Craft");
+    let crafts = texts(p.frame()).iter().filter(|t| t.1 == "Craft").count();
+    assert_eq!(crafts, 1, "one field, each letter typed once");
+    let a = p.keys(vec![key(UiKey::Enter)]);
+    assert_eq!(changes(&a), vec![rename("javaw.exe", Some("Craft"))]);
+}
