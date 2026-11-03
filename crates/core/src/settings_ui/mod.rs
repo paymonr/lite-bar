@@ -1,11 +1,9 @@
-//! The Settings page (mockup v3), built from the UI toolkit: a sidebar, a pinned live
-//! preview and one scrolling page of sections. Pure: no IO, and no clock but `Input::now_ms`.
+//! The Settings window (mockup v3), built from the UI toolkit: a sidebar, then either the
+//! Settings page (a pinned live preview and one scrolling page of sections) or the Games page. Pure: no IO, and no clock but `Input::now_ms`.
 //! The host applies the returned actions and passes the updated settings next frame.
 
 mod appearance;
-mod games;
-// Used by the Games page (plan Task 5); the allow goes with it.
-#[allow(dead_code)]
+mod games_page;
 mod games_text;
 mod general;
 mod hotkeys;
@@ -37,8 +35,7 @@ pub const NAV_APPEARANCE: usize = 1;
 pub const NAV_GENERAL: usize = 2;
 pub const NAV_HOTKEYS: usize = 3;
 pub const NAV_UPDATES: usize = 4;
-pub const NAV_GAMES: usize = 5;
-const SECTIONS: usize = 6;
+const SECTIONS: usize = 5;
 
 /// Smallest window (width, height) in DIPs the page is laid out for.
 pub const MIN_WINDOW_DIP: (f32, f32) = (720.0, 520.0);
@@ -117,6 +114,35 @@ pub enum UiAction {
     SetStartup(bool),
     /// "Install": move Lite Bar to Program Files, as the welcome popup's button does.
     InstallToProgramFiles,
+    /// The window switched to `WindowPage` (a sidebar click).
+    ShowPage(WindowPage),
+}
+
+/// Which page the Settings window shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowPage {
+    #[default]
+    Settings,
+    Games,
+}
+
+/// The open play session the Games page shows as "playing now".
+#[derive(Clone, Debug, PartialEq)]
+pub struct LiveGame {
+    /// Its key in the stats store.
+    pub key: String,
+    pub name: String,
+    pub exe_path: String,
+    /// The session's numbers so far; `None` before it has enough frames.
+    pub session: Option<StatsSummary>,
+}
+
+/// What the Games page shows besides the game list: the local time (for "Today 12:18") and
+/// the game being played.
+#[derive(Clone, Copy, Debug)]
+pub struct GamesInput<'a> {
+    pub now: LocalTime,
+    pub live: Option<&'a LiveGame>,
 }
 
 /// What the Updates section shows: the app's update state and this build's version.
@@ -148,6 +174,7 @@ pub struct PageInput<'a> {
     pub updates: UpdatesInput<'a>,
     pub startup: StartupInput<'a>,
     pub install: InstallInput<'a>,
+    pub games: GamesInput<'a>,
 }
 
 /// A game's name field. The text stays here while it is edited and is only emitted
@@ -194,7 +221,9 @@ impl GameEdit {
 /// State the page keeps between frames.
 #[derive(Clone, Debug)]
 pub struct SettingsView {
-    /// Selected sidebar item (`NAV_*`).
+    /// The page shown.
+    pub page: WindowPage,
+    /// Selected sidebar item (`NAV_*`) of the Settings page.
     pub selected: usize,
     pub hotkey: HotkeyCapture,
     /// Hex fields of the Number, Text and Background color rows.
@@ -217,11 +246,13 @@ pub struct SettingsView {
     stage_bg: Option<Rc<Vec<u8>>>,
     /// The value a click asked for, shown while the change runs.
     startup_target: Option<bool>,
+    games_view: games_page::GamesView,
 }
 
 impl Default for SettingsView {
     fn default() -> Self {
         SettingsView {
+            page: WindowPage::Settings,
             selected: NAV_OVERLAY,
             hotkey: HotkeyCapture::Idle,
             hex: Default::default(),
@@ -238,11 +269,28 @@ impl Default for SettingsView {
             restored: false,
             stage_bg: None,
             startup_target: None,
+            games_view: games_page::GamesView::default(),
         }
     }
 }
 
 impl SettingsView {
+    /// Height of the Games page's content in the last frame.
+    #[cfg(test)]
+    pub(crate) fn games_content_h(&self) -> f32 {
+        self.games_view.content_h
+    }
+
+    /// Shows `page`, ending a rename on the Games page; tells the host.
+    fn switch_page(&mut self, page: WindowPage, out: &mut Vec<UiAction>) {
+        if self.page == WindowPage::Games {
+            out.extend(self.finish_edits());
+            self.games_view.editing = None;
+        }
+        self.page = page;
+        out.push(UiAction::ShowPage(page));
+    }
+
     /// Ends any game-name edit still in progress, e.g. when the window closes.
     pub fn finish_edits(&mut self) -> Vec<UiAction> {
         self.games
@@ -268,13 +316,37 @@ pub fn settings_frame(
     let mut out = Vec::new();
     let area = ui.available();
     let side = Rect::new(area.x, area.y, SIDEBAR_W.min(area.w), area.h);
-    let clicked = sidebar(ui, view, side);
+    let clicked = sidebar(ui, view, side, &mut out);
     let main = Rect::new(
         side.right() + 1.0,
         area.y,
         (area.w - side.w - 1.0).max(0.0),
         area.h,
     );
+    if view.page == WindowPage::Games {
+        let header_h = match save_error {
+            Some(msg) => save_error_strip(ui, msg, main, main.y),
+            None => 0.0,
+        };
+        let body = Rect::new(
+            main.x,
+            main.y + header_h,
+            main.w,
+            (main.h - header_h).max(0.0),
+        );
+        let content_h = view.games_view.content_h;
+        let mut new_h = content_h;
+        ui.region(body, |ui| {
+            ui.scroll_area(games_page::scroll_id(), body.h, content_h, |ui| {
+                new_h = games_page::content(ui, view, settings, games, input.games, &mut out);
+            });
+        });
+        if new_h != content_h {
+            view.games_view.content_h = new_h;
+            ui.request_redraw();
+        }
+        return out;
+    }
     let mut header_h = preview::header(ui, view, &settings.overlay, main);
     if let Some(msg) = save_error {
         header_h += save_error_strip(ui, msg, main, main.y + header_h);
@@ -289,9 +361,11 @@ pub fn settings_frame(
     let mut new_h = content_h;
     ui.region(body, |ui| {
         ui.scroll_area(scroll_id(), body.h, content_h, |ui| {
-            new_h = content(ui, view, settings, games, hotkey_status, input, &mut out);
+            new_h = content(ui, view, settings, hotkey_status, input, &mut out);
         });
     });
+    // Room below the last section, so clicking it can bring its heading to the top.
+    new_h = new_h.max(view.headings[NAV_UPDATES] + body.h);
     let scroll = ui.scroll_offset(scroll_id());
     if clicked {
         view.nav_scroll = Some(scroll);
@@ -301,7 +375,7 @@ pub fn settings_frame(
         view.nav_scroll = None;
         let max = (content_h - body.h).max(0.0);
         view.selected = if max > 0.0 && scroll >= max - 0.5 {
-            NAV_GAMES
+            NAV_UPDATES
         } else {
             view.headings
                 .iter()
@@ -344,8 +418,8 @@ fn save_error_strip(ui: &mut Ui, msg: &str, main: Rect, top: f32) -> f32 {
     y + PAD_Y - 2.0 - top
 }
 
-/// Returns whether a section was clicked.
-fn sidebar(ui: &mut Ui, view: &mut SettingsView, side: Rect) -> bool {
+/// Returns whether a Settings section was clicked.
+fn sidebar(ui: &mut Ui, view: &mut SettingsView, side: Rect, out: &mut Vec<UiAction>) -> bool {
     let mut clicked = false;
     ui.paint(Cmd::Fill {
         rect: side,
@@ -378,7 +452,8 @@ fn sidebar(ui: &mut Ui, view: &mut SettingsView, side: Rect) -> bool {
             ui.label("Lite Bar", TextStyle::BOLD, theme::TEXT);
         });
         ui.space(14.0);
-        settings_header(ui);
+        let on_settings = view.page == WindowPage::Settings;
+        settings_header(ui, on_settings);
         let item = |label| SidebarItem {
             label,
             indent: true,
@@ -391,12 +466,35 @@ fn sidebar(ui: &mut Ui, view: &mut SettingsView, side: Rect) -> bool {
             item("General"),
             item("Hotkeys"),
             item("Updates"),
-            item("Games"),
         ];
-        if let Some(i) = ui.sidebar(id("settings.nav"), &items, &mut view.selected) {
+        let mut selected = if on_settings {
+            view.selected
+        } else {
+            usize::MAX
+        };
+        if let Some(i) = ui.sidebar(id("settings.nav"), &items, &mut selected) {
+            view.selected = i;
+            if !on_settings {
+                view.switch_page(WindowPage::Settings, out);
+            }
             // Any click scrolls, also on the selected section.
             ui.set_scroll(scroll_id(), view.headings[i]);
             clicked = true;
+        }
+        ui.space(14.0);
+        let games = [SidebarItem {
+            label: "Games",
+            indent: false,
+            enabled: true,
+            note: None,
+        }];
+        let mut selected = if on_settings { usize::MAX } else { 0 };
+        if ui
+            .sidebar(id("settings.nav.games"), &games, &mut selected)
+            .is_some()
+            && on_settings
+        {
+            view.switch_page(WindowPage::Games, out);
         }
         ui.space(14.0);
         let later = |label, note| SidebarItem {
@@ -405,31 +503,30 @@ fn sidebar(ui: &mut Ui, view: &mut SettingsView, side: Rect) -> bool {
             enabled: false,
             note: Some(note),
         };
-        let future = [
-            later("Sound mixer", "soon"),
-            later("Optimize", "later"),
-            later("History", "later"),
-        ];
+        let future = [later("Sound mixer", "soon"), later("Optimize", "later")];
         let mut none = usize::MAX;
         ui.sidebar(id("settings.nav.later"), &future, &mut none);
     });
     clicked
 }
 
-/// The always-on "Settings" header above its sections, drawn like a selected item.
-fn settings_header(ui: &mut Ui) {
+/// The "Settings" header above its sections, drawn like a selected item while the Settings
+/// page is shown.
+fn settings_header(ui: &mut Ui, active: bool) {
     let a = ui.available();
     let rect = Rect::new(a.x, a.y, a.w, theme::NAV_H);
-    ui.paint(Cmd::Fill {
-        rect,
-        color: theme::SURFACE,
-        radius: theme::NAV_RADIUS,
-    });
-    ui.paint(Cmd::Fill {
-        rect: Rect::new(rect.x, rect.y, 3.0, rect.h),
-        color: theme::ACCENT,
-        radius: 0.0,
-    });
+    if active {
+        ui.paint(Cmd::Fill {
+            rect,
+            color: theme::SURFACE,
+            radius: theme::NAV_RADIUS,
+        });
+        ui.paint(Cmd::Fill {
+            rect: Rect::new(rect.x, rect.y, 3.0, rect.h),
+            color: theme::ACCENT,
+            radius: 0.0,
+        });
+    }
     let h = ui.text_measure().measure("Settings", TextStyle::BODY).1;
     ui.paint(Cmd::Text {
         pos: Pt {
@@ -438,7 +535,11 @@ fn settings_header(ui: &mut Ui) {
         },
         text: "Settings".to_string(),
         style: TextStyle::BODY,
-        color: theme::SIDEBAR_SELECTED_TEXT,
+        color: if active {
+            theme::SIDEBAR_SELECTED_TEXT
+        } else {
+            theme::TEXT
+        },
     });
     ui.space(theme::NAV_H + theme::NAV_SPACING);
 }
@@ -448,7 +549,6 @@ fn content(
     ui: &mut Ui,
     view: &mut SettingsView,
     settings: &Settings,
-    games: &[GameRow],
     hotkey_status: Option<&str>,
     input: PageInput,
     out: &mut Vec<UiAction>,
@@ -473,8 +573,6 @@ fn content(
         hotkeys::section(ui, view, settings, hotkey_status, out);
         view.headings[NAV_UPDATES] = heading(ui, "UPDATES", 16.0) - first;
         updates::section(ui, settings, input.updates, out);
-        view.headings[NAV_GAMES] = heading(ui, "GAMES", 16.0) - first;
-        games::section(ui, view, games, &settings.not_games, out);
         restore_row(ui, view, out);
         bottom = ui.available().y;
     });

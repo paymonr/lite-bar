@@ -150,6 +150,8 @@ impl App {
             }
             UiAction::SetStartup(on) => self.set_startup(on),
             UiAction::InstallToProgramFiles => self.start_move(),
+            // The Games page's live updates come with the next change (plan Task 7).
+            UiAction::ShowPage(_) => {}
             UiAction::StartHotkeyCapture => self.start_hotkey_capture(),
             UiAction::CancelHotkeyCapture => {
                 if self.end_hotkey_capture() {

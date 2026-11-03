@@ -7,7 +7,7 @@ fn sidebar_switches_page() {
     p.click_text("Hotkeys");
     assert_eq!(p.view.selected, NAV_HOTKEYS);
     // Disabled future pages cannot be selected.
-    p.click_text("History");
+    p.click_text("Optimize");
     assert_eq!(p.view.selected, NAV_HOTKEYS);
 }
 
@@ -38,7 +38,7 @@ fn content_height_change_asks_for_a_redraw() {
     let mut p = Page::new(TALL);
     p.idle();
     assert_eq!(p.frame().redraw_after_ms, None);
-    p.games.clear();
+    p.install_offer = true;
     p.idle();
     assert_eq!(p.frame().redraw_after_ms, Some(p.now));
 }
@@ -97,13 +97,11 @@ fn wheel_scrolling_moves_the_highlight() {
 #[test]
 fn clicked_last_section_stays_selected_at_the_bottom() {
     let mut p = Page::new(MOCKUP);
-    p.click_text("Games");
+    p.click_text("Updates");
     p.idle();
-    // The page cannot scroll far enough to bring the heading to the top.
-    assert!(p.scroll() < p.view.headings[NAV_GAMES]);
-    assert_eq!(p.view.selected, NAV_GAMES);
+    assert_eq!(p.view.selected, NAV_UPDATES);
     p.idle();
-    assert_eq!(p.view.selected, NAV_GAMES);
+    assert_eq!(p.view.selected, NAV_UPDATES);
 }
 
 #[test]
@@ -129,11 +127,7 @@ fn scrolling_to_the_bottom_highlights_the_last_section() {
         last = p.scroll();
         p.wheel(-5.0);
     }
-    assert!(p.scroll() < p.view.headings[NAV_GAMES]);
-    assert_eq!(p.view.selected, NAV_GAMES);
-    // Scrolling back up a little leaves the bottom.
-    p.wheel(1.0);
-    assert_ne!(p.view.selected, NAV_GAMES);
+    assert_eq!(p.view.selected, NAV_UPDATES);
 }
 
 #[test]
@@ -165,9 +159,8 @@ fn nav_order_matches_the_page() {
             NAV_APPEARANCE,
             NAV_GENERAL,
             NAV_HOTKEYS,
-            NAV_UPDATES,
-            NAV_GAMES
+            NAV_UPDATES
         ],
-        [0, 1, 2, 3, 4, 5]
+        [0, 1, 2, 3, 4]
     );
 }

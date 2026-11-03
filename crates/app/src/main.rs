@@ -1689,24 +1689,25 @@ mod app {
         /// committing it.
         fn type_uncommitted_game_name(app: &mut App, name: &str) {
             use windows::Win32::UI::WindowsAndMessaging::{
-                WM_CHAR, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+                WM_CHAR, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
             };
             app.open_settings_hidden();
             let ui = app.settings_ui.as_ref().unwrap();
+            let click = |(x, y): (i32, i32)| {
+                ui.send_msg(WM_MOUSEMOVE, 0, at(x, y));
+                ui.send_msg(WM_LBUTTONDOWN, 1, at(x, y));
+                ui.send_msg(WM_LBUTTONUP, 0, at(x, y));
+                ui.paint();
+            };
             ui.paint();
-            let s = ui.scale();
-            let mid = at((450.0 * s) as i32, (400.0 * s) as i32);
-            ui.send_msg(WM_MOUSEMOVE, 0, mid);
-            for _ in 0..30 {
-                ui.send_msg(WM_MOUSEWHEEL, ((-120i16) as u16 as usize) << 16, mid);
-            }
+            click(ui.find_any_text_px("Games").expect("the Games item"));
             ui.paint();
-            let (x, y) = ui
-                .find_text_px("Minecraft", lite_bar_core::ui::theme::PLACEHOLDER)
-                .expect("the game's empty name field");
-            ui.send_msg(WM_MOUSEMOVE, 0, at(x, y));
-            ui.send_msg(WM_LBUTTONDOWN, 1, at(x, y));
-            ui.send_msg(WM_LBUTTONUP, 0, at(x, y));
+            // Clicking the name opens its rename field, focused from the next frame on.
+            click(
+                ui.find_text_px("Minecraft", lite_bar_core::ui::theme::TEXT)
+                    .expect("the game's name"),
+            );
+            ui.paint();
             for c in name.chars() {
                 ui.send_msg(WM_CHAR, c as usize, 0);
             }

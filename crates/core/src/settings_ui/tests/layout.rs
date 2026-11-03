@@ -38,11 +38,13 @@ fn check(f: &Frame, w: f32, h: f32, scroll: f32) {
         }
     }
     // Scrolling content is clipped to the viewport under the header.
-    let s = stage(f);
-    let top = s.bottom() + 13.0;
+    // The Settings page scrolls under its preview; the Games page has none.
+    let top = find_stage(f).map_or(0.0, |s| s.bottom() + 13.0);
     let viewport = Rect::new(SIDEBAR_W + 1.0, top, w, h - top);
     for (text, r) in text_rects(f) {
-        let r = if r.x >= SIDEBAR_W && r.y >= s.bottom() {
+        // Page text reaching into the scrolling area is clipped to it (the header's text
+        // ends above it).
+        let r = if r.x >= SIDEBAR_W && r.bottom() > top {
             r.intersect(viewport)
         } else {
             r
@@ -171,7 +173,7 @@ fn mixer_buttons_wrap_at_the_minimum_width() {
 }
 
 #[test]
-fn not_games_and_the_install_row_lay_out_cleanly() {
+fn the_install_row_lays_out_cleanly() {
     for w in [MIN_WINDOW_DIP.0, 1100.0] {
         for status in [
             MoveStatus::Idle,
@@ -185,20 +187,73 @@ fn not_games_and_the_install_row_lay_out_cleanly() {
                 "A Game With A Really Quite Long Name",
                 None,
             ));
-            p.settings
-                .not_games
-                .insert(game_key_of("eldenring.exe"), "Elden Ring".to_string());
-            p.settings.not_games.insert(
-                "gone".to_string(),
-                "An App Whose Stats Are Gone".to_string(),
-            );
             p.install_offer = true;
             p.move_status = status;
             p.elevated = false;
             p.idle();
             p.idle();
-            assert!(find_text(p.frame(), "Not games").is_some());
             check(p.frame(), w, 3000.0, 0.0);
         }
+    }
+}
+
+/// The Games page at `w`×`h` with 20 long-named games, on `tab` ("Games 20" or "Other
+/// apps 5"), scrolled through.
+fn check_games_page(w: f32, h: f32, other_apps: bool) {
+    let mut p = Page::with_measure(Rect::new(0.0, 0.0, w, h), &CONSERVATIVE);
+    p.games = (0..20)
+        .map(|i| {
+            let exe = format!(
+                "C:\\Games\\Some Very Long Game Folder {i}\\a-game-with-a-really-long-name-{i}.exe"
+            );
+            GameRow {
+                sessions: 1234,
+                play_secs: 3_600_000.0,
+                ..game(
+                    &exe,
+                    &format!("A Game With A Really Quite Long Name {i}"),
+                    None,
+                )
+            }
+        })
+        .collect();
+    for g in p.games.iter().take(5) {
+        p.settings
+            .not_games
+            .insert(g.key.clone(), g.stored_name.clone());
+    }
+    p.show_games();
+    if other_apps {
+        p.click_text("Other apps 5");
+        p.idle();
+    }
+    p.idle();
+    let max = (p.view.games_content_h() - (h - 60.0)).max(0.0) + 200.0;
+    let mut scroll = 0.0;
+    while scroll <= max {
+        p.st.scroll.insert(id("games.scroll"), scroll);
+        p.idle();
+        check(p.frame(), w, h, scroll);
+        scroll += 60.0;
+    }
+}
+
+#[test]
+fn games_page_lays_out_cleanly() {
+    for (w, h) in [MIN_WINDOW_DIP, (1100.0, 800.0)] {
+        for other_apps in [false, true] {
+            check_games_page(w, h, other_apps);
+        }
+    }
+}
+
+#[test]
+fn narrow_table_drops_sessions_and_last() {
+    for (w, wide) in [(MIN_WINDOW_DIP.0, false), (1100.0, true)] {
+        let mut p = Page::with_measure(Rect::new(0.0, 0.0, w, 800.0), &CONSERVATIVE);
+        p.show_games();
+        assert_eq!(find_text(p.frame(), "SESSIONS").is_some(), wide, "w {w}");
+        assert_eq!(find_text(p.frame(), "LAST").is_some(), wide, "w {w}");
+        assert!(find_text(p.frame(), "PLAYED").is_some());
     }
 }

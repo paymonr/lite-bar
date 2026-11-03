@@ -17,13 +17,14 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use lite_bar_core::game_name::find_override;
+use lite_bar_core::history::LocalTime;
 use lite_bar_core::hotkey::Hotkey;
 use lite_bar_core::install::MoveStatus;
 use lite_bar_core::settings::Settings;
 use lite_bar_core::settings_edit::apply_change;
 use lite_bar_core::settings_ui::{
-    settings_frame, GameRow, InstallInput, PageInput, SettingsView, StartupInput, UiAction,
-    UpdatesInput, MIN_WINDOW_DIP,
+    settings_frame, GameRow, GamesInput, InstallInput, PageInput, SettingsView, StartupInput,
+    UiAction, UpdatesInput, MIN_WINDOW_DIP,
 };
 use lite_bar_core::startup_task::StartupState;
 use lite_bar_core::ui::{HotkeyCapture, Ui};
@@ -236,6 +237,10 @@ impl UiApp for SettingsPage {
                 install: InstallInput {
                     offer: st.install_offer,
                     status: &st.move_status,
+                },
+                games: GamesInput {
+                    now: LocalTime::default(),
+                    live: None,
                 },
             },
         );
@@ -512,6 +517,19 @@ impl SettingsUi {
                 color: c,
                 ..
             } if t == text && c == color => Some((
+                ((pos.x + 4.0) * s).round() as i32,
+                ((pos.y + 4.0) * s).round() as i32,
+            )),
+            _ => None,
+        })
+    }
+
+    /// Where the first `text` is drawn, in any color.
+    #[cfg(test)]
+    pub fn find_any_text_px(&self, text: &str) -> Option<(i32, i32)> {
+        let s = self.window.scale();
+        self.window.cmds().into_iter().find_map(|c| match c {
+            lite_bar_core::ui::Cmd::Text { pos, text: t, .. } if t == text => Some((
                 ((pos.x + 4.0) * s).round() as i32,
                 ((pos.y + 4.0) * s).round() as i32,
             )),
