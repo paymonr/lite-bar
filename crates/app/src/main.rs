@@ -1702,11 +1702,8 @@ mod app {
             ui.paint();
             click(ui.find_any_text_px("Games").expect("the Games item"));
             ui.paint();
-            // Clicking the name opens its rename field, focused from the next frame on.
-            click(
-                ui.find_text_px("Minecraft", lite_bar_core::ui::theme::TEXT)
-                    .expect("the game's name"),
-            );
+            // The card's Rename opens the game's rename field, focused from the next frame on.
+            click(ui.find_any_text_px("Rename").expect("the card's Rename"));
             ui.paint();
             for c in name.chars() {
                 ui.send_msg(WM_CHAR, c as usize, 0);

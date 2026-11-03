@@ -1,13 +1,15 @@
-//! The Games page: "Open stats folder", the Games | Other apps tabs and a table of what Lite
-//! Bar recorded. Clicking a game's name renames it; "Not a game" moves it to Other apps and
+//! The Games page: "Open stats folder", a card for the game being played (or played last),
+//! the Games | Other apps tabs and a table of what Lite Bar recorded. Clicking a game's name renames it; "Not a game" moves it to Other apps and
 //! "It's a game" moves it back (both are `[not_games]` changes, applied by the host).
 
 use super::games_text::{fps_whole, last_played_text, played_short};
 use super::{
     button_width, ellipsize, end_card, paint_centered, row_line, setting_row, text_block, GameEdit,
-    GameRow, GamesInput, SettingsView, UiAction, GAMES_HINT, HEADING, HINT, PAGE_PAD_X, ROW_H,
-    SCROLL_PAD_BOTTOM, SCROLL_PAD_TOP,
+    GameRow, GamesInput, LiveGame, SettingsView, UiAction, GAMES_HINT, HEADING, HINT, PAGE_PAD_X,
+    ROW_H, SCROLL_PAD_BOTTOM, SCROLL_PAD_TOP,
 };
+use std::collections::BTreeMap;
+
 use crate::history::LocalTime;
 use crate::settings::Settings;
 use crate::settings_edit::SettingsChange;
@@ -97,6 +99,10 @@ pub(super) fn content(
             },
         );
         ui.space(14.0);
+        if let Some(card) = active_card(games, &settings.not_games, input.live) {
+            active_game(ui, view, &card, input.now, out);
+            ui.space(4.0);
+        }
         table(ui, view, settings, games, input.now, out);
         bottom = ui.available().y;
     });
@@ -464,8 +470,7 @@ fn name_cell(
         );
     });
     if clicked {
-        view.games_view.editing = Some(game.exe_path.clone());
-        ui.focus(field);
+        start_rename(ui, view, game, out);
     }
 }
 
@@ -487,4 +492,264 @@ fn paint_right(ui: &mut Ui, right: f32, y: f32, text: &str, style: TextStyle, co
 /// The last path component, for showing `C:\Games\x.exe` as `x.exe`.
 fn file_name(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
+/// What the card on top shows.
+#[derive(Debug)]
+pub(super) enum Card<'a> {
+    /// The open session that had the focus last, with its game's row when it has one.
+    Playing {
+        live: &'a LiveGame,
+        row: Option<&'a GameRow>,
+    },
+    /// Nothing is playing: the game played last.
+    LastPlayed(&'a GameRow),
+}
+
+/// The card's game: the live one unless it's marked "Not a game", else the unmarked game
+/// played last; `None` when there's neither.
+pub(super) fn active_card<'a>(
+    games: &'a [GameRow],
+    not_games: &BTreeMap<String, String>,
+    live: Option<&'a LiveGame>,
+) -> Option<Card<'a>> {
+    if let Some(live) = live.filter(|l| !not_games.contains_key(&l.key)) {
+        let row = games.iter().find(|g| g.key == live.key);
+        return Some(Card::Playing { live, row });
+    }
+    games
+        .iter()
+        .filter(|g| !not_games.contains_key(&g.key))
+        .max_by_key(|g| g.last_played)
+        .map(Card::LastPlayed)
+}
+
+const CARD_TILE: f32 = 40.0;
+const CARD_TOP_H: f32 = 44.0;
+const PANEL_H: f32 = 74.0;
+/// Below this width the two panels stack.
+const PANELS_SIDE_BY_SIDE_W: f32 = 560.0;
+const PLAYING: Rgba = Rgba(0x7C, 0xFC, 0x7C, 255);
+const PANEL_BG: Rgba = Rgba(0x1F, 0x21, 0x27, 255);
+const RENAME: &str = "Rename";
+const BIG: TextStyle = TextStyle {
+    size: 22.0,
+    bold: true,
+    mono: true,
+};
+const MONO_BIG: TextStyle = TextStyle {
+    size: 16.0,
+    bold: false,
+    mono: true,
+};
+
+/// One panel's three numbers with their captions.
+struct Panel {
+    title: &'static str,
+    values: [(String, String); 3],
+    /// The first value in the overlay's green (the live session).
+    live: bool,
+}
+
+fn dashes(captions: [&str; 3]) -> [(String, String); 3] {
+    captions.map(|c| ("—".to_string(), c.to_string()))
+}
+
+/// The card's two panels: this or the last session, and all time.
+fn panels(card: &Card, row: Option<&GameRow>) -> (Panel, Panel) {
+    let first = match card {
+        Card::Playing { live, .. } => Panel {
+            title: "THIS SESSION",
+            values: match live.session {
+                Some(s) => [
+                    (fps_whole(Some(s.avg_fps)), "avg FPS".into()),
+                    (fps_whole(Some(s.low_1pct_fps)), "1% low".into()),
+                    (played_short(s.play_secs), "so far".into()),
+                ],
+                None => dashes(["avg FPS", "1% low", "so far"]),
+            },
+            live: true,
+        },
+        Card::LastPlayed(r) => Panel {
+            title: "LAST SESSION",
+            values: match r.last_session {
+                Some(l) => [
+                    (fps_whole(Some(l.avg_fps)), "avg FPS".into()),
+                    (fps_whole(Some(l.low_1pct_fps)), "1% low".into()),
+                    (played_short(l.play_secs), "played".into()),
+                ],
+                None => dashes(["avg FPS", "1% low", "played"]),
+            },
+            live: false,
+        },
+    };
+    let all_time = Panel {
+        title: "ALL TIME",
+        values: match row {
+            Some(r) => [
+                (fps_whole(r.summary.map(|s| s.avg_fps)), "avg FPS".into()),
+                (
+                    fps_whole(r.summary.map(|s| s.low_1pct_fps)),
+                    "1% low".into(),
+                ),
+                (
+                    played_short(r.play_secs),
+                    format!(
+                        "{} session{}",
+                        r.sessions,
+                        if r.sessions == 1 { "" } else { "s" }
+                    ),
+                ),
+            ],
+            None => dashes(["avg FPS", "1% low", "played"]),
+        },
+        live: false,
+    };
+    (first, all_time)
+}
+
+fn active_game(
+    ui: &mut Ui,
+    view: &mut SettingsView,
+    card: &Card,
+    now: LocalTime,
+    out: &mut Vec<UiAction>,
+) {
+    let (name, key, row, badge) = match card {
+        Card::Playing { live, row } => (
+            live.name.clone(),
+            live.key.clone(),
+            *row,
+            "PLAYING NOW".to_string(),
+        ),
+        Card::LastPlayed(row) => (
+            row.override_name.clone().unwrap_or(row.stored_name.clone()),
+            row.key.clone(),
+            Some(*row),
+            format!("LAST PLAYED · {}", last_played_text(row.last_played, now)),
+        ),
+    };
+    let (first, all_time) = panels(card, row);
+    let playing = matches!(card, Card::Playing { .. });
+
+    ui.card(|ui| {
+        ui.row(CARD_TOP_H, |ui| {
+            let r = ui.available();
+            let tile = Rect::new(
+                r.x,
+                r.y + (CARD_TOP_H - CARD_TILE) / 2.0,
+                CARD_TILE,
+                CARD_TILE,
+            );
+            ui.paint(Cmd::Fill {
+                rect: tile,
+                color: theme::BUTTON_BG,
+                radius: 8.0,
+            });
+            paint_centered(ui, tile, &initial(&name), TextStyle::BOLD, theme::TEXT);
+
+            // On the right: Not a game, and Rename for a game the stats already list.
+            let by = r.y + (CARD_TOP_H - theme::CONTROL_HEIGHT) / 2.0;
+            let mark_w = button_width(ui, NOT_A_GAME);
+            let mark = Rect::new(r.right() - mark_w, by, mark_w, theme::CONTROL_HEIGHT);
+            let mut marked = false;
+            ui.place(mark, |ui| {
+                marked = ui.button(id("games.card.mark"), NOT_A_GAME)
+            });
+            if marked {
+                out.push(UiAction::Change(SettingsChange::NotAGame {
+                    key: key.clone(),
+                    name: Some(name.clone()),
+                }));
+            }
+            let mut left = mark.x;
+            if let Some(row) = row {
+                let w = button_width(ui, RENAME);
+                left = mark.x - COL_GAP - w;
+                let rect = Rect::new(left, by, w, theme::CONTROL_HEIGHT);
+                let mut clicked = false;
+                ui.place(rect, |ui| {
+                    clicked = ui.button(id("games.card.rename"), RENAME)
+                });
+                if clicked {
+                    start_rename(ui, view, row, out);
+                }
+            }
+
+            let text_x = tile.right() + 12.0;
+            let text_w = (left - COL_GAP - text_x).max(0.0);
+            let badge_color = if playing { PLAYING } else { theme::MUTED };
+            let badge = ellipsize(ui, &badge, HEADING, text_w);
+            paint_text(ui, text_x, r.y + 4.0, &badge, HEADING, badge_color);
+            let shown = ellipsize(ui, &name, TextStyle::BOLD, text_w);
+            paint_text(ui, text_x, r.y + 22.0, &shown, TextStyle::BOLD, theme::TEXT);
+        });
+        ui.space(10.0);
+        if ui.available().w >= PANELS_SIDE_BY_SIDE_W {
+            ui.row(PANEL_H, |ui| {
+                let r = ui.available();
+                let half = (r.w - 12.0) / 2.0;
+                panel(ui, Rect::new(r.x, r.y, half, PANEL_H), &first);
+                panel(
+                    ui,
+                    Rect::new(r.x + half + 12.0, r.y, half, PANEL_H),
+                    &all_time,
+                );
+            });
+        } else {
+            ui.row(PANEL_H, |ui| {
+                let r = ui.available();
+                panel(ui, r, &first);
+            });
+            ui.space(8.0);
+            ui.row(PANEL_H, |ui| {
+                let r = ui.available();
+                panel(ui, r, &all_time);
+            });
+        }
+    });
+    end_card(ui);
+}
+
+fn panel(ui: &mut Ui, rect: Rect, p: &Panel) {
+    ui.paint(Cmd::Fill {
+        rect,
+        color: PANEL_BG,
+        radius: 6.0,
+    });
+    let x = rect.x + 12.0;
+    paint_text(ui, x, rect.y + 8.0, p.title, HEADING, theme::MUTED);
+    let col_w = ((rect.w - 24.0) / 3.0).max(0.0);
+    let base = rect.y + 52.0;
+    for (i, (value, caption)) in p.values.iter().enumerate() {
+        let vx = x + col_w * i as f32;
+        let (style, color) = match (i, p.live) {
+            (0, true) => (BIG, PLAYING),
+            (0, false) => (BIG, theme::TEXT),
+            _ => (MONO_BIG, theme::TEXT),
+        };
+        let value = ellipsize(ui, value, style, (col_w - 8.0).max(0.0));
+        let vh = ui.text_measure().measure(&value, style).1;
+        paint_text(ui, vx, base - vh, &value, style, color);
+        let caption = ellipsize(ui, caption, HINT, (col_w - 8.0).max(0.0));
+        paint_text(ui, vx, base + 2.0, &caption, HINT, theme::MUTED);
+    }
+}
+
+/// The first letter of `name`, upper case, for the letter tile.
+fn initial(name: &str) -> String {
+    name.chars()
+        .next()
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_default()
+}
+
+/// Starts renaming `row` in the table, switching to the Games tab if needed.
+fn start_rename(ui: &mut Ui, view: &mut SettingsView, row: &GameRow, out: &mut Vec<UiAction>) {
+    if view.games_view.tab != GamesTab::Games {
+        out.extend(view.finish_edits());
+        view.games_view.tab = GamesTab::Games;
+    }
+    view.games_view.editing = Some(row.exe_path.clone());
+    ui.focus(id(&format!("settings.game:{}", row.exe_path)));
 }

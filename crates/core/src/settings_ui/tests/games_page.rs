@@ -163,7 +163,12 @@ fn tabs_show_counts_and_switch() {
     p.click_text("Other apps 1");
     p.idle();
     assert!(find_text(p.frame(), "It's a game").is_some());
-    assert!(find_text(p.frame(), "Not a game").is_none());
+    // Only the card on top still offers it.
+    let n = texts(p.frame())
+        .iter()
+        .filter(|t| t.1 == "Not a game")
+        .count();
+    assert_eq!(n, 1);
 }
 
 #[test]
@@ -458,4 +463,201 @@ fn renaming_a_file_name_override_edits_that_key() {
         p.settings.game_names.iter().collect::<Vec<_>>(),
         vec![(&"javaw.exe".to_string(), &"Minecraft Mods".to_string())]
     );
+}
+
+// ---- The active game card ----
+
+use crate::settings_ui::games_page::{active_card, Card};
+
+fn summary(avg: f64, low: f64, secs: f64) -> StatsSummary {
+    StatsSummary {
+        frames: 1000,
+        play_secs: secs,
+        avg_fps: avg,
+        low_1pct_fps: low,
+        high_1pct_fps: avg * 2.0,
+    }
+}
+
+fn live(exe: &str, name: &str) -> LiveGame {
+    LiveGame {
+        key: game_key_of(exe),
+        name: name.to_string(),
+        exe_path: exe.to_string(),
+        session: Some(summary(141.0, 72.0, 2534.0)),
+    }
+}
+
+fn played(exe: &str, name: &str, last: LocalTime) -> GameRow {
+    GameRow {
+        last_played: last,
+        sessions: 14,
+        play_secs: 49_906.0,
+        summary: Some(summary(135.8, 66.0, 49_906.0)),
+        last_session: Some(crate::history::LastSession {
+            start: today(12, 11),
+            end: last,
+            play_secs: 391.0,
+            avg_fps: 128.0,
+            low_1pct_fps: 61.0,
+            high_1pct_fps: 200.0,
+        }),
+        ..game(exe, name, None)
+    }
+}
+
+#[test]
+fn the_live_game_is_playing_now_with_its_row() {
+    let games = [
+        played("a.exe", "A", today(9, 0)),
+        played("b.exe", "B", today(12, 0)),
+    ];
+    let l = live("a.exe", "A");
+    match active_card(&games, &BTreeMap::new(), Some(&l)) {
+        Some(Card::Playing { live, row }) => {
+            assert_eq!(live.key, l.key);
+            assert_eq!(row.map(|r| r.key.as_str()), Some(games[0].key.as_str()));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_first_session_plays_without_a_row() {
+    let games = [played("b.exe", "B", today(12, 0))];
+    let l = live("new.exe", "New");
+    assert!(matches!(
+        active_card(&games, &BTreeMap::new(), Some(&l)),
+        Some(Card::Playing { row: None, .. })
+    ));
+}
+
+#[test]
+fn a_marked_live_game_is_not_playing_now() {
+    let games = [
+        played("a.exe", "A", today(12, 0)),
+        played("b.exe", "B", today(9, 0)),
+    ];
+    let marked: BTreeMap<String, String> = [(game_key_of("a.exe"), "A".to_string())].into();
+    let l = live("a.exe", "A");
+    match active_card(&games, &marked, Some(&l)) {
+        Some(Card::LastPlayed(row)) => assert_eq!(row.stored_name, "B"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn without_a_live_game_the_newest_unmarked_game_is_last_played() {
+    let games = [
+        played("a.exe", "A", today(9, 0)),
+        played("b.exe", "B", today(12, 0)),
+    ];
+    match active_card(&games, &BTreeMap::new(), None) {
+        Some(Card::LastPlayed(row)) => assert_eq!(row.stored_name, "B"),
+        other => panic!("{other:?}"),
+    }
+    assert!(active_card(&[], &BTreeMap::new(), None).is_none());
+}
+
+/// The Games page with Minecraft (played today 12:18) and Elden Ring (earlier).
+fn card_page(playing: bool) -> Page {
+    let mut p = Page::new(Rect::new(0.0, 0.0, 1100.0, 3000.0));
+    p.games = vec![
+        played("javaw.exe", "Minecraft", today(12, 18)),
+        GameRow {
+            override_name: Some("Elden Ring".to_string()),
+            ..played("eldenring.exe", "ELDEN RING", today(8, 0))
+        },
+    ];
+    p.games[1].override_key = Some("eldenring.exe".to_string());
+    if playing {
+        p.live = Some(live("javaw.exe", "Minecraft"));
+    }
+    p.show_games();
+    p
+}
+
+#[test]
+fn playing_card_shows_this_session_and_all_time() {
+    let p = card_page(true);
+    for text in [
+        "PLAYING NOW",
+        "THIS SESSION",
+        "ALL TIME",
+        "141",
+        "72",
+        "0:42",
+        "14 sessions",
+    ] {
+        assert!(find_text(p.frame(), text).is_some(), "missing {text:?}");
+    }
+    let card = find_text(p.frame(), "PLAYING NOW").unwrap().0.y;
+    let tabs = find_text(p.frame(), "Games 2").unwrap().0.y;
+    assert!(card < tabs, "the card sits above the tabs");
+}
+
+#[test]
+fn playing_card_without_numbers_yet_shows_dashes() {
+    let mut p = card_page(true);
+    p.live.as_mut().unwrap().session = None;
+    p.idle();
+    let dashes = texts(p.frame()).iter().filter(|t| t.1 == "—").count();
+    assert!(dashes >= 3, "avg, 1% low and time: {dashes}");
+}
+
+#[test]
+fn last_played_card_shows_when_and_last_session() {
+    let p = card_page(false);
+    for text in [
+        "LAST PLAYED · Today 12:18",
+        "LAST SESSION",
+        "ALL TIME",
+        "128",
+        "61",
+        "0:06",
+    ] {
+        assert!(find_text(p.frame(), text).is_some(), "missing {text:?}");
+    }
+    assert!(find_text(p.frame(), "PLAYING NOW").is_none());
+}
+
+#[test]
+fn no_card_without_games() {
+    let mut p = games_page();
+    p.games.clear();
+    p.idle();
+    assert!(find_text(p.frame(), "ALL TIME").is_none());
+}
+
+/// Clicks `label` nearest below `anchor` (the card's badge).
+fn click_in_card(p: &mut Page, anchor: &str, label: &str) -> Vec<UiAction> {
+    let y = find_text(p.frame(), anchor).unwrap().0.y;
+    let at = texts(p.frame())
+        .into_iter()
+        .filter(|t| t.1 == label)
+        .min_by(|a, b| (a.0.y - y).abs().total_cmp(&(b.0.y - y).abs()))
+        .unwrap()
+        .0;
+    p.click(Pt {
+        x: at.x + 2.0,
+        y: at.y + 4.0,
+    })
+}
+
+#[test]
+fn card_buttons_rename_and_mark() {
+    let mut p = card_page(true);
+    let a = click_in_card(&mut p, "PLAYING NOW", "Not a game");
+    assert_eq!(
+        changes(&a),
+        vec![not_a_game(&game_key_of("javaw.exe"), Some("Minecraft"))]
+    );
+    let mut p = card_page(false);
+    p.click_text("Other apps 0");
+    p.idle();
+    click_in_card(&mut p, "LAST PLAYED · Today 12:18", "Rename");
+    p.idle();
+    p.typing("Craft");
+    let a = p.keys(vec![key(UiKey::Enter)]);
+    assert_eq!(changes(&a), vec![rename("javaw.exe", Some("Craft"))]);
 }

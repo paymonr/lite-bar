@@ -257,3 +257,39 @@ fn narrow_table_drops_sessions_and_last() {
         assert!(find_text(p.frame(), "PLAYED").is_some());
     }
 }
+
+#[test]
+fn games_page_card_states_lay_out_cleanly() {
+    let summary = crate::frame_stats::StatsSummary {
+        frames: 1000,
+        play_secs: 360_000.0,
+        avg_fps: 1234.0,
+        low_1pct_fps: 999.0,
+        high_1pct_fps: 2000.0,
+    };
+    for (w, h) in [MIN_WINDOW_DIP, (1100.0, 800.0)] {
+        for playing in [false, true] {
+            let mut p = Page::with_measure(Rect::new(0.0, 0.0, w, h), &CONSERVATIVE);
+            p.games = vec![GameRow {
+                sessions: 1234,
+                play_secs: 3_600_000.0,
+                summary: Some(summary),
+                ..game(
+                    "C:\\Games\\Long\\a-game-with-a-really-long-name.exe",
+                    "A Game With A Really Quite Long Name That Goes On",
+                    None,
+                )
+            }];
+            if playing {
+                p.live = Some(LiveGame {
+                    key: "live".to_string(),
+                    name: "Another Game With A Really Quite Long Name".to_string(),
+                    exe_path: "C:\\x.exe".to_string(),
+                    session: Some(summary),
+                });
+            }
+            p.show_games();
+            check(p.frame(), w, h, 0.0);
+        }
+    }
+}
