@@ -141,7 +141,10 @@ fn updates_nav_scrolls_as_far_as_the_page_goes() {
     assert_eq!(p.view.selected, NAV_UPDATES);
     let y = find_text(p.frame(), "UPDATES").expect("in view").0.y;
     assert!(y < MIN_WINDOW_DIP.1, "the heading is on screen");
-    assert!(find_text(p.frame(), "Restore defaults").is_some(), "at the bottom");
+    assert!(
+        find_text(p.frame(), "Restore defaults").is_some(),
+        "at the bottom"
+    );
 }
 
 #[test]
@@ -178,5 +181,8 @@ fn the_page_ends_at_restore_defaults() {
     }
     let (pos, style, _) = find_text(p.frame(), "Restore defaults").expect("visible at the bottom");
     let below = MOCKUP.h - (pos.y + style.size);
-    assert!(below < 80.0, "{below} px of blank space under Restore defaults");
+    assert!(
+        below < 80.0,
+        "{below} px of blank space under Restore defaults"
+    );
 }

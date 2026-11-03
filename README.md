@@ -76,11 +76,11 @@ The overlay toggles with `Ctrl+Alt+Shift+L` by default.
 
 - A card on top shows the game you're playing: **PLAYING NOW** with this session's average FPS, 1% low and play time so far, next to the game's **ALL TIME** numbers. While you look at the window the game doesn't have the focus, so these numbers hold still; with the window on another screen they keep counting (refreshed once a second). When nothing is playing, the card shows the game you played last and its **LAST SESSION**.
 - **Games** and **Other apps** tabs, with a table of everything recorded: sessions, play time, when it was last played, average FPS and 1% low (narrow windows leave out Sessions and Last).
-- Click a game's name to rename it (Enter saves, Esc cancels). The name is saved under `[game_names]` and `games.csv` is regenerated.
+- Click a game's name, or **Rename** on the card, to rename it (Enter saves, Esc cancels); a game in its very first session is renamed right on the card. The name is saved under `[game_names]` and `games.csv` is regenerated.
 - **Not a game** takes an app that was recorded by mistake out of your stats and moves it to **Other apps**, where **It's a game** puts it back (see [Stats and history](#stats-and-history)).
 - **Open stats folder** opens the stats folder.
 
-While the Games page is shown, Lite Bar also checks once a second whether the game it shows has exited, even with the overlay off; nothing runs while the window is closed or the Settings page is shown. This page is where game history (per-session lists and charts) will grow.
+While you can see the Games page, Lite Bar also checks once a second whether the game it shows has exited, even with the overlay off. Nothing runs while the window is closed, minimized, on the Settings page, or behind the game you're playing on the same screen. This page is where game history (per-session lists and charts) will grow.
 
 The window takes about 10–20 MB while open; closing it frees all of it.
 

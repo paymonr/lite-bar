@@ -567,7 +567,7 @@ mod app {
         /// While the Games page is shown: ends sessions of exited games (the overlay's timer
         /// may be off) and shows the time and the game being played.
         fn on_games_timer(&mut self) {
-            if !self.games_page_shown {
+            if !self.games_page_shown || !self.games_page_visible() {
                 return;
             }
             self.check_sessions();
@@ -576,6 +576,28 @@ mod app {
                 ui.set_now(local_now());
                 ui.set_live(live.as_ref());
             }
+        }
+
+        /// Whether you can see the Games page: its window isn't minimized, and no game you're
+        /// playing is in front of it on the same monitor (where it would redraw unseen).
+        fn games_page_visible(&self) -> bool {
+            use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONEAREST};
+            use windows::Win32::UI::WindowsAndMessaging::IsIconic;
+            let Some(ui) = &self.settings_ui else {
+                return false;
+            };
+            let window = ui.hwnd();
+            let foreground = foreground_window();
+            let game_in_front = foreground.is_some_and(|(pid, _)| self.sessions.contains(pid));
+            // SAFETY: plain FFI on window handles; a stale handle just gives no monitor.
+            let (minimized, same_monitor) = unsafe {
+                let same = foreground.is_some_and(|(_, fg)| {
+                    MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST)
+                        == MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST)
+                });
+                (IsIconic(window).as_bool(), same)
+            };
+            games_page_in_view(minimized, game_in_front, same_monitor)
         }
 
         /// The last-focused open session as the Games page shows it.
@@ -837,6 +859,12 @@ mod app {
             start: now,
             last_alive: now,
         })
+    }
+
+    /// Whether the Games page is worth refreshing: not when minimized, nor behind a game you're
+    /// playing on the same monitor. On another monitor it keeps counting.
+    fn games_page_in_view(minimized: bool, game_in_front: bool, same_monitor: bool) -> bool {
+        !minimized && !(game_in_front && same_monitor)
     }
 
     /// Moves the foreground `pid` to the front of `order` when it has an open session; other
@@ -3495,6 +3523,18 @@ mod app {
             live_session(&mut app, r"C:\Games\a.exe", std::process::id());
             app.on_games_timer();
             assert_eq!(app.settings_ui.as_ref().unwrap().live_shown(), None);
+        }
+
+        #[test]
+        fn the_games_page_is_out_of_view_behind_a_game_or_minimized() {
+            // (minimized, a game you're playing is in front, on the same monitor)
+            assert!(
+                games_page_in_view(false, false, true),
+                "you're looking at it"
+            );
+            assert!(games_page_in_view(false, true, false), "on another monitor");
+            assert!(!games_page_in_view(false, true, true), "behind the game");
+            assert!(!games_page_in_view(true, false, false), "minimized");
         }
 
         #[test]
