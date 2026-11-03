@@ -8,6 +8,9 @@ repository.workspace = true
 [dependencies]
 lite-bar-core.workspace = true
 
+[build-dependencies]
+lite-bar-core.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = [
     "Win32_Foundation",

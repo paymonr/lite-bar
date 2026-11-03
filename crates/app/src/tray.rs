@@ -6,18 +6,16 @@ use lite_bar_core::update::Version;
 
 use windows::core::{Error, PCWSTR};
 use windows::Win32::Foundation::{HWND, POINT};
-use windows::Win32::Graphics::Gdi::{
-    CreateBitmap, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    DIB_RGB_COLORS,
-};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_SETVERSION,
     NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
-    PostMessageW, SetForegroundWindow, SetMenuDefaultItem, TrackPopupMenu, HICON, ICONINFO,
-    MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_NULL,
+    AppendMenuW, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos, GetSystemMetrics,
+    LoadImageW, PostMessageW, SetForegroundWindow, SetMenuDefaultItem, TrackPopupMenu, HICON,
+    IMAGE_ICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, SM_CXICON, SM_CXSMICON, SM_CYICON,
+    SM_CYSMICON, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_NULL,
 };
 
 /// Callback message the shell sends to the owner window. Uses `NOTIFYICON_VERSION_4`
@@ -87,75 +85,38 @@ pub fn menu_labels(state: &TrayMenuState) -> Vec<(MenuItem, String)> {
     items
 }
 
-const ICON_SIZE: usize = 32;
-const ICON_RADIUS: f32 = 6.0;
-const ICON_BLUE: u32 = 0xFF2F_6FDB;
-const ICON_WHITE: u32 = 0xFFFF_FFFF;
+/// Resource id of the app icon group. `build.rs` embeds `assets/lite-bar.ico` under it; the
+/// exe, its shortcut and its Installed apps entry all show it.
+pub const APP_ICON_ID: u16 = 1;
 
-/// 32x32 `0xAARRGGBB` pixels, row-major, top-down: a rounded `#2F6FDB` square with a white "L".
-/// Alpha is either 0 or 255, so premultiplication does not matter.
-fn icon_pixels() -> Vec<u32> {
-    let size = ICON_SIZE as f32;
-    let mut px = vec![0u32; ICON_SIZE * ICON_SIZE];
-    for y in 0..ICON_SIZE {
-        for x in 0..ICON_SIZE {
-            // Distance from the pixel centre to the nearest corner-circle centre, if in a corner.
-            let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let ox = (ICON_RADIUS - cx).max(cx - (size - ICON_RADIUS)).max(0.0);
-            let oy = (ICON_RADIUS - cy).max(cy - (size - ICON_RADIUS)).max(0.0);
-            if ox * ox + oy * oy > ICON_RADIUS * ICON_RADIUS {
-                continue;
-            }
-            let stem = (10..14).contains(&x) && (7..25).contains(&y);
-            let foot = (10..24).contains(&x) && (21..25).contains(&y);
-            px[y * ICON_SIZE + x] = if stem || foot { ICON_WHITE } else { ICON_BLUE };
-        }
-    }
-    px
+/// Which of the system's icon sizes to load.
+#[derive(Clone, Copy, Debug)]
+pub enum IconSize {
+    /// Tray, title bar: `SM_CXSMICON`.
+    Small,
+    /// Taskbar, Alt+Tab: `SM_CXICON`.
+    Large,
 }
 
-/// Builds the icon from `icon_pixels` with a 32-bit ARGB DIB and an all-zero mask.
-pub(crate) fn create_icon() -> windows::core::Result<HICON> {
-    let pixels = icon_pixels();
-    let info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: ICON_SIZE as i32,
-            biHeight: -(ICON_SIZE as i32), // top-down
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
+/// The app icon at `size`, loaded from the exe's own resources. Destroy it with `DestroyIcon`.
+pub(crate) fn create_icon(size: IconSize) -> windows::core::Result<HICON> {
+    let (cx, cy) = match size {
+        IconSize::Small => (SM_CXSMICON, SM_CYSMICON),
+        IconSize::Large => (SM_CXICON, SM_CYICON),
     };
-    let mut bits = std::ptr::null_mut();
-    // SAFETY: `info` is a valid BITMAPINFO, `bits` a valid out-pointer. The DIB holds
-    // ICON_SIZE * ICON_SIZE 32-bit pixels, which is exactly what is copied in. Both bitmaps are
-    // deleted before returning (CreateIconIndirect copies them).
+    // SAFETY: plain FFI; the name is an integer resource id, as MAKEINTRESOURCE makes. Without
+    // LR_SHARED the icon is a new one the caller owns.
     unsafe {
-        let color = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0)?;
-        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast::<u32>(), pixels.len());
-        // 1 bpp mask, rows padded to 16 bits: 32 px = 4 bytes per row.
-        let mask_bits = [0u8; ICON_SIZE * 4];
-        let mask = CreateBitmap(
-            ICON_SIZE as i32,
-            ICON_SIZE as i32,
-            1,
-            1,
-            Some(mask_bits.as_ptr().cast()),
-        );
-        let icon_info = ICONINFO {
-            fIcon: true.into(),
-            xHotspot: 0,
-            yHotspot: 0,
-            hbmMask: mask,
-            hbmColor: color,
-        };
-        let icon = CreateIconIndirect(&icon_info);
-        let _ = DeleteObject(color.into());
-        let _ = DeleteObject(mask.into());
-        icon
+        let module = GetModuleHandleW(None)?;
+        let handle = LoadImageW(
+            Some(module.into()),
+            PCWSTR(APP_ICON_ID as usize as *const u16),
+            IMAGE_ICON,
+            GetSystemMetrics(cx),
+            GetSystemMetrics(cy),
+            LR_DEFAULTCOLOR,
+        )?;
+        Ok(HICON(handle.0))
     }
 }
 
@@ -172,7 +133,7 @@ impl Tray {
     pub fn new(hwnd: HWND) -> windows::core::Result<Tray> {
         let tray = Tray {
             hwnd,
-            icon: create_icon()?,
+            icon: create_icon(IconSize::Small)?,
             added: Cell::new(false),
         };
         if let Err(e) = tray.add() {
@@ -188,7 +149,7 @@ impl Tray {
     pub fn new_hidden(hwnd: HWND) -> windows::core::Result<Tray> {
         Ok(Tray {
             hwnd,
-            icon: create_icon()?,
+            icon: create_icon(IconSize::Small)?,
             added: Cell::new(false),
         })
     }
@@ -292,7 +253,7 @@ impl Tray {
 impl Drop for Tray {
     fn drop(&mut self) {
         self.remove();
-        // SAFETY: the icon was created by CreateIconIndirect and is destroyed exactly once.
+        // SAFETY: the icon was loaded by create_icon and is destroyed exactly once.
         unsafe {
             let _ = DestroyIcon(self.icon);
         }
@@ -420,16 +381,56 @@ mod tests {
     }
 
     #[test]
-    fn icon_is_rounded_blue_square_with_white_l() {
-        let px = icon_pixels();
-        let at = |x: usize, y: usize| px[y * ICON_SIZE + x];
-        // Rounded corner is transparent, the body is opaque #2F6FDB.
-        assert_eq!(at(0, 0) >> 24, 0);
-        assert_eq!(at(3, 16), 0xFF2F6FDB);
-        // The stem of the L is white; the area right of the stem, above the foot, is blue.
-        assert_eq!(at(11, 12), 0xFFFFFFFF);
-        assert_eq!(at(20, 12), 0xFF2F6FDB);
-        // The foot of the L.
-        assert_eq!(at(18, 23), 0xFFFFFFFF);
+    fn exe_carries_the_app_icon() {
+        use windows::Win32::System::LibraryLoader::{FindResourceW, GetModuleHandleW};
+        use windows::Win32::UI::WindowsAndMessaging::RT_GROUP_ICON;
+        // SAFETY: plain FFI; the name is an integer resource id, as MAKEINTRESOURCE makes.
+        let found = unsafe {
+            let module = GetModuleHandleW(None).unwrap();
+            FindResourceW(
+                Some(module),
+                PCWSTR(APP_ICON_ID as usize as *const u16),
+                RT_GROUP_ICON,
+            )
+        };
+        assert!(
+            !found.is_invalid(),
+            "no icon group {APP_ICON_ID} in the exe"
+        );
+    }
+
+    /// Width of the color bitmap of `icon`.
+    fn icon_width(icon: HICON) -> i32 {
+        use windows::Win32::Graphics::Gdi::{DeleteObject, GetObjectW, BITMAP};
+        use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, ICONINFO};
+        let mut info = ICONINFO::default();
+        let mut bitmap = BITMAP::default();
+        // SAFETY: plain FFI with live out-parameters; GetIconInfo's bitmaps are ours to delete.
+        unsafe {
+            GetIconInfo(icon, &mut info).unwrap();
+            GetObjectW(
+                info.hbmColor.into(),
+                size_of::<BITMAP>() as i32,
+                Some((&mut bitmap as *mut BITMAP).cast()),
+            );
+            let _ = DeleteObject(info.hbmColor.into());
+            let _ = DeleteObject(info.hbmMask.into());
+        }
+        bitmap.bmWidth
+    }
+
+    #[test]
+    fn create_icon_has_the_system_icon_sizes() {
+        use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXICON, SM_CXSMICON};
+        for (size, metric) in [(IconSize::Small, SM_CXSMICON), (IconSize::Large, SM_CXICON)] {
+            let icon = create_icon(size).unwrap();
+            // SAFETY: plain FFI.
+            let expected = unsafe { GetSystemMetrics(metric) };
+            assert_eq!(icon_width(icon), expected, "{size:?}");
+            // SAFETY: the icon was loaded for this test and is destroyed once.
+            unsafe {
+                let _ = DestroyIcon(icon);
+            }
+        }
     }
 }

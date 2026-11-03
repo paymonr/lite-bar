@@ -32,6 +32,8 @@ scripts/xwin.sh build --release -p lite-bar
 
 FPS capture needs an elevated (administrator) run in M1.
 
+The icon is `crates/app/assets/lite-bar.ico`. `crates/app/build.rs` turns it into a Windows resource and hands it to the linker, so no resource compiler is needed, and the exe, its shortcut, Installed apps, the tray and the windows all show it. To change it, edit and run `scripts/make-icon.py` (needs Python with Pillow), which draws every size from 16 to 256 px.
+
 CI builds natively on a Windows runner with a plain `cargo build --release -p lite-bar`; the cross-compile setup above is only for local development in WSL2. Pull requests are checked by `.github/workflows/ci.yml` (`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`).
 
 ## Releases

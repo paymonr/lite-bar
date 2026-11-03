@@ -6,6 +6,7 @@ pub mod frame_stats;
 pub mod game_name;
 pub mod history;
 pub mod hotkey;
+pub mod icon_res;
 pub mod install;
 pub mod layout;
 pub mod move_prompt_ui;
