@@ -67,16 +67,19 @@ fn appearance_reclick_scrolls_back_to_its_heading() {
 
 #[test]
 fn highlight_follows_the_scroll() {
-    // Short enough that the Updates heading can reach the top.
     let mut p = Page::new(Rect::new(0.0, 0.0, 900.0, MIN_WINDOW_DIP.1));
     let h = p.view.headings;
+    // The furthest the page scrolls: the last sections' headings can't reach the top.
+    p.st.scroll.insert(id("settings.scroll"), f32::MAX);
+    p.idle();
+    let max = p.scroll();
+    assert!(max < h[NAV_UPDATES]);
     for (scroll, want) in [
         (h[NAV_APPEARANCE] - 1.0, NAV_OVERLAY),
         (h[NAV_APPEARANCE], NAV_APPEARANCE),
         (h[NAV_GENERAL] - 1.0, NAV_APPEARANCE),
         (h[NAV_GENERAL], NAV_GENERAL),
-        (h[NAV_HOTKEYS], NAV_HOTKEYS),
-        (h[NAV_UPDATES], NAV_UPDATES),
+        (max, NAV_UPDATES),
         (0.0, NAV_OVERLAY),
     ] {
         p.st.scroll.insert(id("settings.scroll"), scroll);
@@ -131,14 +134,14 @@ fn scrolling_to_the_bottom_highlights_the_last_section() {
 }
 
 #[test]
-fn updates_nav_scrolls_to_its_heading() {
-    // Short enough that the Updates heading can reach the top.
+fn updates_nav_scrolls_as_far_as_the_page_goes() {
     let mut p = Page::new(Rect::new(0.0, 0.0, 900.0, MIN_WINDOW_DIP.1));
-    let top = find_text(p.frame(), "OVERLAY").unwrap().0.y;
     p.click_text("Updates");
     p.idle();
     assert_eq!(p.view.selected, NAV_UPDATES);
-    assert_eq!(find_text(p.frame(), "UPDATES").unwrap().0.y, top);
+    let y = find_text(p.frame(), "UPDATES").expect("in view").0.y;
+    assert!(y < MIN_WINDOW_DIP.1, "the heading is on screen");
+    assert!(find_text(p.frame(), "Restore defaults").is_some(), "at the bottom");
 }
 
 #[test]
@@ -163,4 +166,17 @@ fn nav_order_matches_the_page() {
         ],
         [0, 1, 2, 3, 4]
     );
+}
+
+#[test]
+fn the_page_ends_at_restore_defaults() {
+    let mut p = Page::new(MOCKUP);
+    let mut last = -1.0;
+    while p.scroll() != last {
+        last = p.scroll();
+        p.wheel(-5.0);
+    }
+    let (pos, style, _) = find_text(p.frame(), "Restore defaults").expect("visible at the bottom");
+    let below = MOCKUP.h - (pos.y + style.size);
+    assert!(below < 80.0, "{below} px of blank space under Restore defaults");
 }

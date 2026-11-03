@@ -364,8 +364,6 @@ pub fn settings_frame(
             new_h = content(ui, view, settings, hotkey_status, input, &mut out);
         });
     });
-    // Room below the last section, so clicking it can bring its heading to the top.
-    new_h = new_h.max(view.headings[NAV_UPDATES] + body.h);
     let scroll = ui.scroll_offset(scroll_id());
     if clicked {
         view.nav_scroll = Some(scroll);
