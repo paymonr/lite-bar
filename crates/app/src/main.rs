@@ -263,8 +263,9 @@ mod app {
         just_shown: bool,
         /// App-clock time each tracked pid's process was last queried.
         last_query: HashMap<u32, f64>,
-        /// The open session whose process had the focus last: the Games page's "playing now".
-        last_focused_session: Option<u32>,
+        /// Pids of open sessions, most recently focused first: the Games page's "playing
+        /// now" is the first that isn't marked "Not a game".
+        focus_order: Vec<u32>,
         /// That session's game name, looked up once per pid.
         live_name: Option<(u32, String)>,
         /// The settings window shows the Games page: its timer runs.
@@ -475,8 +476,7 @@ mod app {
                     self.start_session(pid, hwnd, now);
                 }
             }
-            self.last_focused_session =
-                focused_session(pid, &self.sessions, self.last_focused_session);
+            note_focus(&mut self.focus_order, pid, &self.sessions);
             if self.ticks.is_multiple_of(PRUNE_EVERY_TICKS) {
                 self.tracker
                     .lock()
@@ -580,9 +580,13 @@ mod app {
 
         /// The last-focused open session as the Games page shows it.
         fn live_game(&mut self) -> Option<LiveGame> {
-            let pid = self.last_focused_session?;
-            let s = self.sessions.get(pid)?;
-            let (key, exe_path, title) = (s.key(), s.exe_path.clone(), s.window_title.clone());
+            let not_games = &self.settings.not_games;
+            let (pid, key, exe_path, title) = self.focus_order.iter().find_map(|pid| {
+                let s = self.sessions.get(*pid)?;
+                let key = s.key();
+                (!not_games.contains_key(&key))
+                    .then(|| (*pid, key, s.exe_path.clone(), s.window_title.clone()))
+            })?;
             let name = match &self.live_name {
                 Some((p, name)) if *p == pid => name.clone(),
                 _ => {
@@ -617,9 +621,7 @@ mod app {
 
         /// Takes the session's frame stats and stores it if it is long enough.
         fn finish_session(&mut self, session: OpenSession, end: LocalTime) {
-            if self.last_focused_session == Some(session.pid) {
-                self.last_focused_session = None;
-            }
+            self.focus_order.retain(|pid| *pid != session.pid);
             if self
                 .live_name
                 .as_ref()
@@ -839,10 +841,13 @@ mod app {
 
     /// The foreground pid that needs a new session: it has counted frames, none is open, and
     /// its process hasn't already refused a query during this focus.
-    /// The open session that had the focus last: the foreground `pid` when it has one, else
-    /// the one remembered (the settings window has the focus while you look at it).
-    fn focused_session(pid: Option<u32>, sessions: &SessionBook, last: Option<u32>) -> Option<u32> {
-        pid.filter(|p| sessions.contains(*p)).or(last)
+    /// Moves the foreground `pid` to the front of `order` when it has an open session; other
+    /// foregrounds (the settings window, a browser) leave the order as it is.
+    fn note_focus(order: &mut Vec<u32>, pid: Option<u32>, sessions: &SessionBook) {
+        if let Some(pid) = pid.filter(|p| sessions.contains(*p)) {
+            order.retain(|p| *p != pid);
+            order.insert(0, pid);
+        }
     }
 
     fn pid_to_track(
@@ -1334,7 +1339,7 @@ mod app {
             gate: QueryGate::default(),
             just_shown: false,
             last_query: HashMap::new(),
-            last_focused_session: None,
+            focus_order: Vec::new(),
             live_name: None,
             games_page_shown: false,
             settings_ui: None,
@@ -1485,7 +1490,7 @@ mod app {
                 gate: QueryGate::default(),
                 just_shown: false,
                 last_query: HashMap::new(),
-                last_focused_session: None,
+                focus_order: Vec::new(),
                 live_name: None,
                 games_page_shown: false,
                 settings_ui: None,
@@ -3417,7 +3422,8 @@ mod app {
                 start: at,
                 last_alive: at,
             });
-            app.last_focused_session = Some(pid);
+            app.focus_order.retain(|p| *p != pid);
+            app.focus_order.insert(0, pid);
         }
 
         /// A pid no process has.
@@ -3478,7 +3484,7 @@ mod app {
             live_session(&mut app, r"C:\Games\a.exe", GONE_PID);
             let s = app.sessions.remove(GONE_PID).unwrap();
             app.finish_session(s, local_now());
-            assert_eq!(app.last_focused_session, None);
+            assert!(!app.focus_order.contains(&GONE_PID));
         }
 
         #[test]
@@ -3492,20 +3498,40 @@ mod app {
         }
 
         #[test]
-        fn the_focused_pid_is_remembered_only_with_a_session() {
+        fn focus_order_puts_the_focused_session_first() {
             let mut book = SessionBook::new();
             let at = local_now();
-            book.track(OpenSession {
-                pid: 7,
-                created: 1,
-                exe_path: r"C:\Games\a.exe".into(),
-                window_title: None,
-                start: at,
-                last_alive: at,
-            });
-            assert_eq!(focused_session(Some(7), &book, None), Some(7));
-            assert_eq!(focused_session(Some(8), &book, Some(7)), Some(7), "kept");
-            assert_eq!(focused_session(None, &book, Some(7)), Some(7));
+            for pid in [7, 8] {
+                book.track(OpenSession {
+                    pid,
+                    created: 1,
+                    exe_path: r"C:\Games\a.exe".into(),
+                    window_title: None,
+                    start: at,
+                    last_alive: at,
+                });
+            }
+            let mut order = Vec::new();
+            note_focus(&mut order, Some(7), &book);
+            note_focus(&mut order, Some(8), &book);
+            assert_eq!(order, vec![8, 7]);
+            note_focus(&mut order, Some(7), &book);
+            assert_eq!(order, vec![7, 8]);
+            note_focus(&mut order, Some(9), &book);
+            note_focus(&mut order, None, &book);
+            assert_eq!(order, vec![7, 8], "no session: kept as is");
+        }
+
+        #[test]
+        fn a_marked_app_focused_last_does_not_hide_the_running_game() {
+            let dir = TempDir::new("games-marked-last");
+            let (mut app, _owner) = test_app(dir.path());
+            live_session(&mut app, r"C:\Games\game.exe", 100);
+            live_session(&mut app, r"C:\Tools\wezterm-gui.exe", 200);
+            let marked = lite_bar_core::game_name::game_key(r"C:\Tools\wezterm-gui.exe", None);
+            app.settings.not_games.insert(marked, "WezTerm".into());
+            let live = app.live_game().expect("the game");
+            assert_eq!(live.exe_path, r"C:\Games\game.exe");
         }
 
         #[test]
