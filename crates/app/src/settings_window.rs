@@ -23,8 +23,8 @@ use lite_bar_core::install::MoveStatus;
 use lite_bar_core::settings::Settings;
 use lite_bar_core::settings_edit::apply_change;
 use lite_bar_core::settings_ui::{
-    settings_frame, GameRow, GamesInput, InstallInput, PageInput, SettingsView, StartupInput,
-    UiAction, UpdatesInput, MIN_WINDOW_DIP,
+    settings_frame, GameRow, GamesInput, InstallInput, LiveGame, PageInput, SettingsView,
+    StartupInput, UiAction, UpdatesInput, MIN_WINDOW_DIP,
 };
 use lite_bar_core::startup_task::StartupState;
 use lite_bar_core::ui::{HotkeyCapture, Ui};
@@ -190,6 +190,9 @@ struct WindowState {
     /// Program Files, and how an install is going.
     install_offer: bool,
     move_status: MoveStatus,
+    /// What the Games page shows: the local time and the game being played.
+    now: LocalTime,
+    live: Option<LiveGame>,
     queue: ActionQueue,
 }
 
@@ -239,8 +242,8 @@ impl UiApp for SettingsPage {
                     status: &st.move_status,
                 },
                 games: GamesInput {
-                    now: LocalTime::default(),
-                    live: None,
+                    now: st.now,
+                    live: st.live.as_ref(),
                 },
             },
         );
@@ -422,6 +425,40 @@ impl SettingsUi {
         st.move_status = status.clone();
         drop(st);
         self.window.request_redraw();
+    }
+
+    /// The local time the Games page counts "Today" from; redraws when the minute changes.
+    pub fn set_now(&self, now: LocalTime) {
+        let mut st = self.state.borrow_mut();
+        let minute = |t: LocalTime| (t.year, t.month, t.day, t.hour, t.minute);
+        if minute(st.now) == minute(now) {
+            st.now = now;
+            return;
+        }
+        st.now = now;
+        drop(st);
+        self.window.request_redraw();
+    }
+
+    /// The game the Games page shows as playing now; redraws only when it changed.
+    pub fn set_live(&self, live: Option<&LiveGame>) {
+        let mut st = self.state.borrow_mut();
+        if st.live.as_ref() == live {
+            return;
+        }
+        st.live = live.cloned();
+        drop(st);
+        self.window.request_redraw();
+    }
+
+    #[cfg(test)]
+    pub fn live_shown(&self) -> Option<LiveGame> {
+        self.state.borrow().live.clone()
+    }
+
+    #[cfg(test)]
+    pub fn now_shown(&self) -> LocalTime {
+        self.state.borrow().now
     }
 
     #[cfg(test)]

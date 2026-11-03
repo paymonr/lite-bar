@@ -88,7 +88,7 @@ mod app {
     };
     use lite_bar_core::settings::{Settings, StatsLayout};
     use lite_bar_core::settings_edit::SettingsChange;
-    use lite_bar_core::settings_ui::GameRow;
+    use lite_bar_core::settings_ui::{GameRow, LiveGame};
     use lite_bar_core::startup_task::StartupState;
     use lite_bar_core::update::{
         current_version, ReleaseInfo, UpdateSchedule, UpdateState, Version,
@@ -145,6 +145,9 @@ mod app {
     const SAVE_TIMER_ID: usize = 2;
     /// Owner-window timer for the next automatic update check.
     const UPDATE_TIMER_ID: usize = 3;
+    /// Owner-window timer that refreshes the Games page while it is shown.
+    const GAMES_TIMER_ID: usize = 4;
+    const GAMES_TIMER_MS: u32 = 1000;
     const SETTINGS_FILE: &str = "settings.toml";
     /// Subfolder of the app dir holding `games.toml`, `games.csv` and `sessions.csv`.
     const STATS_DIR: &str = "stats";
@@ -260,6 +263,12 @@ mod app {
         just_shown: bool,
         /// App-clock time each tracked pid's process was last queried.
         last_query: HashMap<u32, f64>,
+        /// The open session whose process had the focus last: the Games page's "playing now".
+        last_focused_session: Option<u32>,
+        /// That session's game name, looked up once per pid.
+        live_name: Option<(u32, String)>,
+        /// The settings window shows the Games page: its timer runs.
+        games_page_shown: bool,
         /// The settings window while it is open.
         settings_ui: Option<SettingsUi>,
         /// When the window's changes are due to be written.
@@ -466,6 +475,8 @@ mod app {
                     self.start_session(pid, hwnd, now);
                 }
             }
+            self.last_focused_session =
+                focused_session(pid, &self.sessions, self.last_focused_session);
             if self.ticks.is_multiple_of(PRUNE_EVERY_TICKS) {
                 self.tracker
                     .lock()
@@ -534,6 +545,66 @@ mod app {
             }
         }
 
+        /// Starts (on) or stops the Games page's 1 s refresh.
+        pub(super) fn show_games_page(&mut self, on: bool) {
+            if on == self.games_page_shown {
+                return;
+            }
+            self.games_page_shown = on;
+            // SAFETY: plain FFI on our own window.
+            unsafe {
+                if on {
+                    SetTimer(Some(self.hwnd), GAMES_TIMER_ID, GAMES_TIMER_MS, None);
+                } else {
+                    let _ = KillTimer(Some(self.hwnd), GAMES_TIMER_ID);
+                }
+            }
+            if on {
+                self.on_games_timer();
+            }
+        }
+
+        /// While the Games page is shown: ends sessions of exited games (the overlay's timer
+        /// may be off) and shows the time and the game being played.
+        fn on_games_timer(&mut self) {
+            if !self.games_page_shown {
+                return;
+            }
+            self.check_sessions();
+            let live = self.live_game();
+            if let Some(ui) = &self.settings_ui {
+                ui.set_now(local_now());
+                ui.set_live(live.as_ref());
+            }
+        }
+
+        /// The last-focused open session as the Games page shows it.
+        fn live_game(&mut self) -> Option<LiveGame> {
+            let pid = self.last_focused_session?;
+            let s = self.sessions.get(pid)?;
+            let (key, exe_path, title) = (s.key(), s.exe_path.clone(), s.window_title.clone());
+            let name = match &self.live_name {
+                Some((p, name)) if *p == pid => name.clone(),
+                _ => {
+                    let name = resolve_name(&exe_path, title.as_deref());
+                    self.live_name = Some((pid, name.clone()));
+                    name
+                }
+            };
+            let session = self
+                .tracker
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .stats(pid)
+                .and_then(|h| h.summary());
+            Some(LiveGame {
+                key,
+                name,
+                exe_path,
+                session,
+            })
+        }
+
         /// Quit or sign-out: every session ends (now, if its process still runs) and queued
         /// stats writes are retried; what still fails is saved for the next start.
         fn finish_all_sessions(&mut self) {
@@ -546,6 +617,16 @@ mod app {
 
         /// Takes the session's frame stats and stores it if it is long enough.
         fn finish_session(&mut self, session: OpenSession, end: LocalTime) {
+            if self.last_focused_session == Some(session.pid) {
+                self.last_focused_session = None;
+            }
+            if self
+                .live_name
+                .as_ref()
+                .is_some_and(|(pid, _)| *pid == session.pid)
+            {
+                self.live_name = None;
+            }
             let hist = self
                 .tracker
                 .lock()
@@ -758,6 +839,12 @@ mod app {
 
     /// The foreground pid that needs a new session: it has counted frames, none is open, and
     /// its process hasn't already refused a query during this focus.
+    /// The open session that had the focus last: the foreground `pid` when it has one, else
+    /// the one remembered (the settings window has the focus while you look at it).
+    fn focused_session(pid: Option<u32>, sessions: &SessionBook, last: Option<u32>) -> Option<u32> {
+        pid.filter(|p| sessions.contains(*p)).or(last)
+    }
+
     fn pid_to_track(
         pid: Option<u32>,
         has_stats: bool,
@@ -950,6 +1037,10 @@ mod app {
             }
             WM_TIMER if wparam.0 == SAVE_TIMER_ID => {
                 with_app(|app| app.on_save_timer(Instant::now()));
+                return LRESULT(0);
+            }
+            WM_TIMER if wparam.0 == GAMES_TIMER_ID => {
+                with_app(App::on_games_timer);
                 return LRESULT(0);
             }
             WM_TIMER if wparam.0 == UPDATE_TIMER_ID => {
@@ -1243,6 +1334,9 @@ mod app {
             gate: QueryGate::default(),
             just_shown: false,
             last_query: HashMap::new(),
+            last_focused_session: None,
+            live_name: None,
+            games_page_shown: false,
             settings_ui: None,
             save: SaveDebounce::default(),
             unsaved: Vec::new(),
@@ -1391,6 +1485,9 @@ mod app {
                 gate: QueryGate::default(),
                 just_shown: false,
                 last_query: HashMap::new(),
+                last_focused_session: None,
+                live_name: None,
+                games_page_shown: false,
                 settings_ui: None,
                 save: SaveDebounce::default(),
                 unsaved: Vec::new(),
@@ -3305,6 +3402,110 @@ mod app {
             app.apply_ui_action(UiAction::InstallToProgramFiles);
             let settings = app.settings_ui.as_ref().unwrap().hwnd();
             assert_eq!(MOVE_PARENT.get(), settings.0 as usize);
+        }
+
+        /// An open session for `pid` running `exe`, focused last. For a running pid it takes
+        /// the process's real creation time, so the exit check sees it as still running.
+        fn live_session(app: &mut App, exe: &str, pid: u32) {
+            let at = local_now();
+            let created = crate::process_info::process_info(pid).map_or(1, |i| i.created);
+            app.sessions.track(OpenSession {
+                pid,
+                created,
+                exe_path: exe.into(),
+                window_title: None,
+                start: at,
+                last_alive: at,
+            });
+            app.last_focused_session = Some(pid);
+        }
+
+        /// A pid no process has.
+        const GONE_PID: u32 = 0xFFFF_FFF0;
+
+        #[test]
+        fn showing_the_games_page_starts_the_games_timer_and_settings_stops_it() {
+            use lite_bar_core::settings_ui::WindowPage;
+            let dir = TempDir::new("games-timer");
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            app.apply_ui_action(UiAction::ShowPage(WindowPage::Games));
+            assert!(app.games_page_shown);
+            app.apply_ui_action(UiAction::ShowPage(WindowPage::Settings));
+            assert!(!app.games_page_shown);
+            app.apply_ui_action(UiAction::ShowPage(WindowPage::Games));
+            app.close_settings_window();
+            assert!(!app.games_page_shown, "closing the window stops it");
+        }
+
+        #[test]
+        fn the_last_focused_session_feeds_the_page() {
+            use lite_bar_core::settings_ui::WindowPage;
+            let dir = TempDir::new("games-live");
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            live_session(&mut app, r"C:\Games\a.exe", std::process::id());
+            app.apply_ui_action(UiAction::ShowPage(WindowPage::Games));
+            let ui = app.settings_ui.as_ref().unwrap();
+            let live = ui.live_shown().expect("a live game");
+            assert_eq!(
+                live.key,
+                lite_bar_core::game_name::game_key(r"C:\Games\a.exe", None)
+            );
+            assert_eq!(live.exe_path, r"C:\Games\a.exe");
+            assert_eq!(live.session, None, "no frames counted yet");
+            assert!(!live.name.is_empty());
+            assert!(ui.now_shown().year >= 2026);
+        }
+
+        #[test]
+        fn an_exited_game_ends_its_session_while_the_page_is_shown() {
+            use lite_bar_core::settings_ui::WindowPage;
+            let dir = TempDir::new("games-exited");
+            let (mut app, _owner) = test_app(dir.path());
+            assert!(!app.overlay_on);
+            app.open_settings_hidden();
+            live_session(&mut app, r"C:\Games\a.exe", GONE_PID);
+            app.apply_ui_action(UiAction::ShowPage(WindowPage::Games));
+            assert!(!app.sessions.contains(GONE_PID));
+            assert_eq!(app.settings_ui.as_ref().unwrap().live_shown(), None);
+        }
+
+        #[test]
+        fn finishing_the_session_clears_the_last_focused_one() {
+            let dir = TempDir::new("games-finish");
+            let (mut app, _owner) = test_app(dir.path());
+            live_session(&mut app, r"C:\Games\a.exe", GONE_PID);
+            let s = app.sessions.remove(GONE_PID).unwrap();
+            app.finish_session(s, local_now());
+            assert_eq!(app.last_focused_session, None);
+        }
+
+        #[test]
+        fn no_live_updates_while_the_settings_page_is_shown() {
+            let dir = TempDir::new("games-hidden-page");
+            let (mut app, _owner) = test_app(dir.path());
+            app.open_settings_hidden();
+            live_session(&mut app, r"C:\Games\a.exe", std::process::id());
+            app.on_games_timer();
+            assert_eq!(app.settings_ui.as_ref().unwrap().live_shown(), None);
+        }
+
+        #[test]
+        fn the_focused_pid_is_remembered_only_with_a_session() {
+            let mut book = SessionBook::new();
+            let at = local_now();
+            book.track(OpenSession {
+                pid: 7,
+                created: 1,
+                exe_path: r"C:\Games\a.exe".into(),
+                window_title: None,
+                start: at,
+                last_alive: at,
+            });
+            assert_eq!(focused_session(Some(7), &book, None), Some(7));
+            assert_eq!(focused_session(Some(8), &book, Some(7)), Some(7), "kept");
+            assert_eq!(focused_session(None, &book, Some(7)), Some(7));
         }
 
         #[test]
