@@ -839,8 +839,6 @@ mod app {
         })
     }
 
-    /// The foreground pid that needs a new session: it has counted frames, none is open, and
-    /// its process hasn't already refused a query during this focus.
     /// Moves the foreground `pid` to the front of `order` when it has an open session; other
     /// foregrounds (the settings window, a browser) leave the order as it is.
     fn note_focus(order: &mut Vec<u32>, pid: Option<u32>, sessions: &SessionBook) {
@@ -850,6 +848,8 @@ mod app {
         }
     }
 
+    /// The foreground pid that needs a new session: it has counted frames, none is open, and
+    /// its process hasn't already refused a query during this focus.
     fn pid_to_track(
         pid: Option<u32>,
         has_stats: bool,
