@@ -89,6 +89,8 @@ pub struct Ui<'a> {
     focus_start: Option<Id>,
     /// Whether the focused widget was built this frame.
     focus_seen: bool,
+    /// A field `focus` asked for; it gets the focus when the frame finishes.
+    focus_request: Option<Id>,
     /// Whether a focused text field (with a caret) was built this frame.
     caret_seen: bool,
     /// Widgets that take focus, in build order, for Tab.
@@ -132,6 +134,7 @@ impl<'a> Ui<'a> {
             clipboard: None,
             focus_start,
             focus_seen: false,
+            focus_request: None,
             caret_seen: false,
             focusables: Vec::new(),
             tab: None,
@@ -158,6 +161,14 @@ impl<'a> Ui<'a> {
             l.y += px;
         }
         l.gap_pending = false;
+    }
+
+    /// Moves the keyboard focus to the field `id`, as Tab would: it takes typing from the
+    /// next frame on (the field may not exist yet in this one, e.g. it replaces the button
+    /// that asked), and Esc puts back the text it had then.
+    pub fn focus(&mut self, id: Id) {
+        self.focus_request = Some(id);
+        self.request_redraw();
     }
 
     /// The next widget (or row/column) gets exactly this width.
@@ -503,6 +514,11 @@ impl<'a> Ui<'a> {
             // The focused field was not built (e.g. the page changed), so nothing can
             // type into it or blink its caret.
             self.state.focused = None;
+        }
+        if let Some(id) = self.focus_request.take() {
+            self.state.focused = Some(id);
+            self.state.focus_fresh = true;
+            self.state.focus_revert = None;
         }
         self.tab_focus();
         if self.input.released {

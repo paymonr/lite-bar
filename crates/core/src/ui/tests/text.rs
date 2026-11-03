@@ -261,3 +261,60 @@ fn an_unfocused_field_shows_the_start_of_its_text() {
     assert_eq!(st.focused, None);
     assert_eq!(text_x(&f), 8.0);
 }
+
+/// A text button for "Minecraft" at (0, 0); `Fake` makes it 63 wide.
+fn name_button(st: &mut UiState, input: &Input, area_w: f32) -> (bool, Frame) {
+    let mut clicked = false;
+    let f = frame_in(st, input, Rect::new(0.0, 0.0, area_w, 100.0), |ui| {
+        clicked = ui.text_button(id("name"), "Minecraft", TextStyle::BODY, theme::TEXT)
+    });
+    (clicked, f)
+}
+
+#[test]
+fn text_button_click_returns_true_once() {
+    let mut st = UiState::default();
+    name_button(&mut st, &hover(10.0, 5.0), 214.0);
+    assert!(!name_button(&mut st, &press(10.0, 5.0), 214.0).0);
+    assert!(name_button(&mut st, &release(10.0, 5.0), 214.0).0);
+    assert!(!name_button(&mut st, &hover(10.0, 5.0), 214.0).0);
+    let (_, f) = name_button(&mut st, &Input::default(), 214.0);
+    assert_eq!(texts(&f), vec!["Minecraft".to_string()]);
+}
+
+#[test]
+fn text_button_ellipsizes_to_the_width() {
+    let mut st = UiState::default();
+    let (_, f) = name_button(&mut st, &Input::default(), 40.0);
+    let t = texts(&f);
+    assert_eq!(t.len(), 1);
+    assert!(t[0].ends_with('…'), "{t:?}");
+    assert!(7.0 * t[0].chars().count() as f32 <= 40.0, "{t:?}");
+}
+
+#[test]
+fn focus_makes_the_field_take_typing() {
+    let mut st = UiState::default();
+    let mut e = TextEdit::new("ab");
+    frame(&mut st, &Input::default(), |ui| {
+        ui.focus(id("f"));
+        ui.text_field(id("f"), &mut e, "Name");
+    });
+    assert_eq!(st.focused, Some(id("f")));
+    let (ev, _) = field(&mut st, &typing("c"), &mut e);
+    assert_eq!(ev, TextFieldEvent::Changed);
+    assert_eq!(e.text, "abc");
+}
+
+#[test]
+fn esc_after_focus_restores_the_text() {
+    let mut st = UiState::default();
+    let mut e = TextEdit::new("ab");
+    frame(&mut st, &Input::default(), |ui| ui.focus(id("f")));
+    field(&mut st, &Input::default(), &mut e);
+    field(&mut st, &typing("c"), &mut e);
+    let (ev, _) = field(&mut st, &with_keys(vec![key(UiKey::Esc)]), &mut e);
+    assert_eq!(ev, TextFieldEvent::Cancelled);
+    assert_eq!(e.text, "ab");
+    assert_eq!(st.focused, None);
+}

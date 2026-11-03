@@ -523,19 +523,7 @@ fn restore_row(ui: &mut Ui, view: &SettingsView, out: &mut Vec<UiAction>) {
 
 /// `text` cut to fit `max_w`, ending in "…" when shortened.
 fn ellipsize(ui: &Ui, text: &str, style: TextStyle, max_w: f32) -> String {
-    let m = ui.text_measure();
-    if m.measure(text, style).0 <= max_w {
-        return text.to_string();
-    }
-    let mut chars: Vec<char> = text.chars().collect();
-    while !chars.is_empty() {
-        chars.pop();
-        let s: String = chars.iter().collect::<String>().trim_end().to_string() + "…";
-        if m.measure(&s, style).0 <= max_w {
-            return s;
-        }
-    }
-    String::new()
+    ui.ellipsize(text, style, max_w)
 }
 
 /// Width and height of an optional bold title over muted lines.
