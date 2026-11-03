@@ -70,8 +70,17 @@ The overlay toggles with `Ctrl+Alt+Shift+L` by default.
 - **General**: the **Start with Windows** switch (see [Start with Windows](#start-with-windows)).
 - **Hotkeys**: click the field and press the new combination; Esc cancels. A combination another app already holds is refused with "Already used by another app" and the old hotkey stays.
 - **Updates**: the **Check for updates** switch, **Check now** and the update status (see [Updates](#updates)).
-- **Games**: rename any game you've played. The name is saved under `[game_names]` and `games.csv` is regenerated. **Not a game** takes an app that was recorded by mistake out of your stats; it moves to a **Not games** list, where **It's a game** puts it back (see [Stats and history](#stats-and-history)). **Open stats folder** opens the stats folder.
 - **Restore defaults** (click twice) puts every overlay setting and the hotkey back to how Lite Bar ships. Game names, apps marked **Not a game** and saved colors are kept.
+
+**Games**, below the settings in the sidebar, is a page of its own:
+
+- A card on top shows the game you're playing: **PLAYING NOW** with this session's average FPS, 1% low and play time so far, next to the game's **ALL TIME** numbers. While you look at the window the game doesn't have the focus, so these numbers hold still; with the window on another screen they keep counting (refreshed once a second). When nothing is playing, the card shows the game you played last and its **LAST SESSION**.
+- **Games** and **Other apps** tabs, with a table of everything recorded: sessions, play time, when it was last played, average FPS and 1% low (narrow windows leave out Sessions and Last).
+- Click a game's name to rename it (Enter saves, Esc cancels). The name is saved under `[game_names]` and `games.csv` is regenerated.
+- **Not a game** takes an app that was recorded by mistake out of your stats and moves it to **Other apps**, where **It's a game** puts it back (see [Stats and history](#stats-and-history)).
+- **Open stats folder** opens the stats folder.
+
+While the Games page is shown, Lite Bar also checks once a second whether the game it shows has exited, even with the overlay off; nothing runs while the window is closed or the Settings page is shown. This page is where game history (per-session lists and charts) will grow.
 
 The window takes about 10–20 MB while open; closing it frees all of it.
 
@@ -235,7 +244,7 @@ A play session runs from a game's first counted frame until its process exits, o
 - editors and tools: `code`, `devenv`, `photoshop`, `blender`
 - Lite Bar itself: `lite-bar`
 
-Anything else that gets recorded by mistake (a terminal, a video call) can be taken out with **Not a game** in the settings window's **Games** section. From then on its sessions aren't recorded, and it disappears from `games.csv` and `sessions.csv`. Its history isn't deleted: `games.toml` keeps it, and its `sessions.csv` rows move to `sessions-not-games.csv`. **It's a game**, in the **Not games** list below, puts everything back where it was. The marks are saved under `[not_games]` in the settings file. If the game exits while the overlay is hidden, the session ends at the last time Lite Bar saw it running. Kept sessions are saved in `%APPDATA%\LiteBar\stats\`:
+Anything else that gets recorded by mistake (a terminal, a video call) can be taken out with **Not a game** on the settings window's **Games** page. From then on its sessions aren't recorded, and it disappears from `games.csv` and `sessions.csv`. Its history isn't deleted: `games.toml` keeps it, and its `sessions.csv` rows move to `sessions-not-games.csv`. **It's a game**, on the **Other apps** tab, puts everything back where it was. The marks are saved under `[not_games]` in the settings file. If the game exits while the overlay is hidden, the session ends at the last time Lite Bar saw it running. Kept sessions are saved in `%APPDATA%\LiteBar\stats\`:
 
 | File | Contents |
 | --- | --- |
@@ -254,7 +263,7 @@ Games are kept apart by the exe's full path. For Microsoft Store and Game Pass a
 3. the window title, without version numbers and `- ...` suffixes;
 4. the exe file name without `.exe`.
 
-To rename a game, type a name in the settings window's **Games** section, or add it to `[game_names]` in the settings file and choose **Reload settings**. Either way `games.csv` is regenerated with the new name, and new `sessions.csv` rows use it (existing rows keep the old name).
+To rename a game, click its name on the settings window's **Games** page, or add it to `[game_names]` in the settings file and choose **Reload settings**. Either way `games.csv` is regenerated with the new name, and new `sessions.csv` rows use it (existing rows keep the old name).
 
 Anti-cheat: Lite Bar never injects into, hooks or reads the memory of a game. Its only contact with a game's process is `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION` to read the exe path, the start time and whether the process has exited, and the handle is closed straight away. Lite Bar queries a recorded game's process when its session starts and then about once a second only while the game has stopped presenting frames; while it presents, that alone shows it is running, and it is queried at most every 30 s. The window title comes from `GetWindowTextW`, once, when the session starts. Everything else reads files and the registry, with no network lookups. If a game's process refuses even that limited query, its live stats still show on the overlay, but it isn't recorded in the history (a warning goes to the log). Lite Bar asks such a process at most once each time it gets the focus.
 
