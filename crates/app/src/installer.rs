@@ -242,7 +242,7 @@ fn swap_with(
 
 /// `MoveFileExW`, replacing the target and flushing before it returns. Works on a running
 /// exe within its volume.
-fn move_file(from: &Path, to: &Path) -> io::Result<()> {
+pub(crate) fn move_file(from: &Path, to: &Path) -> io::Result<()> {
     let (from, to) = (
         HSTRING::from(from.as_os_str()),
         HSTRING::from(to.as_os_str()),
@@ -264,22 +264,28 @@ pub const CLEANUP_DELAY: Duration = Duration::from_secs(1);
 
 /// Removes `<exe>.old`: `Ok(true)` when removed, `Ok(false)` when there was none.
 pub fn cleanup_old(exe: &Path) -> Result<bool, String> {
-    cleanup_old_with(exe, CLEANUP_TRIES, CLEANUP_DELAY, std::thread::sleep)
+    remove_with_retries(
+        &old_path(exe),
+        CLEANUP_TRIES,
+        CLEANUP_DELAY,
+        std::thread::sleep,
+    )
 }
 
-fn cleanup_old_with(
-    exe: &Path,
+/// Removes `old`, trying `tries` times `delay` apart (`sleep` waits): `Ok(true)` when
+/// removed, `Ok(false)` when there was none.
+pub(crate) fn remove_with_retries(
+    old: &Path,
     tries: u32,
     delay: Duration,
     mut sleep: impl FnMut(Duration),
 ) -> Result<bool, String> {
-    let old = old_path(exe);
     let mut last = String::new();
     for i in 0..tries {
         if i > 0 {
             sleep(delay);
         }
-        match std::fs::remove_file(&old) {
+        match std::fs::remove_file(old) {
             Ok(()) => return Ok(true),
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(e) => last = e.to_string(),
@@ -707,7 +713,7 @@ mod tests {
         );
         let mut sleeps = Vec::new();
         // The old process lets go during the first wait.
-        let got = cleanup_old_with(&exe, 5, CLEANUP_DELAY, |d| {
+        let got = remove_with_retries(&old_path(&exe), 5, CLEANUP_DELAY, |d| {
             sleeps.push(d);
             hold = None;
         });
@@ -723,7 +729,7 @@ mod tests {
             .open(old_path(&exe))
             .unwrap();
         let mut tries = 0;
-        assert!(cleanup_old_with(&exe, 5, CLEANUP_DELAY, |_| tries += 1).is_err());
+        assert!(remove_with_retries(&old_path(&exe), 5, CLEANUP_DELAY, |_| tries += 1).is_err());
         assert_eq!(tries, 4, "waits between the 5 tries");
     }
 

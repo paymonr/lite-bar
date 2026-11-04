@@ -7,7 +7,7 @@ use std::fmt;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::frame_stats::{FrameHistogram, StatsSummary};
-use crate::game_name::display_name;
+use crate::game_name::{display_name, game_key, is_generic_host};
 
 /// Sessions with less counted play time than this are discarded.
 pub const MIN_SESSION_SECS: f64 = 60.0;
@@ -21,7 +21,8 @@ pub const SESSIONS_CSV_HEADER: &str =
 const GAMES_CSV_HEADER: &str =
     "game,sessions,play_time,first_played,last_played,avg_fps,low_1pct_fps,high_1pct_fps,exe_path";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// `Default` is all zeros, only a filler (e.g. for rows built in tests).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LocalTime {
     pub year: u16,
     pub month: u8,
@@ -111,6 +112,71 @@ pub struct GameRecord {
     pub first_played: LocalTime,
     pub last_played: LocalTime,
     pub hist: FrameHistogram,
+    /// The newest session's numbers; `None` in entries written before they were kept.
+    pub last_session: Option<LastSession>,
+}
+
+/// One session's numbers, kept per game for the Games page's "last session".
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LastSession {
+    pub start: LocalTime,
+    pub end: LocalTime,
+    pub play_secs: f64,
+    pub avg_fps: f64,
+    pub low_1pct_fps: f64,
+    pub high_1pct_fps: f64,
+}
+
+impl LastSession {
+    /// `s`'s numbers, or `None` when it has too few frames for stats.
+    fn of(s: &SessionRecord) -> Option<LastSession> {
+        let sum = s.hist.summary()?;
+        Some(LastSession {
+            start: s.start,
+            end: s.end,
+            play_secs: sum.play_secs,
+            avg_fps: sum.avg_fps,
+            low_1pct_fps: sum.low_1pct_fps,
+            high_1pct_fps: sum.high_1pct_fps,
+        })
+    }
+}
+
+/// On-disk shape of `last_session` in `games.toml`.
+#[derive(Serialize, Deserialize)]
+struct LastSessionFile {
+    start: LocalTime,
+    end: LocalTime,
+    play_secs: f64,
+    avg: f64,
+    low_1pct: f64,
+    high_1pct: f64,
+}
+
+impl From<LastSessionFile> for LastSession {
+    fn from(f: LastSessionFile) -> Self {
+        LastSession {
+            start: f.start,
+            end: f.end,
+            play_secs: f.play_secs,
+            avg_fps: f.avg,
+            low_1pct_fps: f.low_1pct,
+            high_1pct_fps: f.high_1pct,
+        }
+    }
+}
+
+impl From<&LastSession> for LastSessionFile {
+    fn from(l: &LastSession) -> Self {
+        LastSessionFile {
+            start: l.start,
+            end: l.end,
+            play_secs: l.play_secs,
+            avg: l.avg_fps,
+            low_1pct: l.low_1pct_fps,
+            high_1pct: l.high_1pct_fps,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -120,7 +186,9 @@ pub struct GameStore {
     pub unparsed: BTreeMap<String, toml::Value>,
 }
 
-fn parse_game(value: &toml::Value) -> Result<GameRecord, String> {
+/// A game entry, plus a warning when its optional `last_session` couldn't be read (the game
+/// is kept without it: the field is only shown on the Games page).
+fn parse_game(value: &toml::Value) -> Result<(GameRecord, Option<String>), String> {
     let g: GameIn = value
         .clone()
         .try_into()
@@ -131,14 +199,29 @@ fn parse_game(value: &toml::Value) -> Result<GameRecord, String> {
             g.total_secs
         ));
     }
-    Ok(GameRecord {
+    let (last_session, warning) = match g.last_session {
+        None => (None, None),
+        Some(raw) => match raw.try_into::<LastSessionFile>() {
+            Ok(file) => (Some(LastSession::from(file)), None),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "last_session: {}; ignored",
+                    e.message().replace('\n', " ")
+                )),
+            ),
+        },
+    };
+    let record = GameRecord {
         name: g.name,
         exe_path: g.exe_path,
         sessions: g.sessions,
         first_played: g.first_played,
         last_played: g.last_played,
         hist: FrameHistogram::from_sparse(&g.buckets, g.total_secs),
-    })
+        last_session,
+    };
+    Ok((record, warning))
 }
 
 /// On-disk shape of one game in `games.toml`.
@@ -152,6 +235,9 @@ struct GameIn {
     total_secs: f64,
     #[serde(default)]
     buckets: Vec<(u32, u64)>,
+    /// Read leniently: a bad one is dropped with a warning, not the whole game.
+    #[serde(default)]
+    last_session: Option<toml::Value>,
 }
 
 #[derive(Serialize)]
@@ -165,6 +251,8 @@ struct GameOut<'a> {
     /// TOML integers are i64, so counts are clamped to `i64::MAX` (only reachable with
     /// corrupt data).
     buckets: Vec<(u32, i64)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_session: Option<LastSessionFile>,
 }
 
 #[derive(Serialize)]
@@ -188,7 +276,10 @@ impl GameStore {
         let mut warnings = Vec::new();
         for (key, value) in entries {
             match parse_game(value) {
-                Ok(record) => {
+                Ok((record, warning)) => {
+                    if let Some(w) = warning {
+                        warnings.push(format!("games.{key}: {w}"));
+                    }
                     store.games.insert(key.clone(), record);
                 }
                 Err(reason) => {
@@ -212,6 +303,7 @@ impl GameStore {
                 last_played: g.last_played,
                 total_secs: g.hist.total_secs(),
                 buckets: toml_buckets(&g.hist),
+                last_session: g.last_session.as_ref().map(LastSessionFile::from),
             };
             let value = toml::Value::try_from(out).expect("game entry converts to a TOML value");
             games.insert(key.clone(), value);
@@ -243,6 +335,7 @@ impl GameStore {
                     g.name = s.name.clone();
                     g.exe_path = s.exe_path.clone();
                     g.last_played = s.end;
+                    g.last_session = LastSession::of(s);
                 }
             }
             None => {
@@ -255,6 +348,7 @@ impl GameStore {
                         first_played: s.start,
                         last_played: s.end,
                         hist: s.hist.clone(),
+                        last_session: LastSession::of(s),
                     },
                 );
             }
@@ -408,6 +502,128 @@ pub fn session_csv_row(s: &SessionRecord, display: &str) -> String {
     )
 }
 
+impl GameStore {
+    /// The store without the games marked "Not a game", for `games.csv`. The store itself
+    /// keeps them, so "It's a game" brings their history back.
+    pub fn shown(&self, not_games: &BTreeMap<String, String>) -> GameStore {
+        GameStore {
+            games: self
+                .games
+                .iter()
+                .filter(|(key, _)| !not_games.contains_key(*key))
+                .map(|(key, g)| (key.clone(), g.clone()))
+                .collect(),
+            unparsed: BTreeMap::new(),
+        }
+    }
+}
+
+/// Splits the rows of `sessions.csv` (`shown`) and of the file kept aside for not-games
+/// (`aside`) again for `not_games`: rows of a not-game go aside, the others are shown. Each
+/// side is a whole file (BOM, header, rows by end time, the order `sessions.csv` is appended
+/// in); an aside side without rows is empty, meaning no file. Lines that can't be read as a
+/// session row stay shown.
+pub fn split_sessions_csv(
+    shown: &str,
+    aside: &str,
+    store: &GameStore,
+    overrides: &BTreeMap<String, String>,
+    not_games: &BTreeMap<String, String>,
+) -> (String, String) {
+    let (mut visible, mut hidden) = (Vec::new(), Vec::new());
+    for line in data_lines(shown).chain(data_lines(aside)) {
+        let key = csv_fields(line)
+            .filter(|f| f.len() == 9)
+            .and_then(|f| row_key(&f[2], &f[8], store, overrides));
+        if key.is_some_and(|k| not_games.contains_key(&k)) {
+            hidden.push(line);
+        } else {
+            visible.push(line);
+        }
+    }
+    let end_time = |line: &&str| line.get(20..39).unwrap_or("").to_string();
+    visible.sort_by_key(end_time);
+    hidden.sort_by_key(end_time);
+    let file = |rows: &[&str]| {
+        let mut out = format!("{CSV_BOM}{SESSIONS_CSV_HEADER}\r\n");
+        for row in rows {
+            out.push_str(row);
+            out.push_str("\r\n");
+        }
+        out
+    };
+    let aside = if hidden.is_empty() {
+        String::new()
+    } else {
+        file(&hidden)
+    };
+    (file(&visible), aside)
+}
+
+/// The non-empty lines of a sessions CSV file after its BOM and header.
+fn data_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.strip_prefix(CSV_BOM)
+        .unwrap_or(text)
+        .lines()
+        .filter(|l| !l.trim().is_empty() && *l != SESSIONS_CSV_HEADER)
+}
+
+/// The fields of one CSV line, with `"…"` quoting and `""` for a quote; `None` when a quote
+/// is left open.
+fn csv_fields(line: &str) -> Option<Vec<String>> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut at_start = true;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if quoted {
+            if c != '"' {
+                field.push(c);
+            } else if chars.peek() == Some(&'"') {
+                chars.next();
+                field.push('"');
+            } else {
+                quoted = false;
+            }
+        } else if c == ',' {
+            fields.push(std::mem::take(&mut field));
+            at_start = true;
+            continue;
+        } else if c == '"' && at_start {
+            quoted = true;
+        } else {
+            field.push(c);
+        }
+        at_start = false;
+    }
+    (!quoted).then(|| {
+        fields.push(field);
+        fields
+    })
+}
+
+/// The game key of a session row: from the exe path, or for a generic host (Java), the
+/// stored game with that exe and the row's shown name.
+fn row_key(
+    game: &str,
+    exe_path: &str,
+    store: &GameStore,
+    overrides: &BTreeMap<String, String>,
+) -> Option<String> {
+    if !is_generic_host(exe_path) {
+        return Some(game_key(exe_path, None));
+    }
+    store
+        .games
+        .iter()
+        .find(|(_, g)| {
+            g.exe_path.eq_ignore_ascii_case(exe_path)
+                && display_name(&g.name, &g.exe_path, overrides) == game
+        })
+        .map(|(key, _)| key.clone())
+}
+
 /// The whole `games.csv`: BOM, header, then games by `last_played` descending.
 pub fn games_csv(store: &GameStore, overrides: &BTreeMap<String, String>) -> String {
     let mut games: Vec<&GameRecord> = store.games.values().collect();
@@ -478,6 +694,7 @@ mod tests {
             first_played: t(1, 0, 0),
             last_played: last,
             hist: h,
+            last_session: None,
         }
     }
 
@@ -1005,5 +1222,172 @@ mod tests {
         ] {
             assert!(parse_pending(bad).is_err(), "{bad}");
         }
+    }
+
+    // ---- Not games ----
+
+    /// A session of `exe` named `name` (the display name in the row), at hour `h`.
+    fn row_of(exe: &str, name: &str, h: u8) -> String {
+        let s = SessionRecord {
+            start: t(2, h, 0),
+            end: t(2, h, 30),
+            key: String::new(),
+            name: name.into(),
+            exe_path: exe.into(),
+            hist: hist(4000, 1.0 / 64.0),
+        };
+        session_csv_row(&s, name)
+    }
+
+    fn csv_of(rows: &[String]) -> String {
+        format!("{CSV_BOM}{SESSIONS_CSV_HEADER}\r\n{}", rows.concat())
+    }
+
+    fn not_games(keys: &[&str]) -> BTreeMap<String, String> {
+        keys.iter()
+            .map(|k| (k.to_string(), "x".to_string()))
+            .collect()
+    }
+
+    const ZOOM: &str = r"C:\Apps\Zoom.exe";
+    const DOOM: &str = r"C:\Games\Doom.exe";
+
+    #[test]
+    fn shown_store_leaves_out_not_games() {
+        let mut store = GameStore::default();
+        store.games.insert(
+            r"c:\games\a.exe".into(),
+            game("A", t(2, 0, 0), hist(10, 0.5)),
+        );
+        store.games.insert(
+            r"c:\games\b.exe".into(),
+            game("B", t(3, 0, 0), hist(10, 0.5)),
+        );
+        let shown = store.shown(&not_games(&[r"c:\games\b.exe"]));
+        assert_eq!(
+            shown.games.keys().collect::<Vec<_>>(),
+            vec![r"c:\games\a.exe"]
+        );
+        assert_eq!(store.games.len(), 2, "the store itself keeps every game");
+    }
+
+    #[test]
+    fn rows_of_not_games_move_aside_and_come_back_in_order() {
+        let (z1, d2, z3) = (
+            row_of(ZOOM, "Zoom", 1),
+            row_of(DOOM, "Doom", 2),
+            row_of(ZOOM, "Zoom", 3),
+        );
+        let all = csv_of(&[z1.clone(), d2.clone(), z3.clone()]);
+        let store = GameStore::default();
+        let none = BTreeMap::new();
+        let hidden = not_games(&[r"c:\apps\zoom.exe"]);
+
+        let (shown, aside) = split_sessions_csv(&all, "", &store, &none, &hidden);
+        assert_eq!(shown, csv_of(std::slice::from_ref(&d2)));
+        assert_eq!(aside, csv_of(&[z1.clone(), z3.clone()]));
+
+        // "It's a game": the rows go back between the others, by start time.
+        let (shown, aside) = split_sessions_csv(&shown, &aside, &store, &none, &BTreeMap::new());
+        assert_eq!(shown, all);
+        assert_eq!(aside, "", "nothing left aside: no file");
+    }
+
+    #[test]
+    fn java_games_are_told_apart_by_their_shown_name() {
+        let javaw = r"C:\Java\bin\javaw.exe";
+        let mut store = GameStore::default();
+        let mut mc = game("Minecraft", t(2, 0, 0), hist(10, 0.5));
+        mc.exe_path = javaw.into();
+        let mut other = game("Other", t(2, 0, 0), hist(10, 0.5));
+        other.exe_path = javaw.into();
+        store
+            .games
+            .insert(r"c:\java\bin\javaw.exe|minecraft".into(), mc);
+        store
+            .games
+            .insert(r"c:\java\bin\javaw.exe|other".into(), other);
+        let (m, o) = (row_of(javaw, "Minecraft", 1), row_of(javaw, "Other", 2));
+        let all = csv_of(&[m.clone(), o.clone()]);
+        let hidden = not_games(&[r"c:\java\bin\javaw.exe|other"]);
+        let (shown, aside) = split_sessions_csv(&all, "", &store, &BTreeMap::new(), &hidden);
+        assert_eq!(shown, csv_of(&[m]));
+        assert_eq!(aside, csv_of(&[o]));
+    }
+
+    #[test]
+    fn quoted_names_and_a_missing_last_newline_are_read() {
+        let odd = row_of(ZOOM, "Zoom, \"the\" app", 1);
+        let all = csv_of(std::slice::from_ref(&odd));
+        let cut = all.trim_end_matches("\r\n");
+        let hidden = not_games(&[r"c:\apps\zoom.exe"]);
+        let (shown, aside) =
+            split_sessions_csv(cut, "", &GameStore::default(), &BTreeMap::new(), &hidden);
+        assert_eq!(shown, csv_of(&[]));
+        assert_eq!(aside, csv_of(&[odd]));
+    }
+
+    #[test]
+    fn unreadable_lines_stay_shown() {
+        let all = csv_of(&["garbage without commas\r\n".to_string()]);
+        let hidden = not_games(&[r"c:\apps\zoom.exe"]);
+        let (shown, aside) =
+            split_sessions_csv(&all, "", &GameStore::default(), &BTreeMap::new(), &hidden);
+        assert_eq!(shown, all);
+        assert_eq!(aside, "");
+    }
+
+    // ---- Last session ----
+
+    #[test]
+    fn add_session_keeps_the_newest_session() {
+        let mut store = GameStore::default();
+        let newer = session("k", "A", t(2, 9, 30), t(2, 10, 0), hist(6000, 1.0 / 64.0));
+        let older = session("k", "A", t(2, 8, 0), t(2, 9, 0), hist(6000, 1.0 / 32.0));
+        store.add_session(&newer);
+        store.add_session(&older);
+        let want = newer.hist.summary().unwrap();
+        let last = store.games["k"].last_session.expect("a last session");
+        assert_eq!((last.start, last.end), (newer.start, newer.end));
+        assert_eq!(last.play_secs, want.play_secs);
+        assert_eq!(last.avg_fps, want.avg_fps);
+        assert_eq!(last.low_1pct_fps, want.low_1pct_fps);
+        assert_eq!(last.high_1pct_fps, want.high_1pct_fps);
+    }
+
+    #[test]
+    fn last_session_round_trips_and_old_entries_have_none() {
+        let mut store = GameStore::default();
+        store.add_session(&session(
+            "k",
+            "A",
+            t(2, 9, 30),
+            t(2, 10, 0),
+            hist(6000, 1.0 / 64.0),
+        ));
+        let (back, warnings) = GameStore::parse(&store.to_toml()).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(back.games["k"].last_session, store.games["k"].last_session);
+
+        let old = "[games.k]\nname = \"A\"\nexe_path = 'C:\\A.exe'\nsessions = 1\n\
+                   first_played = \"2026-10-02 09:30:07\"\nlast_played = \"2026-10-02 10:00:07\"\n\
+                   total_secs = 60.0\nbuckets = []\n";
+        let (old, warnings) = GameStore::parse(old).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(old.games["k"].last_session, None);
+    }
+
+    #[test]
+    fn a_damaged_last_session_leaves_the_game_readable() {
+        let text = "[games.k]\nname = \"A\"\nexe_path = 'C:\\A.exe'\nsessions = 3\n\
+                    first_played = \"2026-10-02 09:30:07\"\nlast_played = \"2026-10-02 10:00:07\"\n\
+                    total_secs = 60.0\nbuckets = []\nlast_session = \"garbage\"\n";
+        let (store, warnings) = GameStore::parse(text).unwrap();
+        let game = store.games.get("k").expect("the game is still read");
+        assert_eq!(game.sessions, 3);
+        assert_eq!(game.last_session, None);
+        assert!(store.unparsed.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("games.k") && warnings[0].contains("last_session"));
     }
 }

@@ -20,6 +20,17 @@ pub struct OpenSession {
 }
 
 impl OpenSession {
+    /// The game's key in the stats store (what `finish` records under).
+    pub fn key(&self) -> String {
+        game_key(
+            &self.exe_path,
+            self.window_title
+                .as_deref()
+                .and_then(clean_window_title)
+                .as_deref(),
+        )
+    }
+
     /// The stored record for this session ending at `end`, or `None` when it is too short to
     /// keep. `resolve_name(exe_path, window_title)` is only called for kept sessions.
     pub fn finish(
@@ -31,13 +42,7 @@ impl OpenSession {
         let record = SessionRecord {
             start: self.start,
             end,
-            key: game_key(
-                &self.exe_path,
-                self.window_title
-                    .as_deref()
-                    .and_then(clean_window_title)
-                    .as_deref(),
-            ),
+            key: self.key(),
             name: String::new(),
             exe_path: self.exe_path,
             hist,
@@ -87,6 +92,10 @@ impl SessionBook {
     pub fn remove(&mut self, pid: u32) -> Option<OpenSession> {
         let index = self.sessions.iter().position(|s| s.pid == pid)?;
         Some(self.sessions.swap_remove(index))
+    }
+
+    pub fn get(&self, pid: u32) -> Option<&OpenSession> {
+        self.sessions.iter().find(|s| s.pid == pid)
     }
 
     pub fn pids(&self) -> Vec<u32> {
@@ -413,5 +422,30 @@ mod tests {
         assert!(!liveness_query_due(Some(99.5), Some(70.5), 100.0));
         assert!(liveness_query_due(Some(99.5), Some(70.0), 100.0));
         assert!(liveness_query_due(Some(99.5), None, 100.0), "never queried");
+    }
+
+    #[test]
+    fn key_is_the_key_finish_records() {
+        let java = OpenSession {
+            exe_path: r"C:\Java\bin\javaw.exe".into(),
+            window_title: Some("Minecraft 1.21".into()),
+            ..open(9, 1)
+        };
+        let key = java.key();
+        let record = java
+            .finish(t(11, 0), hist(10_000, 1.0 / 64.0), |_, _| {
+                "Minecraft".into()
+            })
+            .expect("kept");
+        assert_eq!(key, record.key);
+        assert!(key.contains('|'), "a Java game's key has its title: {key}");
+    }
+
+    #[test]
+    fn get_finds_a_tracked_session() {
+        let mut book = SessionBook::new();
+        book.track(open(7, 100));
+        assert_eq!(book.get(7).map(|s| s.created), Some(100));
+        assert!(book.get(8).is_none());
     }
 }

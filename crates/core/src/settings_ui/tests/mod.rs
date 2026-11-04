@@ -1,5 +1,5 @@
 mod appearance;
-mod games;
+mod games_page;
 mod general;
 mod hotkeys;
 mod layout;
@@ -12,7 +12,9 @@ mod updates;
 
 use super::*;
 use crate::color::Rgb;
+use crate::history::LocalTime;
 use crate::hotkey::Key;
+use crate::install::{MoveOutcome, MoveStatus};
 use crate::settings::{Location, StatsLayout, MAX_SAVED_COLORS};
 use crate::settings_edit::apply_change;
 use crate::startup_task::StartupState;
@@ -65,12 +67,19 @@ fn rgb(hex: &str) -> Rgb {
     Rgb::parse_hex(hex).unwrap()
 }
 
+/// The test games' key in the stats store.
+fn game_key_of(exe: &str) -> String {
+    format!("key:{exe}")
+}
+
 fn game(exe: &str, stored: &str, name: Option<&str>) -> GameRow {
     GameRow {
+        key: game_key_of(exe),
         exe_path: exe.to_string(),
         stored_name: stored.to_string(),
         override_name: name.map(str::to_string),
         override_key: name.map(|_| exe.to_string()),
+        ..GameRow::default()
     }
 }
 
@@ -85,6 +94,11 @@ struct Page {
     update: UpdateState,
     startup: StartupState,
     elevated: bool,
+    install_offer: bool,
+    move_status: MoveStatus,
+    /// The Games page's "now" and live game.
+    games_now: LocalTime,
+    live: Option<LiveGame>,
     area: Rect,
     now: u64,
     last: Option<Frame>,
@@ -110,6 +124,17 @@ impl Page {
             update: UpdateState::Idle,
             startup: StartupState::Off,
             elevated: true,
+            install_offer: false,
+            move_status: MoveStatus::Idle,
+            games_now: LocalTime {
+                year: 2026,
+                month: 11,
+                day: 3,
+                hour: 15,
+                minute: 0,
+                second: 0,
+            },
+            live: None,
             area,
             now: 0,
             last: None,
@@ -143,6 +168,14 @@ impl Page {
                     state: &self.startup,
                     elevated: self.elevated,
                 },
+                install: InstallInput {
+                    offer: self.install_offer,
+                    status: &self.move_status,
+                },
+                games: GamesInput {
+                    now: self.games_now,
+                    live: self.live.as_ref(),
+                },
             },
         );
         self.last = Some(ui.finish());
@@ -174,6 +207,21 @@ impl Page {
             .get(&id("settings.scroll"))
             .copied()
             .unwrap_or(0.0)
+    }
+
+    /// Clicks Games in the sidebar and lets the page settle.
+    fn show_games(&mut self) {
+        let at = texts(self.frame())
+            .into_iter()
+            .find(|t| t.1 == "Games" && t.0.x < SIDEBAR_W)
+            .expect("the Games item")
+            .0;
+        self.click(Pt {
+            x: at.x + 4.0,
+            y: at.y + 4.0,
+        });
+        self.idle();
+        self.idle();
     }
 
     fn idle(&mut self) -> Vec<UiAction> {
@@ -304,13 +352,14 @@ fn track_near(f: &Frame, label: &str) -> Rect {
 
 /// The preview stage: the gradient image, 92 tall.
 fn stage(f: &Frame) -> Rect {
-    f.cmds
-        .iter()
-        .find_map(|c| match c {
-            Cmd::Image { rect, .. } if rect.h == 92.0 => Some(*rect),
-            _ => None,
-        })
-        .expect("a preview stage")
+    find_stage(f).expect("a preview stage")
+}
+
+fn find_stage(f: &Frame) -> Option<Rect> {
+    f.cmds.iter().find_map(|c| match c {
+        Cmd::Image { rect, .. } if rect.h == 92.0 => Some(*rect),
+        _ => None,
+    })
 }
 
 /// The preview overlay's background box (default black at 55%).

@@ -1,8 +1,12 @@
 //! Shared helpers for the app crate's tests.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 
-/// A fresh, empty directory under `%TEMP%` that is removed on drop.
+use crate::startup::{CommandRunner, Output};
+
+/// A fresh, empty directory under `%TEMP%` that is removed on drop. Its path is the long form,
+/// as Windows reports paths back, even when `%TEMP%` is an 8.3 short path (as on CI runners).
 pub struct TempDir(PathBuf);
 
 impl TempDir {
@@ -10,7 +14,7 @@ impl TempDir {
         let dir = std::env::temp_dir().join(format!("lite-bar-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
-        TempDir(dir)
+        TempDir(crate::registration::long_path(&dir))
     }
 
     pub fn path(&self) -> &Path {
@@ -104,4 +108,50 @@ pub fn http_ok(body: &[u8]) -> Vec<u8> {
     .into_bytes();
     v.extend_from_slice(body);
     v
+}
+
+/// Records every call and answers with scripted exit codes and stdout, in order.
+#[derive(Default)]
+pub struct FakeRunner {
+    pub calls: RefCell<Vec<(String, Vec<String>)>>,
+    /// Answers for the calls in order; a call past the end fails.
+    pub answers: RefCell<Vec<Output>>,
+    /// The XML file's bytes, read while the create command "runs".
+    pub seen_file: RefCell<Option<Vec<u8>>>,
+}
+
+impl FakeRunner {
+    pub fn new(answers: Vec<Output>) -> FakeRunner {
+        FakeRunner {
+            answers: RefCell::new(answers.into_iter().rev().collect()),
+            ..FakeRunner::default()
+        }
+    }
+
+    pub fn calls(&self) -> Vec<Vec<String>> {
+        self.calls.borrow().iter().map(|c| c.1.clone()).collect()
+    }
+
+    fn answer(&self, exe: &str, args: &[String]) -> Output {
+        self.calls
+            .borrow_mut()
+            .push((exe.to_string(), args.to_vec()));
+        if args.first().map(String::as_str) == Some("/Create") {
+            *self.seen_file.borrow_mut() = std::fs::read(&args[4]).ok();
+        }
+        self.answers
+            .borrow_mut()
+            .pop()
+            .unwrap_or_else(|| Err("unexpected call".into()))
+    }
+}
+
+impl CommandRunner for FakeRunner {
+    fn run(&self, exe: &str, args: &[String]) -> Result<i32, String> {
+        self.answer(exe, args).map(|a| a.0)
+    }
+
+    fn output(&self, exe: &str, args: &[String]) -> Output {
+        self.answer(exe, args)
+    }
 }

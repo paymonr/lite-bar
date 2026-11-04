@@ -18,11 +18,10 @@ fn with_update(state: UpdateState) -> Page {
 }
 
 #[test]
-fn updates_section_sits_between_hotkeys_and_game_names() {
+fn updates_section_follows_hotkeys() {
     let p = Page::new(TALL);
     let y = |t: &str| find_text(p.frame(), t).unwrap().0.y;
     assert!(y("HOTKEYS") < y("UPDATES"));
-    assert!(y("UPDATES") < y("GAME NAMES"));
     // The sidebar lists it in the same place.
     let side = |t: &str| {
         texts(p.frame())
@@ -33,7 +32,7 @@ fn updates_section_sits_between_hotkeys_and_game_names() {
             .y
     };
     assert!(side("Hotkeys") < side("Updates"));
-    assert!(side("Updates") < side("Game names"));
+    assert!(side("Updates") < side("Games"));
     assert!(find_text(p.frame(), "Check for updates").is_some());
 }
 

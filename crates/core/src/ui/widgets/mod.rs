@@ -84,6 +84,41 @@ impl Ui<'_> {
         });
     }
 
+    /// Text that clicks like a button: drawn like `label` (ellipsized to the available
+    /// width), in the hot accent color while hovered.
+    pub fn text_button(&mut self, id: Id, text: &str, style: TextStyle, color: Rgba) -> bool {
+        let shown = self.ellipsize(text, style, self.available().w);
+        let (w, h) = self.measure.measure(&shown, style);
+        let rect = self.alloc(Some(w), h);
+        let (hot, clicked) = self.interact(id, rect);
+        self.cmds.push(Cmd::Text {
+            pos: Pt {
+                x: rect.x,
+                y: rect.y,
+            },
+            text: shown,
+            style,
+            color: if hot { theme::ACCENT_HOT } else { color },
+        });
+        clicked
+    }
+
+    /// `text`, shortened with "…" to fit `max_w` (empty when not even that fits).
+    pub fn ellipsize(&self, text: &str, style: TextStyle, max_w: f32) -> String {
+        if self.measure.measure(text, style).0 <= max_w {
+            return text.to_string();
+        }
+        let mut chars: Vec<char> = text.chars().collect();
+        while !chars.is_empty() {
+            chars.pop();
+            let s: String = chars.iter().collect::<String>().trim_end().to_string() + "…";
+            if self.measure.measure(&s, style).0 <= max_w {
+                return s;
+            }
+        }
+        String::new()
+    }
+
     pub fn button(&mut self, id: Id, text: &str) -> bool {
         self.styled_button(id, text, false)
     }

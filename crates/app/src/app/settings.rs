@@ -6,7 +6,7 @@ use std::time::Instant;
 use lite_bar_core::hotkey::Hotkey;
 use lite_bar_core::settings::Settings;
 use lite_bar_core::settings_edit::{apply_change, edit_settings_text, push_change, SettingsChange};
-use lite_bar_core::settings_ui::{GameRow, UiAction};
+use lite_bar_core::settings_ui::{GameRow, UiAction, WindowPage};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
@@ -14,7 +14,7 @@ use super::{quit, shell_open, App, SAVE_TIMER_ID, SETTINGS_FILE};
 use crate::hotkeys::{self, HotkeyId, Registration};
 use crate::log;
 use crate::settings_window::{switch_hotkey, Drained, HotkeyDecision, SettingsUi, SAVE_DELAY};
-use crate::stats_files::{list_games, write_atomic};
+use crate::stats_files::{list_games, local_now, write_atomic};
 
 /// Shown in the window when the file cannot be edited (not valid TOML, a bad section).
 pub(super) const SAVE_FAILED_FILE: &str =
@@ -70,6 +70,8 @@ impl App {
                 ui.set_save_error(self.save_error);
                 ui.set_update(&self.update);
                 ui.set_startup(&self.startup, self.elevated);
+                ui.set_install(self.install_offered(), &self.move_status);
+                ui.set_now(local_now());
                 self.settings_ui = Some(ui);
                 self.refresh_startup();
             }
@@ -91,6 +93,7 @@ impl App {
                 self.apply_ui_action(action);
             }
             if drained.closed {
+                self.show_games_page(false);
                 self.settings_ui = None;
                 self.end_hotkey_capture();
                 self.flush_settings_save();
@@ -110,6 +113,7 @@ impl App {
 
     /// Closes the window (Quit, restart, shutdown), applies its last edits and saves.
     pub(super) fn close_settings_window(&mut self) {
+        self.show_games_page(false);
         if let Some(ui) = self.settings_ui.take() {
             for action in ui.close().actions {
                 self.apply_ui_action(action);
@@ -148,6 +152,8 @@ impl App {
                 }
             }
             UiAction::SetStartup(on) => self.set_startup(on),
+            UiAction::InstallToProgramFiles => self.start_move(),
+            UiAction::ShowPage(page) => self.show_games_page(page == WindowPage::Games),
             UiAction::StartHotkeyCapture => self.start_hotkey_capture(),
             UiAction::CancelHotkeyCapture => {
                 if self.end_hotkey_capture() {
@@ -199,6 +205,10 @@ impl App {
             }
             SettingsChange::GameName { .. } => {
                 self.writer.mark_games_csv_dirty();
+                self.writer.flush(&self.settings.game_names);
+            }
+            SettingsChange::NotAGame { .. } => {
+                self.writer.set_not_games(&self.settings.not_games);
                 self.writer.flush(&self.settings.game_names);
             }
             SettingsChange::CheckUpdates(_) | SettingsChange::RestoreDefaults => {

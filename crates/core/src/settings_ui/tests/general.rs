@@ -177,3 +177,96 @@ fn an_error_with_a_verified_state_shows_it_and_takes_clicks() {
     assert!(!toggle_on(&p) && !toggle_mixed(&p));
     assert_eq!(click_toggle(&mut p), vec![UiAction::SetStartup(true)]);
 }
+
+const INSTALL_TITLE: &str = "Install to Program Files";
+const INSTALL_HINT: &str = "Adds Lite Bar to Start and Installed apps.";
+const INSTALL_ASKS: &str = "Asks for admin once.";
+
+fn with_install(status: MoveStatus, elevated: bool) -> Page {
+    let mut p = Page::new(TALL);
+    p.install_offer = true;
+    p.move_status = status;
+    p.elevated = elevated;
+    p.idle();
+    p
+}
+
+fn has_text_starting(p: &Page, prefix: &str) -> Option<Rgba> {
+    texts(p.frame())
+        .into_iter()
+        .find(|t| t.1.starts_with(prefix))
+        .map(|t| t.3)
+}
+
+#[test]
+fn install_row_shows_only_outside_program_files() {
+    let p = Page::new(TALL);
+    assert!(find_text(p.frame(), INSTALL_TITLE).is_none());
+    let p = with_install(MoveStatus::Idle, true);
+    let y = |t: &str| find_text(p.frame(), t).unwrap().0.y;
+    assert!(y("Start with Windows") < y(INSTALL_TITLE));
+    assert!(y(INSTALL_TITLE) < y("HOTKEYS"));
+    assert!(find_text(p.frame(), INSTALL_HINT).is_some());
+    assert!(
+        find_text(p.frame(), INSTALL_ASKS).is_none(),
+        "already admin"
+    );
+}
+
+#[test]
+fn install_button_starts_the_install() {
+    let mut p = with_install(MoveStatus::Idle, true);
+    assert_eq!(
+        p.click_text("Install"),
+        vec![UiAction::InstallToProgramFiles]
+    );
+}
+
+#[test]
+fn install_says_it_asks_for_admin_when_not_elevated() {
+    let p = with_install(MoveStatus::Idle, false);
+    assert!(find_text(p.frame(), INSTALL_ASKS).is_some());
+}
+
+#[test]
+fn installing_shows_progress_instead_of_the_button() {
+    let p = with_install(MoveStatus::Moving, true);
+    assert!(find_text(p.frame(), "Installing…").is_some());
+    assert!(find_text(p.frame(), "Install").is_none());
+}
+
+#[test]
+fn a_failed_install_says_why_and_can_be_tried_again() {
+    let mut p = with_install(
+        MoveStatus::Done(MoveOutcome::Failed("access denied".into())),
+        true,
+    );
+    assert_eq!(
+        has_text_starting(&p, "Couldn't install Lite Bar"),
+        Some(PROBLEM_TEXT)
+    );
+    assert_eq!(
+        p.click_text("Install"),
+        vec![UiAction::InstallToProgramFiles]
+    );
+}
+
+#[test]
+fn a_declined_prompt_is_explained_quietly() {
+    let p = with_install(MoveStatus::Done(MoveOutcome::Declined), true);
+    assert_eq!(has_text_starting(&p, "Not installed"), Some(theme::MUTED));
+    assert!(find_text(p.frame(), "Install").is_some());
+}
+
+#[test]
+fn installed_but_not_started_offers_no_second_install() {
+    let p = with_install(
+        MoveStatus::Done(MoveOutcome::MovedNotStarted("boom".into())),
+        true,
+    );
+    assert_eq!(
+        has_text_starting(&p, "Installed, but couldn't start the new copy"),
+        Some(PROBLEM_TEXT)
+    );
+    assert!(find_text(p.frame(), "Install").is_none());
+}

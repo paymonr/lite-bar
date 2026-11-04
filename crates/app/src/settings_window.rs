@@ -17,12 +17,14 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use lite_bar_core::game_name::find_override;
+use lite_bar_core::history::LocalTime;
 use lite_bar_core::hotkey::Hotkey;
+use lite_bar_core::install::MoveStatus;
 use lite_bar_core::settings::Settings;
 use lite_bar_core::settings_edit::apply_change;
 use lite_bar_core::settings_ui::{
-    settings_frame, GameRow, PageInput, SettingsView, StartupInput, UiAction, UpdatesInput,
-    MIN_WINDOW_DIP,
+    settings_frame, GameRow, GamesInput, InstallInput, LiveGame, PageInput, SettingsView,
+    StartupInput, UiAction, UpdatesInput, MIN_WINDOW_DIP,
 };
 use lite_bar_core::startup_task::StartupState;
 use lite_bar_core::ui::{HotkeyCapture, Ui};
@@ -184,6 +186,13 @@ struct WindowState {
     /// as administrator.
     startup: StartupState,
     elevated: bool,
+    /// What the General section's install row shows: whether Lite Bar runs from outside
+    /// Program Files, and how an install is going.
+    install_offer: bool,
+    move_status: MoveStatus,
+    /// What the Games page shows: the local time and the game being played.
+    now: LocalTime,
+    live: Option<LiveGame>,
     queue: ActionQueue,
 }
 
@@ -227,6 +236,14 @@ impl UiApp for SettingsPage {
                 startup: StartupInput {
                     state: &st.startup,
                     elevated: st.elevated,
+                },
+                install: InstallInput {
+                    offer: st.install_offer,
+                    status: &st.move_status,
+                },
+                games: GamesInput {
+                    now: st.now,
+                    live: st.live.as_ref(),
                 },
             },
         );
@@ -398,6 +415,58 @@ impl SettingsUi {
         self.window.request_redraw();
     }
 
+    /// Shows the install row (only when `offer`) and how an install is going.
+    pub fn set_install(&self, offer: bool, status: &MoveStatus) {
+        let mut st = self.state.borrow_mut();
+        if st.install_offer == offer && st.move_status == *status {
+            return;
+        }
+        st.install_offer = offer;
+        st.move_status = status.clone();
+        drop(st);
+        self.window.request_redraw();
+    }
+
+    /// The local time the Games page counts "Today" from; redraws when the minute changes.
+    pub fn set_now(&self, now: LocalTime) {
+        let mut st = self.state.borrow_mut();
+        let minute = |t: LocalTime| (t.year, t.month, t.day, t.hour, t.minute);
+        if minute(st.now) == minute(now) {
+            st.now = now;
+            return;
+        }
+        st.now = now;
+        drop(st);
+        self.window.request_redraw();
+    }
+
+    /// The game the Games page shows as playing now; redraws only when it changed.
+    pub fn set_live(&self, live: Option<&LiveGame>) {
+        let mut st = self.state.borrow_mut();
+        if st.live.as_ref() == live {
+            return;
+        }
+        st.live = live.cloned();
+        drop(st);
+        self.window.request_redraw();
+    }
+
+    #[cfg(test)]
+    pub fn live_shown(&self) -> Option<LiveGame> {
+        self.state.borrow().live.clone()
+    }
+
+    #[cfg(test)]
+    pub fn now_shown(&self) -> LocalTime {
+        self.state.borrow().now
+    }
+
+    #[cfg(test)]
+    pub fn install_shown(&self) -> (bool, MoveStatus) {
+        let st = self.state.borrow();
+        (st.install_offer, st.move_status.clone())
+    }
+
     #[cfg(test)]
     pub fn startup_state(&self) -> StartupState {
         self.state.borrow().startup.clone()
@@ -485,6 +554,19 @@ impl SettingsUi {
                 color: c,
                 ..
             } if t == text && c == color => Some((
+                ((pos.x + 4.0) * s).round() as i32,
+                ((pos.y + 4.0) * s).round() as i32,
+            )),
+            _ => None,
+        })
+    }
+
+    /// Where the first `text` is drawn, in any color.
+    #[cfg(test)]
+    pub fn find_any_text_px(&self, text: &str) -> Option<(i32, i32)> {
+        let s = self.window.scale();
+        self.window.cmds().into_iter().find_map(|c| match c {
+            lite_bar_core::ui::Cmd::Text { pos, text: t, .. } if t == text => Some((
                 ((pos.x + 4.0) * s).round() as i32,
                 ((pos.y + 4.0) * s).round() as i32,
             )),
@@ -669,10 +751,12 @@ mod tests {
     #[test]
     fn overrides_come_from_the_settings() {
         let rows = vec![GameRow {
+            key: "k".to_string(),
             exe_path: "javaw.exe".into(),
             stored_name: "Java".into(),
             override_name: None,
             override_key: None,
+            ..GameRow::default()
         }];
         let mut s = Settings::default();
         assert_eq!(with_overrides(&rows, &s), rows);
@@ -686,10 +770,12 @@ mod tests {
     #[test]
     fn file_name_override_shows_in_the_window() {
         let rows = vec![GameRow {
+            key: "k".to_string(),
             exe_path: r"C:\Java\bin\javaw.exe".into(),
             stored_name: "Java".into(),
             override_name: None,
             override_key: None,
+            ..GameRow::default()
         }];
         let mut s = Settings::default();
         s.game_names.insert("JAVAW.exe".into(), "Minecraft".into());

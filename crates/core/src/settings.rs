@@ -101,6 +101,18 @@ impl Default for UpdateSettings {
     }
 }
 
+#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+pub struct InstallSettings {
+    /// Offer to move Lite Bar to Program Files when it starts.
+    pub move_prompt: bool,
+}
+
+impl Default for InstallSettings {
+    fn default() -> Self {
+        InstallSettings { move_prompt: true }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Default, Serialize)]
 pub struct Settings {
     pub overlay: OverlaySettings,
@@ -108,9 +120,14 @@ pub struct Settings {
     /// Display names used in the game stats files (`games.csv`, `sessions.csv`). Keys are an
     /// exe file name or a full path.
     pub game_names: BTreeMap<String, String>,
+    /// Apps marked "Not a game": no sessions are recorded for them and the stats files leave
+    /// them out. Keys are game keys (as in `games.toml`); values are the name shown when
+    /// marked.
+    pub not_games: BTreeMap<String, String>,
     /// Colors saved in the settings window's picker, oldest first, at most `MAX_SAVED_COLORS`.
     pub saved_colors: Vec<Rgb>,
     pub updates: UpdateSettings,
+    pub install: InstallSettings,
 }
 
 /// Most colors kept in `[colors] saved`.
@@ -169,6 +186,26 @@ fn read_section(root: &toml::Table, name: &str, warnings: &mut Vec<String>) -> t
             toml::Table::new()
         }
     }
+}
+
+/// The string entries of the table `name`; other values are warned about and skipped.
+fn read_string_map(
+    root: &toml::Table,
+    name: &str,
+    warnings: &mut Vec<String>,
+) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+    for (key, value) in &read_section(root, name, warnings) {
+        match value {
+            toml::Value::String(v) => {
+                map.insert(key.clone(), v.clone());
+            }
+            _ => warnings.push(format!(
+                "{name}.{key}: expected a string; ignoring this entry"
+            )),
+        }
+    }
+    map
 }
 
 /// Parses settings text, falling back to the default for every missing or invalid field.
@@ -232,6 +269,11 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
         settings.updates.check = v;
     }
 
+    let install = read_section(&root, "install", &mut warnings);
+    if let Some(v) = read_field(&install, "install", "move_prompt", &mut warnings) {
+        settings.install.move_prompt = v;
+    }
+
     let colors = read_section(&root, "colors", &mut warnings);
     if let Some(entries) = read_field::<Vec<toml::Value>>(&colors, "colors", "saved", &mut warnings)
     {
@@ -254,17 +296,8 @@ pub fn parse_settings(text: &str) -> (Settings, Vec<String>) {
         }
     }
 
-    let game_names = read_section(&root, "game_names", &mut warnings);
-    for (key, value) in &game_names {
-        match value {
-            toml::Value::String(name) => {
-                settings.game_names.insert(key.clone(), name.clone());
-            }
-            _ => warnings.push(format!(
-                "game_names.{key}: expected a string; ignoring this entry"
-            )),
-        }
-    }
+    settings.game_names = read_string_map(&root, "game_names", &mut warnings);
+    settings.not_games = read_string_map(&root, "not_games", &mut warnings);
 
     (settings, warnings)
 }
@@ -313,12 +346,23 @@ saved = []
 # Nothing is downloaded or installed until you click "Update now".
 check = true
 
+[install]
+# Offer to move Lite Bar to Program Files when it starts: true or false.
+# Set to false once you answer "Move to Program Files" or "No thanks".
+move_prompt = true
+
 [game_names]
 # Display names used in the game stats files (games.csv, sessions.csv). The key is an exe
 # file name or a full path; the value is the name to use. Use single quotes for a path so
 # backslashes need no escaping.
 # "javaw.exe" = "Minecraft"
 # 'C:\Games\Foo\foo.exe' = "Foo: Remastered"
+
+[not_games]
+# Apps you marked "Not a game" in the settings window. No play sessions are recorded for them,
+# and games.csv and sessions.csv leave them out (their earlier sessions are kept aside and come
+# back if you click "It's a game"). The key is the game key from games.toml; the value is its
+# name.
 "##;
 
 #[cfg(test)]
@@ -486,8 +530,37 @@ mod tests {
                 .iter()
                 .skip_while(|l| **l != "[game_names]")
                 .skip(1)
+                .take_while(|l| !l.starts_with('['))
                 .any(|l| !l.starts_with('#') && !l.trim().is_empty()),
             "[game_names] must have no active entries"
+        );
+    }
+
+    #[test]
+    fn parses_not_games() {
+        let (s, w) = parse_settings("[not_games]\n'C:\\Zoom\\zoom.exe' = \"Zoom\"\nbad = 3\n");
+        assert_eq!(s.not_games.len(), 1);
+        assert_eq!(s.not_games["C:\\Zoom\\zoom.exe"], "Zoom");
+        assert!(w.iter().any(|w| w.contains("not_games.bad")));
+    }
+
+    #[test]
+    fn template_explains_not_games_without_entries() {
+        let template = default_settings_toml();
+        let lines: Vec<&str> = template.lines().collect();
+        assert!(lines.contains(&"[not_games]"));
+        let section: Vec<&&str> = lines
+            .iter()
+            .skip_while(|l| **l != "[not_games]")
+            .skip(1)
+            .take_while(|l| !l.starts_with('['))
+            .collect();
+        assert!(section.iter().any(|l| l.contains("Not a game")));
+        assert!(
+            section
+                .iter()
+                .all(|l| l.starts_with('#') || l.trim().is_empty()),
+            "[not_games] must have no active entries"
         );
     }
 
@@ -557,5 +630,33 @@ mod updates_tests {
         assert!(lines.contains(&"[updates]"));
         let at = lines.iter().position(|l| *l == "check = true").unwrap();
         assert!(lines[at - 1].starts_with('#'));
+    }
+}
+
+#[cfg(test)]
+mod install_tests {
+    use super::*;
+
+    #[test]
+    fn move_prompt_defaults_true_and_parses() {
+        assert!(Settings::default().install.move_prompt);
+        let (s, w) = parse_settings("[install]\nmove_prompt = false\n");
+        assert!(!s.install.move_prompt);
+        assert!(w.is_empty(), "{w:?}");
+        let (s, w) = parse_settings("[install]\nmove_prompt = 3\n");
+        assert!(s.install.move_prompt);
+        assert!(w[0].contains("install.move_prompt"));
+        let (s, _) = parse_settings("");
+        assert!(s.install.move_prompt);
+    }
+
+    #[test]
+    fn template_documents_move_prompt() {
+        let t = default_settings_toml();
+        assert!(t.contains("[install]"));
+        assert!(t.contains("move_prompt = true"));
+        let (s, w) = parse_settings(&t);
+        assert_eq!(s, Settings::default());
+        assert!(w.is_empty(), "{w:?}");
     }
 }
